@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,14 +21,22 @@ var ErrWikiPageNotFound = errors.New("wiki page not found")
 // ErrWikiPageConflict is returned when an optimistic lock conflict is detected
 var ErrWikiPageConflict = errors.New("wiki page version conflict")
 
+// ErrWikiCanonicalConflict prevents any write path from materializing a
+// second slug for a registered exact Wiki identity.
+var ErrWikiCanonicalConflict = errors.New("wiki page conflicts with canonical identity")
+
 // wikiPageRepository implements the WikiPageRepository interface
 type wikiPageRepository struct {
-	db *gorm.DB
+	db                                *gorm.DB
+	canonicalIdentityEnabled          bool
+	testAfterWikiLinkSourceSerialized func()
 }
 
 // NewWikiPageRepository creates a new wiki page repository
 func NewWikiPageRepository(db *gorm.DB) interfaces.WikiPageRepository {
-	return &wikiPageRepository{db: db}
+	return &wikiPageRepository{
+		db: db, canonicalIdentityEnabled: db != nil && db.Migrator().HasTable(&types.WikiCanonicalIdentity{}),
+	}
 }
 
 func (r *wikiPageRepository) wikiCategoryRankOrder() string {
@@ -46,7 +55,99 @@ func (r *wikiPageRepository) wikiEmptyInLinksPredicate() string {
 
 // Create inserts a new wiki page record
 func (r *wikiPageRepository) Create(ctx context.Context, page *types.WikiPage) error {
-	return r.db.WithContext(ctx).Create(page).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := validateWikiCanonicalCreate(tx, page, r.canonicalIdentityEnabled); err != nil {
+			return err
+		}
+		return tx.Create(page).Error
+	})
+}
+
+// CreateWithLinks inserts a page and applies its outbound-link contribution
+// to every existing target page in one transaction.
+func (r *wikiPageRepository) CreateWithLinks(ctx context.Context, page *types.WikiPage) error {
+	return r.withWikiLinkTransaction(ctx, page.KnowledgeBaseID, page.Slug, nil, page.OutLinks,
+		func(tx *gorm.DB, _ *types.WikiPage) error {
+			if err := validateWikiCanonicalCreate(tx, page, r.canonicalIdentityEnabled); err != nil {
+				return err
+			}
+			return tx.Create(page).Error
+		})
+}
+
+func validateWikiCanonicalCreate(tx *gorm.DB, page *types.WikiPage, enabled bool) error {
+	return validateWikiCanonicalWrite(tx, page, enabled)
+}
+
+func validateWikiCanonicalWrite(tx *gorm.DB, page *types.WikiPage, enabled bool) error {
+	if page == nil || (page.PageType != types.WikiPageTypeEntity && page.PageType != types.WikiPageTypeConcept) {
+		return nil
+	}
+	identityKey := types.NormalizeWikiIdentityTitle(page.Title)
+	if identityKey == "" || !enabled {
+		return nil
+	}
+	if page.ID != "" {
+		var stored types.WikiPage
+		if err := tx.Select("id, knowledge_base_id, slug, title, page_type, status").Where("id = ?", page.ID).First(&stored).Error; err == nil {
+			oldKey := types.NormalizeWikiIdentityTitle(stored.Title)
+			if page.Status == types.WikiPageStatusArchived {
+				return tx.Where(
+					"knowledge_base_id = ? AND page_type = ? AND identity_key = ? AND canonical_slug = ?",
+					stored.KnowledgeBaseID, stored.PageType, oldKey, stored.Slug,
+				).Delete(&types.WikiCanonicalIdentity{}).Error
+			}
+			// Historical duplicates that are not yet safe to merge remain
+			// editable. An unchanged identity does not create any new
+			// ambiguity, so only identity-changing updates enter the registry
+			// gate below.
+			if stored.Status != types.WikiPageStatusArchived && stored.Slug == page.Slug &&
+				stored.PageType == page.PageType && oldKey == identityKey {
+				return nil
+			}
+			if oldKey != "" && (oldKey != identityKey || stored.PageType != page.PageType) {
+				if err := tx.Where(
+					"knowledge_base_id = ? AND page_type = ? AND identity_key = ? AND canonical_slug = ?",
+					stored.KnowledgeBaseID, stored.PageType, oldKey, stored.Slug,
+				).Delete(&types.WikiCanonicalIdentity{}).Error; err != nil {
+					return err
+				}
+			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+	}
+	var identity types.WikiCanonicalIdentity
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("knowledge_base_id = ? AND page_type = ? AND identity_key = ?",
+			page.KnowledgeBaseID, page.PageType, identityKey).
+		First(&identity).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		identity = types.WikiCanonicalIdentity{
+			TenantID: page.TenantID, KnowledgeBaseID: page.KnowledgeBaseID,
+			PageType: page.PageType, IdentityKey: identityKey, CanonicalSlug: page.Slug,
+		}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "knowledge_base_id"}, {Name: "page_type"}, {Name: "identity_key"}},
+			DoNothing: true,
+		}).Create(&identity).Error; err != nil {
+			return err
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("knowledge_base_id = ? AND page_type = ? AND identity_key = ?",
+				page.KnowledgeBaseID, page.PageType, identityKey).
+			First(&identity).Error; err != nil {
+			return err
+		}
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
+	if identity.CanonicalSlug != page.Slug {
+		return fmt.Errorf("%w: %s must use %s", ErrWikiCanonicalConflict, page.Slug, identity.CanonicalSlug)
+	}
+	return nil
 }
 
 // Update updates an existing wiki page record with optimistic locking.
@@ -59,7 +160,12 @@ func (r *wikiPageRepository) Create(ctx context.Context, page *types.WikiPage) e
 // map call *did* write empty status — one inconsistent half-update. The map
 // covers every column UpdatePage mutates, so no UpdateMeta chaser is needed.
 func (r *wikiPageRepository) Update(ctx context.Context, page *types.WikiPage) error {
-	return updateWikiPageRow(r.db.WithContext(ctx), page)
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := validateWikiCanonicalWrite(tx, page, r.canonicalIdentityEnabled); err != nil {
+			return err
+		}
+		return updateWikiPageRow(tx, page)
+	})
 }
 
 // UpdateWithRevision snapshots the version being superseded and applies the
@@ -71,19 +177,52 @@ func (r *wikiPageRepository) UpdateWithRevision(
 	ctx context.Context, page *types.WikiPage, rev *types.WikiPageRevision,
 ) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if rev != nil {
-			// An already-present (page_id, version) pair means a concurrent
-			// writer snapshotted the same version first; its copy is
-			// identical, so leaving it alone is correct.
-			if err := tx.Clauses(clause.OnConflict{
-				Columns:   []clause.Column{{Name: "page_id"}, {Name: "version"}},
-				DoNothing: true,
-			}).Create(rev).Error; err != nil {
+		if err := validateWikiCanonicalWrite(tx, page, r.canonicalIdentityEnabled); err != nil {
+			return err
+		}
+		return updateWikiPageWithRevisionRow(tx, page, rev)
+	})
+}
+
+// UpdateWithRevisionAndLinks snapshots the superseded revision, updates the
+// source page, and applies the outbound-link diff atomically.
+func (r *wikiPageRepository) UpdateWithRevisionAndLinks(
+	ctx context.Context,
+	page *types.WikiPage,
+	rev *types.WikiPageRevision,
+	oldOutLinks types.StringArray,
+) error {
+	expectedVersion := page.Version
+	err := r.withWikiLinkTransaction(
+		ctx, page.KnowledgeBaseID, page.Slug, oldOutLinks, page.OutLinks,
+		func(tx *gorm.DB, lockedSource *types.WikiPage) error {
+			if lockedSource != nil {
+				page.InLinks = append(types.StringArray(nil), lockedSource.InLinks...)
+			}
+			if err := validateWikiCanonicalWrite(tx, page, r.canonicalIdentityEnabled); err != nil {
 				return err
 			}
+			return updateWikiPageWithRevisionRow(tx, page, rev)
+		},
+	)
+	if err != nil {
+		page.Version = expectedVersion
+	}
+	return err
+}
+
+func updateWikiPageWithRevisionRow(tx *gorm.DB, page *types.WikiPage, rev *types.WikiPageRevision) error {
+	if rev != nil {
+		// An already-present (page_id, version) pair means a concurrent
+		// writer snapshotted the same version first; its copy is identical.
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "page_id"}, {Name: "version"}},
+			DoNothing: true,
+		}).Create(rev).Error; err != nil {
+			return err
 		}
-		return updateWikiPageRow(tx, page)
-	})
+	}
+	return updateWikiPageRow(tx, page)
 }
 
 // updateWikiPageRow performs the versioned page write on the given handle
@@ -226,7 +365,27 @@ func (r *wikiPageRepository) DeleteRevisionsByPage(ctx context.Context, pageID s
 // pages appear as v2 on first view and confuse users who expect `version` to
 // correspond to the number of intentional revisions.
 func (r *wikiPageRepository) UpdateAutoLinkedContent(ctx context.Context, page *types.WikiPage) error {
-	result := r.db.WithContext(ctx).
+	return updateWikiAutoLinkedContentRow(r.db.WithContext(ctx), page)
+}
+
+// UpdateAutoLinkedContentWithLinks rewrites machine-decorated content and its
+// bidirectional link diff without exposing a partially-updated graph.
+func (r *wikiPageRepository) UpdateAutoLinkedContentWithLinks(
+	ctx context.Context, page *types.WikiPage, oldOutLinks types.StringArray,
+) error {
+	return r.withWikiLinkTransaction(
+		ctx, page.KnowledgeBaseID, page.Slug, oldOutLinks, page.OutLinks,
+		func(tx *gorm.DB, lockedSource *types.WikiPage) error {
+			if lockedSource != nil {
+				page.InLinks = append(types.StringArray(nil), lockedSource.InLinks...)
+			}
+			return updateWikiAutoLinkedContentRow(tx, page)
+		},
+	)
+}
+
+func updateWikiAutoLinkedContentRow(db *gorm.DB, page *types.WikiPage) error {
+	result := db.
 		Model(page).
 		Where("id = ?", page.ID).
 		Updates(map[string]interface{}{
@@ -251,7 +410,35 @@ func (r *wikiPageRepository) UpdateAutoLinkedContent(ctx context.Context, page *
 //
 // Used by link maintenance, re-ingest (same-content case), and status changes.
 func (r *wikiPageRepository) UpdateMeta(ctx context.Context, page *types.WikiPage) error {
-	result := r.db.WithContext(ctx).
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := validateWikiCanonicalWrite(tx, page, r.canonicalIdentityEnabled); err != nil {
+			return err
+		}
+		return updateWikiPageMetaRow(tx, page)
+	})
+}
+
+// UpdateMetaWithLinks persists bookkeeping fields and the link diff in one
+// transaction. It covers stale stored out_links even when content is unchanged.
+func (r *wikiPageRepository) UpdateMetaWithLinks(
+	ctx context.Context, page *types.WikiPage, oldOutLinks types.StringArray,
+) error {
+	return r.withWikiLinkTransaction(
+		ctx, page.KnowledgeBaseID, page.Slug, oldOutLinks, page.OutLinks,
+		func(tx *gorm.DB, lockedSource *types.WikiPage) error {
+			if lockedSource != nil {
+				page.InLinks = append(types.StringArray(nil), lockedSource.InLinks...)
+			}
+			if err := validateWikiCanonicalWrite(tx, page, r.canonicalIdentityEnabled); err != nil {
+				return err
+			}
+			return updateWikiPageMetaRow(tx, page)
+		},
+	)
+}
+
+func updateWikiPageMetaRow(db *gorm.DB, page *types.WikiPage) error {
+	result := db.
 		Model(page).
 		Where("id = ?", page.ID).
 		Updates(map[string]interface{}{
@@ -277,6 +464,260 @@ func (r *wikiPageRepository) UpdateMeta(ctx context.Context, page *types.WikiPag
 		return ErrWikiPageNotFound
 	}
 	return nil
+}
+
+// withWikiLinkTransaction locks every involved live page in slug order on
+// PostgreSQL, executes the source-page write, then applies the target in_links
+// diff. SQLite relies on its transaction write lock. Any target failure rolls
+// back the source row and revision as well.
+func (r *wikiPageRepository) withWikiLinkTransaction(
+	ctx context.Context,
+	kbID string,
+	sourceSlug string,
+	oldOutLinks types.StringArray,
+	newOutLinks types.StringArray,
+	writeSource func(*gorm.DB, *types.WikiPage) error,
+) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := validateWikiSourceAttemptGuards(tx, ctx, kbID); err != nil {
+			return err
+		}
+		if err := serializeWikiLinkSource(tx, kbID, sourceSlug); err != nil {
+			return err
+		}
+		currentSource, err := getWikiLinkSource(tx, kbID, sourceSlug)
+		if err != nil {
+			return err
+		}
+		if r.testAfterWikiLinkSourceSerialized != nil {
+			r.testAfterWikiLinkSourceSerialized()
+		}
+		effectiveOldOutLinks := oldOutLinks
+		if currentSource != nil {
+			effectiveOldOutLinks = append(types.StringArray(nil), currentSource.OutLinks...)
+		}
+		targetSlugs := wikiLinkTargetSlugs(
+			types.StringArray{sourceSlug}, effectiveOldOutLinks, newOutLinks,
+		)
+		targets, err := lockWikiLinkTargets(tx, kbID, targetSlugs)
+		if err != nil {
+			return err
+		}
+		lockedSource := targets[sourceSlug]
+		if err := writeSource(tx, lockedSource); err != nil {
+			return err
+		}
+
+		oldSet := wikiSlugSet(effectiveOldOutLinks)
+		newSet := wikiSlugSet(newOutLinks)
+		for _, slug := range targetSlugs {
+			if slug == sourceSlug {
+				// A newly-created self-link was absent during the pre-write lock.
+				if _, ok := targets[slug]; !ok {
+					var source types.WikiPage
+					if err := tx.Where("knowledge_base_id = ? AND slug = ?", kbID, slug).First(&source).Error; err != nil {
+						return err
+					}
+					targets[slug] = &source
+				}
+			}
+			target := targets[slug]
+			if target == nil { // links to pages that do not exist yet are allowed
+				continue
+			}
+			want := newSet[slug]
+			had := oldSet[slug]
+			if want == had && wikiLinkMembershipIsCanonical(target.InLinks, sourceSlug, want) {
+				continue
+			}
+			updated := wikiSetLinkMembership(target.InLinks, sourceSlug, want)
+			result := tx.Model(&types.WikiPage{}).
+				Where("id = ?", target.ID).
+				Updates(map[string]interface{}{"in_links": updated, "updated_at": time.Now()})
+			if result.Error != nil {
+				return fmt.Errorf("update in_links for %s: %w", slug, result.Error)
+			}
+			if result.RowsAffected == 0 {
+				return fmt.Errorf("update in_links for %s: %w", slug, ErrWikiPageNotFound)
+			}
+			target.InLinks = updated
+		}
+		return applyWikiSlugApplicationTransition(tx, ctx)
+	})
+}
+
+// validateWikiSourceAttemptGuards serializes Wiki writes with OpenAttempt and
+// validates every source document inside the page mutation transaction. A
+// detached worker can therefore never write after a newer attempt has opened,
+// nor after the source/KB was deleted or Wiki was disabled.
+func validateWikiSourceAttemptGuards(tx *gorm.DB, ctx context.Context, kbID string) error {
+	guards, guarded := types.WikiSourceAttemptGuardsFromContext(ctx)
+	if !guarded {
+		return nil
+	}
+	if strings.TrimSpace(kbID) == "" {
+		return errors.New("wiki source attempt guard: knowledge base id is required")
+	}
+
+	for _, guard := range guards {
+		if tx.Dialector != nil && tx.Dialector.Name() == "postgres" {
+			if err := tx.Exec(
+				"SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", guard.KnowledgeID,
+			).Error; err != nil {
+				return fmt.Errorf("lock wiki source %s: %w", guard.KnowledgeID, err)
+			}
+		}
+	}
+
+	query := tx
+	if tx.Dialector != nil && tx.Dialector.Name() == "postgres" {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	var kb types.KnowledgeBase
+	if err := query.Where("id = ?", kbID).First(&kb).Error; err != nil {
+		return fmt.Errorf("validate wiki knowledge base %s: %w", kbID, err)
+	}
+	if !kb.IsWikiEnabled() {
+		return fmt.Errorf("validate wiki knowledge base %s: wiki is disabled", kbID)
+	}
+
+	for _, guard := range guards {
+		query = tx
+		if tx.Dialector != nil && tx.Dialector.Name() == "postgres" {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		var knowledge types.Knowledge
+		if err := query.Where("id = ? AND knowledge_base_id = ?", guard.KnowledgeID, kbID).
+			First(&knowledge).Error; err != nil {
+			return fmt.Errorf("validate wiki source %s: %w", guard.KnowledgeID, err)
+		}
+		if knowledge.ParseStatus == types.ParseStatusDeleting || knowledge.ParseStatus == types.ParseStatusCancelled {
+			return fmt.Errorf("validate wiki source %s: knowledge is %s", guard.KnowledgeID, knowledge.ParseStatus)
+		}
+		if guard.Attempt == 0 {
+			if knowledge.ParseStatus != types.ParseStatusCompleted {
+				return fmt.Errorf(
+					"validate wiki maintenance source %s: knowledge is %s",
+					guard.KnowledgeID, knowledge.ParseStatus,
+				)
+			}
+			continue
+		}
+
+		var latestAttempt int
+		if err := tx.Model(&types.KnowledgeProcessingSpan{}).
+			Where("knowledge_id = ? AND kind = ?", guard.KnowledgeID, types.SpanKindRoot).
+			Select("COALESCE(MAX(attempt), 0)").Scan(&latestAttempt).Error; err != nil {
+			return fmt.Errorf("validate wiki source %s latest attempt: %w", guard.KnowledgeID, err)
+		}
+		if latestAttempt != guard.Attempt {
+			return fmt.Errorf(
+				"validate wiki source %s: attempt %d was superseded by attempt %d",
+				guard.KnowledgeID, guard.Attempt, latestAttempt,
+			)
+		}
+	}
+	return nil
+}
+
+// serializeWikiLinkSource prevents two writers for the same source from
+// deriving their diff from the same stale row. It deliberately does not lock
+// a wiki_pages row: reciprocal A->B / B->A writers take different advisory
+// locks, then both acquire all involved rows in the same slug order below.
+func serializeWikiLinkSource(tx *gorm.DB, kbID string, slug string) error {
+	if tx.Dialector == nil || tx.Dialector.Name() != "postgres" {
+		return nil
+	}
+	key := fmt.Sprintf("wiki-link:%d:%s:%s", len(kbID), kbID, slug)
+	return tx.Exec("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", key).Error
+}
+
+func getWikiLinkSource(tx *gorm.DB, kbID string, slug string) (*types.WikiPage, error) {
+	var source types.WikiPage
+	if err := tx.Where("knowledge_base_id = ? AND slug = ?", kbID, slug).First(&source).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &source, nil
+}
+
+func lockWikiLinkTargets(tx *gorm.DB, kbID string, slugs []string) (map[string]*types.WikiPage, error) {
+	targets := make(map[string]*types.WikiPage, len(slugs))
+	if len(slugs) == 0 {
+		return targets, nil
+	}
+	query := tx.Where("knowledge_base_id = ? AND slug IN ?", kbID, slugs).Order("slug ASC")
+	if tx.Dialector != nil && tx.Dialector.Name() == "postgres" {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	var pages []*types.WikiPage
+	if err := query.Find(&pages).Error; err != nil {
+		return nil, err
+	}
+	for _, page := range pages {
+		targets[page.Slug] = page
+	}
+	return targets, nil
+}
+
+func wikiLinkTargetSlugs(sets ...types.StringArray) []string {
+	seen := make(map[string]struct{})
+	for _, links := range sets {
+		for _, slug := range links {
+			if slug != "" {
+				seen[slug] = struct{}{}
+			}
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for slug := range seen {
+		result = append(result, slug)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func wikiSlugSet(links types.StringArray) map[string]bool {
+	set := make(map[string]bool, len(links))
+	for _, slug := range links {
+		set[slug] = true
+	}
+	return set
+}
+
+func wikiLinkMembershipIsCanonical(links types.StringArray, slug string, want bool) bool {
+	count := 0
+	for _, item := range links {
+		if item == slug {
+			count++
+		}
+	}
+	if want {
+		return count == 1
+	}
+	return count == 0
+}
+
+func wikiSetLinkMembership(links types.StringArray, slug string, want bool) types.StringArray {
+	seen := make(map[string]struct{}, len(links)+1)
+	result := make(types.StringArray, 0, len(links)+1)
+	for _, item := range links {
+		if item == "" || item == slug {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		result = append(result, item)
+	}
+	if want {
+		result = append(result, slug)
+	}
+	sort.Strings(result)
+	return result
 }
 
 // GetByID retrieves a wiki page by its unique ID
@@ -317,6 +758,8 @@ func (r *wikiPageRepository) List(ctx context.Context, req *types.WikiPageListRe
 	}
 	if req.Status != "" {
 		query = query.Where("status = ?", req.Status)
+	} else {
+		query = query.Where("status <> ?", types.WikiPageStatusArchived)
 	}
 	if req.Query != "" {
 		// Use PostgreSQL full-text search + ILIKE for aliases
@@ -1097,9 +1540,42 @@ func (r *wikiPageRepository) ListRecentForSuggestions(
 
 // Delete soft-deletes a wiki page by knowledge base ID and slug
 func (r *wikiPageRepository) Delete(ctx context.Context, kbID string, slug string) error {
-	result := r.db.WithContext(ctx).
-		Where("knowledge_base_id = ? AND slug = ?", kbID, slug).
-		Delete(&types.WikiPage{})
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var page types.WikiPage
+		if err := tx.Where("knowledge_base_id = ? AND slug = ?", kbID, slug).First(&page).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrWikiPageNotFound
+			}
+			return err
+		}
+		return deleteWikiPageAndCanonicalIdentity(tx, &page, r.canonicalIdentityEnabled)
+	})
+}
+
+// DeleteByID soft-deletes a wiki page by ID
+func (r *wikiPageRepository) DeleteByID(ctx context.Context, id string) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var page types.WikiPage
+		if err := tx.Where("id = ?", id).First(&page).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrWikiPageNotFound
+			}
+			return err
+		}
+		return deleteWikiPageAndCanonicalIdentity(tx, &page, r.canonicalIdentityEnabled)
+	})
+}
+
+func deleteWikiPageAndCanonicalIdentity(tx *gorm.DB, page *types.WikiPage, enabled bool) error {
+	if enabled && page != nil && (page.PageType == types.WikiPageTypeEntity || page.PageType == types.WikiPageTypeConcept) {
+		if err := tx.Where(
+			"knowledge_base_id = ? AND page_type = ? AND identity_key = ? AND canonical_slug = ?",
+			page.KnowledgeBaseID, page.PageType, types.NormalizeWikiIdentityTitle(page.Title), page.Slug,
+		).Delete(&types.WikiCanonicalIdentity{}).Error; err != nil {
+			return err
+		}
+	}
+	result := tx.Delete(page)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -1109,18 +1585,467 @@ func (r *wikiPageRepository) Delete(ctx context.Context, kbID string, slug strin
 	return nil
 }
 
-// DeleteByID soft-deletes a wiki page by ID
-func (r *wikiPageRepository) DeleteByID(ctx context.Context, id string) error {
-	result := r.db.WithContext(ctx).
-		Where("id = ?", id).
-		Delete(&types.WikiPage{})
-	if result.Error != nil {
-		return result.Error
+// ResolveCanonicalWikiPageSlugs atomically registers or reads the durable
+// canonical slug for every exact title identity. The unique registry key is
+// authoritative across workers, retries, Redis expiry, and process restarts.
+func (r *wikiPageRepository) ResolveCanonicalWikiPageSlugs(
+	ctx context.Context,
+	tenantID uint64,
+	kbID string,
+	candidates []types.WikiCanonicalCandidate,
+) (map[string]string, error) {
+	resolved := make(map[string]string, len(candidates))
+	ordered := append([]types.WikiCanonicalCandidate(nil), candidates...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left := ordered[i].PageType + "\x00" + types.NormalizeWikiIdentityTitle(ordered[i].Title) + "\x00" + ordered[i].Slug
+		right := ordered[j].PageType + "\x00" + types.NormalizeWikiIdentityTitle(ordered[j].Title) + "\x00" + ordered[j].Slug
+		return left < right
+	})
+
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, candidate := range ordered {
+			if candidate.Slug == "" || (candidate.PageType != types.WikiPageTypeEntity && candidate.PageType != types.WikiPageTypeConcept) {
+				continue
+			}
+			identityKey := types.NormalizeWikiIdentityTitle(candidate.Title)
+			if identityKey == "" {
+				resolved[candidate.Slug] = candidate.Slug
+				continue
+			}
+
+			existingCanonicalSlug, err := r.bestExistingCanonicalSlug(tx, kbID, candidate.PageType, identityKey)
+			if err != nil {
+				return err
+			}
+			canonicalSlug := existingCanonicalSlug
+			if canonicalSlug == "" {
+				canonicalSlug = candidate.Slug
+			}
+			identity := types.WikiCanonicalIdentity{
+				TenantID: tenantID, KnowledgeBaseID: kbID, PageType: candidate.PageType,
+				IdentityKey: identityKey, CanonicalSlug: canonicalSlug,
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "knowledge_base_id"}, {Name: "page_type"}, {Name: "identity_key"}},
+				DoNothing: true,
+			}).Create(&identity).Error; err != nil {
+				return err
+			}
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("knowledge_base_id = ? AND page_type = ? AND identity_key = ?", kbID, candidate.PageType, identityKey).
+				First(&identity).Error; err != nil {
+				return err
+			}
+			var registered types.WikiPage
+			registeredErr := tx.Where(
+				"knowledge_base_id = ? AND slug = ? AND page_type = ? AND status <> ?",
+				kbID, identity.CanonicalSlug, candidate.PageType, types.WikiPageStatusArchived,
+			).First(&registered).Error
+			registeredValid := registeredErr == nil &&
+				types.NormalizeWikiIdentityTitle(registered.Title) == identityKey
+			if registeredErr != nil && !errors.Is(registeredErr, gorm.ErrRecordNotFound) {
+				return registeredErr
+			}
+			// A registry row whose page has not been created yet is still
+			// authoritative: it may belong to a concurrent worker between
+			// reservation and persist. Only retarget an identity when another
+			// live page already proves the registry stale.
+			if !registeredValid && existingCanonicalSlug != "" && existingCanonicalSlug != identity.CanonicalSlug {
+				identity.CanonicalSlug = canonicalSlug
+				identity.UpdatedAt = time.Now()
+				if err := tx.Model(&types.WikiCanonicalIdentity{}).
+					Where("id = ?", identity.ID).
+					Updates(map[string]interface{}{
+						"canonical_slug": canonicalSlug,
+						"updated_at":     identity.UpdatedAt,
+					}).Error; err != nil {
+					return err
+				}
+			}
+			resolved[candidate.Slug] = identity.CanonicalSlug
+		}
+		return nil
+	})
+	return resolved, err
+}
+
+func (r *wikiPageRepository) bestExistingCanonicalSlug(
+	db *gorm.DB, kbID, pageType, identityKey string,
+) (string, error) {
+	var pages []*types.WikiPage
+	query := db.Model(&types.WikiPage{}).
+		Where("knowledge_base_id = ? AND page_type = ? AND status <> ?", kbID, pageType, types.WikiPageStatusArchived)
+	if db.Dialector.Name() == "postgres" {
+		query = query.Where("regexp_replace(lower(trim(title)), '[^[:alnum:]]+', '', 'g') = ?", identityKey)
 	}
-	if result.RowsAffected == 0 {
-		return ErrWikiPageNotFound
+	if err := query.Find(&pages).Error; err != nil {
+		return "", err
+	}
+	filtered := pages[:0]
+	for _, page := range pages {
+		if types.NormalizeWikiIdentityTitle(page.Title) == identityKey {
+			filtered = append(filtered, page)
+		}
+	}
+	if len(filtered) == 0 {
+		return "", nil
+	}
+	sort.SliceStable(filtered, func(i, j int) bool { return betterWikiCanonicalPage(filtered[i], filtered[j]) })
+	return filtered[0].Slug, nil
+}
+
+// ReconcileCanonicalWikiPages is a repeatable convergence pass. It only
+// archives a duplicate after the canonical page covers every source document;
+// ambiguous groups remain live and will be reconsidered on a later finalize.
+func (r *wikiPageRepository) ReconcileCanonicalWikiPages(
+	ctx context.Context, kbID string, affectedSlugs []string,
+) (*types.WikiCanonicalReconcileResult, error) {
+	result := &types.WikiCanonicalReconcileResult{Aliases: make(map[string]string)}
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		targetKeys, err := r.reconcileWikiIdentityKeys(tx, kbID, affectedSlugs)
+		if err != nil || (len(affectedSlugs) > 0 && len(targetKeys) == 0) {
+			return err
+		}
+		var pages []*types.WikiPage
+		pageQuery := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("knowledge_base_id = ? AND page_type IN ? AND status <> ?", kbID,
+				[]string{types.WikiPageTypeEntity, types.WikiPageTypeConcept}, types.WikiPageStatusArchived)
+		if len(targetKeys) > 0 && tx.Dialector.Name() == "postgres" {
+			var scopes []string
+			var args []interface{}
+			for key := range targetKeys {
+				parts := strings.SplitN(key, "\x00", 2)
+				if len(parts) != 2 {
+					continue
+				}
+				scopes = append(scopes, "(page_type = ? AND regexp_replace(lower(trim(title)), '[^[:alnum:]]+', '', 'g') = ?)")
+				args = append(args, parts[0], parts[1])
+			}
+			if len(scopes) > 0 {
+				pageQuery = pageQuery.Where("("+strings.Join(scopes, " OR ")+")", args...)
+			}
+		}
+		if err := pageQuery.Find(&pages).Error; err != nil {
+			return err
+		}
+
+		groups := make(map[string][]*types.WikiPage)
+		for _, page := range pages {
+			identityKey := types.NormalizeWikiIdentityTitle(page.Title)
+			groupKey := page.PageType + "\x00" + identityKey
+			if identityKey != "" && (len(targetKeys) == 0 || targetKeys[groupKey]) {
+				groups[groupKey] = append(groups[groupKey], page)
+			}
+		}
+		keys := make([]string, 0, len(groups))
+		for key := range groups {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		for _, key := range keys {
+			group := groups[key]
+			if len(group) < 2 {
+				continue
+			}
+			sort.SliceStable(group, func(i, j int) bool { return betterWikiCanonicalPage(group[i], group[j]) })
+			canonical := group[0]
+			identityKey := types.NormalizeWikiIdentityTitle(canonical.Title)
+			var registered types.WikiCanonicalIdentity
+			registeredErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("knowledge_base_id = ? AND page_type = ? AND identity_key = ?", kbID, canonical.PageType, identityKey).
+				First(&registered).Error
+			if registeredErr != nil && !errors.Is(registeredErr, gorm.ErrRecordNotFound) {
+				return registeredErr
+			}
+			if registeredErr == nil {
+				for _, page := range group {
+					if page.Slug == registered.CanonicalSlug {
+						canonical = page
+						break
+					}
+				}
+			}
+			identity := types.WikiCanonicalIdentity{
+				TenantID: canonical.TenantID, KnowledgeBaseID: kbID, PageType: canonical.PageType,
+				IdentityKey: identityKey, CanonicalSlug: canonical.Slug,
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "knowledge_base_id"}, {Name: "page_type"}, {Name: "identity_key"}},
+				DoUpdates: clause.Assignments(map[string]interface{}{
+					"canonical_slug": canonical.Slug, "updated_at": time.Now(),
+				}),
+			}).Create(&identity).Error; err != nil {
+				return err
+			}
+
+			for _, duplicate := range group {
+				if duplicate.ID == canonical.ID {
+					continue
+				}
+				if !wikiSourceRefsCover(canonical.SourceRefs, duplicate.SourceRefs) {
+					result.DeferredPages++
+					continue
+				}
+				canonical.ChunkRefs = mergeWikiStringArrays(canonical.ChunkRefs, duplicate.ChunkRefs)
+				canonical.Aliases = mergeWikiStringArrays(canonical.Aliases, duplicate.Aliases)
+				canonical.InLinks = mergeWikiStringArrays(canonical.InLinks, duplicate.InLinks)
+				canonical.OutLinks = mergeWikiStringArrays(canonical.OutLinks, duplicate.OutLinks)
+				if duplicate.Title != canonical.Title {
+					canonical.Aliases = mergeWikiStringArrays(canonical.Aliases, types.StringArray{duplicate.Title})
+				}
+				if err := tx.Model(&types.WikiPage{}).Where("id = ?", canonical.ID).Updates(map[string]interface{}{
+					"chunk_refs": canonical.ChunkRefs, "aliases": canonical.Aliases,
+					"in_links": canonical.InLinks, "out_links": canonical.OutLinks, "updated_at": time.Now(),
+				}).Error; err != nil {
+					return err
+				}
+				if err := migrateWikiSlugCheckpointReferences(tx, kbID, duplicate.Slug, canonical.Slug); err != nil {
+					return err
+				}
+				if err := tx.Model(&types.WikiPage{}).Where("id = ? AND status <> ?", duplicate.ID, types.WikiPageStatusArchived).
+					Updates(map[string]interface{}{"status": types.WikiPageStatusArchived, "updated_at": time.Now()}).Error; err != nil {
+					return err
+				}
+				audit := types.WikiPageMergeAudit{
+					TenantID: duplicate.TenantID, KnowledgeBaseID: kbID, PageType: duplicate.PageType,
+					IdentityKey: identityKey, CanonicalPageID: canonical.ID, CanonicalSlug: canonical.Slug,
+					MergedPageID: duplicate.ID, MergedSlug: duplicate.Slug, Reason: "canonical_source_coverage",
+				}
+				if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&audit).Error; err != nil {
+					return err
+				}
+				result.Aliases[duplicate.Slug] = canonical.Slug
+				result.MergedPages++
+			}
+		}
+		return rewriteWikiSlugReferences(tx, kbID, result.Aliases)
+	})
+	if len(result.Aliases) == 0 {
+		result.Aliases = nil
+	}
+	return result, err
+}
+
+func (r *wikiPageRepository) reconcileWikiIdentityKeys(
+	tx *gorm.DB, kbID string, affectedSlugs []string,
+) (map[string]bool, error) {
+	if len(affectedSlugs) == 0 {
+		return nil, nil
+	}
+	var pages []*types.WikiPage
+	if err := tx.Select("slug, title, page_type").
+		Where("knowledge_base_id = ? AND slug IN ? AND page_type IN ? AND status <> ?", kbID, affectedSlugs,
+			[]string{types.WikiPageTypeEntity, types.WikiPageTypeConcept}, types.WikiPageStatusArchived).
+		Find(&pages).Error; err != nil {
+		return nil, err
+	}
+	keys := make(map[string]bool, len(pages))
+	for _, page := range pages {
+		identityKey := types.NormalizeWikiIdentityTitle(page.Title)
+		if identityKey != "" {
+			keys[page.PageType+"\x00"+identityKey] = true
+		}
+	}
+	return keys, nil
+}
+
+func betterWikiCanonicalPage(left, right *types.WikiPage) bool {
+	if len(wikiSourceRefIDs(left.SourceRefs)) != len(wikiSourceRefIDs(right.SourceRefs)) {
+		return len(wikiSourceRefIDs(left.SourceRefs)) > len(wikiSourceRefIDs(right.SourceRefs))
+	}
+	if left.Version != right.Version {
+		return left.Version > right.Version
+	}
+	if len([]rune(left.Content)) != len([]rune(right.Content)) {
+		return len([]rune(left.Content)) > len([]rune(right.Content))
+	}
+	if !left.CreatedAt.Equal(right.CreatedAt) {
+		return left.CreatedAt.Before(right.CreatedAt)
+	}
+	return left.Slug < right.Slug
+}
+
+func wikiSourceRefIDs(refs types.StringArray) map[string]struct{} {
+	out := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		id := strings.TrimSpace(strings.SplitN(ref, "|", 2)[0])
+		if id != "" {
+			out[id] = struct{}{}
+		}
+	}
+	return out
+}
+
+func wikiSourceRefsCover(canonical, duplicate types.StringArray) bool {
+	covered := wikiSourceRefIDs(canonical)
+	for id := range wikiSourceRefIDs(duplicate) {
+		if _, ok := covered[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func mergeWikiStringArrays(left, right types.StringArray) types.StringArray {
+	seen := make(map[string]struct{}, len(left)+len(right))
+	out := make(types.StringArray, 0, len(left)+len(right))
+	for _, value := range append(append(types.StringArray(nil), left...), right...) {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func rewriteWikiSlugReferences(tx *gorm.DB, kbID string, aliases map[string]string) error {
+	if len(aliases) == 0 {
+		return nil
+	}
+	oldSlugs := make([]string, 0, len(aliases))
+	for oldSlug := range aliases {
+		oldSlugs = append(oldSlugs, oldSlug)
+	}
+	sort.Strings(oldSlugs)
+
+	var pages []*types.WikiPage
+	if err := tx.Where("knowledge_base_id = ? AND status <> ? AND slug NOT IN ?", kbID,
+		types.WikiPageStatusArchived, oldSlugs).Find(&pages).Error; err != nil {
+		return err
+	}
+	for _, page := range pages {
+		updates := make(map[string]interface{})
+		content := page.Content
+		summary := page.Summary
+		parentSlug := page.ParentSlug
+		inLinks := page.InLinks
+		outLinks := page.OutLinks
+		for _, oldSlug := range oldSlugs {
+			canonicalSlug := aliases[oldSlug]
+			content = rewriteExactWikiSlug(content, oldSlug, canonicalSlug)
+			summary = rewriteExactWikiSlug(summary, oldSlug, canonicalSlug)
+			if parentSlug == oldSlug {
+				parentSlug = canonicalSlug
+			}
+			inLinks, _ = replaceWikiArrayValue(inLinks, oldSlug, canonicalSlug)
+			outLinks, _ = replaceWikiArrayValue(outLinks, oldSlug, canonicalSlug)
+		}
+		if content != page.Content {
+			updates["content"] = content
+		}
+		if summary != page.Summary {
+			updates["summary"] = summary
+		}
+		if parentSlug != page.ParentSlug {
+			updates["parent_slug"] = parentSlug
+		}
+		if !wikiStringArraysEqual(inLinks, page.InLinks) {
+			updates["in_links"] = inLinks
+		}
+		if !wikiStringArraysEqual(outLinks, page.OutLinks) {
+			updates["out_links"] = outLinks
+		}
+		if len(updates) > 0 {
+			updates["updated_at"] = time.Now()
+			if err := tx.Model(&types.WikiPage{}).Where("id = ?", page.ID).Updates(updates).Error; err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+func rewriteExactWikiSlug(value, oldSlug, canonicalSlug string) string {
+	value = strings.ReplaceAll(value, "[["+oldSlug+"]]", "[["+canonicalSlug+"]]")
+	return strings.ReplaceAll(value, "[["+oldSlug+"|", "[["+canonicalSlug+"|")
+}
+
+func wikiStringArraysEqual(left, right types.StringArray) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func migrateWikiSlugCheckpointReferences(tx *gorm.DB, kbID, oldSlug, canonicalSlug string) error {
+	if tx.Migrator().HasTable(&types.WikiSlugContributionMarker{}) &&
+		tx.Migrator().HasTable(&types.WikiIngestWorkUnit{}) {
+		if err := migrateWikiContributionMarkers(tx, kbID, oldSlug, canonicalSlug); err != nil {
+			return err
+		}
+	}
+	if tx.Migrator().HasTable(&types.WikiSlugApplication{}) {
+		if err := tx.Model(&types.WikiSlugApplication{}).
+			Where("knowledge_base_id = ? AND slug = ?", kbID, oldSlug).
+			Update("slug", canonicalSlug).Error; err != nil {
+			return err
+		}
+	}
+	if tx.Migrator().HasTable(&types.WikiPageIssue{}) {
+		return tx.Model(&types.WikiPageIssue{}).
+			Where("knowledge_base_id = ? AND slug = ?", kbID, oldSlug).
+			Update("slug", canonicalSlug).Error
+	}
+	return nil
+}
+
+func migrateWikiContributionMarkers(tx *gorm.DB, kbID, oldSlug, canonicalSlug string) error {
+	// A work unit may already have published both spellings. Remove only the
+	// row that would collide, then rewrite every remaining marker so replay
+	// recognizes the canonical contribution as already published.
+	if tx.Dialector.Name() == "postgres" {
+		if err := tx.Exec(`DELETE FROM wiki_slug_contribution_markers old_marker
+			USING wiki_slug_contribution_markers canonical_marker, wiki_ingest_work_units work_unit
+			WHERE old_marker.slug = ? AND canonical_marker.slug = ?
+			  AND old_marker.work_id = canonical_marker.work_id
+			  AND old_marker.operation_digest = canonical_marker.operation_digest
+			  AND work_unit.work_id = old_marker.work_id
+			  AND work_unit.knowledge_base_id = ?`, oldSlug, canonicalSlug, kbID).Error; err != nil {
+			return err
+		}
+	} else {
+		if err := tx.Exec(`DELETE FROM wiki_slug_contribution_markers
+			WHERE slug = ? AND EXISTS (
+				SELECT 1 FROM wiki_slug_contribution_markers canonical_marker
+				WHERE canonical_marker.slug = ?
+				  AND canonical_marker.work_id = wiki_slug_contribution_markers.work_id
+				  AND canonical_marker.operation_digest = wiki_slug_contribution_markers.operation_digest
+			) AND work_id IN (
+				SELECT work_id FROM wiki_ingest_work_units WHERE knowledge_base_id = ?
+			)`, oldSlug, canonicalSlug, kbID).Error; err != nil {
+			return err
+		}
+	}
+	return tx.Model(&types.WikiSlugContributionMarker{}).
+		Where("slug = ? AND work_id IN (?)", oldSlug,
+			tx.Model(&types.WikiIngestWorkUnit{}).Select("work_id").Where("knowledge_base_id = ?", kbID)).
+		Update("slug", canonicalSlug).Error
+}
+
+func replaceWikiArrayValue(values types.StringArray, oldValue, newValue string) (types.StringArray, bool) {
+	changed := false
+	out := make(types.StringArray, 0, len(values))
+	for _, value := range values {
+		if value == oldValue {
+			value = newValue
+			changed = true
+		}
+		out = append(out, value)
+	}
+	if !changed {
+		return values, false
+	}
+	return mergeWikiStringArrays(nil, out), true
 }
 
 // escapeLikePattern escapes LIKE / ILIKE metacharacters so the returned string

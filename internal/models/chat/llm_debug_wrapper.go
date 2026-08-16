@@ -44,8 +44,23 @@ func (d *debugChat) ChatStream(ctx context.Context, messages []Message, opts *Ch
 		var usage *types.TokenUsage
 		var toolCalls []types.LLMToolCall
 		var streamErr error
+		defer func() {
+			logLLMDebugStream(ctx, d.inner.GetModelName(), messages, opts,
+				content.String(), toolCalls, usage, streamErr, time.Since(callStart))
+		}()
 
-		for resp := range ch {
+		for {
+			var resp types.StreamResponse
+			var ok bool
+			select {
+			case <-ctx.Done():
+				streamErr = ctx.Err()
+				return
+			case resp, ok = <-ch:
+				if !ok {
+					return
+				}
+			}
 			if resp.ResponseType == types.ResponseTypeAnswer && resp.Content != "" {
 				content.WriteString(resp.Content)
 			}
@@ -58,11 +73,10 @@ func (d *debugChat) ChatStream(ctx context.Context, messages []Message, opts *Ch
 			if len(resp.ToolCalls) > 0 {
 				toolCalls = resp.ToolCalls
 			}
-			wrapped <- resp
+			if !sendStreamResponse(ctx, wrapped, resp) {
+				return
+			}
 		}
-
-		logLLMDebugStream(ctx, d.inner.GetModelName(), messages, opts,
-			content.String(), toolCalls, usage, streamErr, time.Since(callStart))
 	}()
 
 	return wrapped, nil

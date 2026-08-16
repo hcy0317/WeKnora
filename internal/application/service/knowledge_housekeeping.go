@@ -112,7 +112,7 @@ func (h *HousekeepingService) runSweep(ctx context.Context) {
 	threshold := h.staleThreshold()
 	cutoff := time.Now().Add(-threshold)
 
-	// Sweep A: knowledge stuck in "pending", "processing", or "finalizing".
+	// Sweep A: legacy knowledge stuck before post-processing.
 	//
 	// Two-stage check is critical here: knowledge.updated_at advances
 	// only at parse_status transitions, but a long stage (DocReader on
@@ -129,16 +129,14 @@ func (h *HousekeepingService) runSweep(ctx context.Context) {
 	// updated_at check — they have no heartbeat to consult.
 	// Include 'pending' so a task whose enqueue was lost is eventually
 	// recovered too; filterOutQueued below protects legitimately backlogged
-	// tasks. Include 'finalizing' alongside 'processing': finalizing rows still
-	// consume LLM compute via enrichment subtasks (summary/question/graph),
-	// and the same stall modes (subtask worker dies, retry budget exhausted
-	// without decrementing the counter) leave the row hanging just as
-	// visibly. Housekeeping promotes both states to 'failed' once the
-	// span heartbeat is older than the threshold.
+	// tasks. Finalizing is deliberately excluded: its owner is a concrete
+	// postprocess span/durable op and can only be recovered by the exact-owner
+	// evaluator and atomic partial-repair transaction. A broad knowledge UPDATE
+	// here would split knowledge state from its still-open span/op.
 	var candidates []types.Knowledge
 	if err := h.db.WithContext(ctx).
 		Where("parse_status IN ? AND updated_at < ?",
-			[]string{types.ParseStatusPending, types.ParseStatusProcessing, types.ParseStatusFinalizing}, cutoff).
+			[]string{types.ParseStatusPending, types.ParseStatusProcessing}, cutoff).
 		Find(&candidates).Error; err != nil {
 		logger.Warnf(ctx, "[Housekeeping] knowledge candidate query failed: %v", err)
 		return
@@ -164,7 +162,7 @@ func (h *HousekeepingService) runSweep(ctx context.Context) {
 		}
 		res := h.db.WithContext(ctx).Model(&types.Knowledge{}).
 			Where("id IN ? AND parse_status IN ?", stuckIDs,
-				[]string{types.ParseStatusPending, types.ParseStatusProcessing, types.ParseStatusFinalizing}).
+				[]string{types.ParseStatusPending, types.ParseStatusProcessing}).
 			Updates(map[string]interface{}{
 				"parse_status":           types.ParseStatusFailed,
 				"error_message":          "task stuck in processing > " + threshold.String() + ", recovered by housekeeping",
@@ -196,13 +194,23 @@ func (h *HousekeepingService) runSweep(ctx context.Context) {
 			queueSkipped)
 	}
 
-	// Sweep B: knowledge summary stuck. Summary is post-parse; threshold
-	// is shorter because summary tasks are bounded by a single LLM call.
-	// No span heartbeat exists for the summary stage (it lives in a
-	// downstream asynq task), so we accept the original simple check.
+	// Sweep B: legacy summary rows use the same fail-closed queue gate. Modern
+	// postprocess owners are recovered by the exact span evaluator.
 	summaryCutoff := time.Now().Add(-1 * time.Hour)
-	resSummary := h.db.WithContext(ctx).Model(&types.Knowledge{}).
+	var summaryCandidates []types.Knowledge
+	if err := h.db.WithContext(ctx).
 		Where("summary_status = ? AND updated_at < ?", types.SummaryStatusProcessing, summaryCutoff).
+		Find(&summaryCandidates).Error; err != nil {
+		logger.Warnf(ctx, "[Housekeeping] summary candidate query failed: %v", err)
+		return
+	}
+	summaryStuck, _ := h.filterOutQueued(ctx, summaryCandidates)
+	summaryIDs := make([]string, 0, len(summaryStuck))
+	for _, knowledge := range summaryStuck {
+		summaryIDs = append(summaryIDs, knowledge.ID)
+	}
+	resSummary := h.db.WithContext(ctx).Model(&types.Knowledge{}).
+		Where("id IN ? AND summary_status = ?", summaryIDs, types.SummaryStatusProcessing).
 		Update("summary_status", types.SummaryStatusFailed)
 	if resSummary.Error != nil {
 		logger.Warnf(ctx, "[Housekeeping] summary sweep failed: %v", resSummary.Error)
@@ -244,21 +252,27 @@ func (h *HousekeepingService) filterByLastSpanActivity(ctx context.Context, cand
 		Group("knowledge_id").
 		Find(&beats).Error
 	if err != nil {
-		// On query failure, fail safe — assume nothing has a
-		// heartbeat (so all candidates are "stuck"). This matches
-		// the previous-version behaviour and never under-recovers.
-		logger.Warnf(ctx, "[Housekeeping] span heartbeat query failed: %v (will fail safe and recover all candidates)", err)
-		return candidates
+		// Ownership is unknown when heartbeat storage cannot be read. Killing
+		// every candidate here turns a telemetry outage into destructive state
+		// mutation, so fail closed and preserve the whole set for the next sweep.
+		logger.Warnf(ctx, "[Housekeeping] span heartbeat query failed: %v (preserving all candidates)", err)
+		return nil
 	}
 	heartbeat := make(map[string]time.Time, len(beats))
+	unknown := make(map[string]struct{})
 	for _, b := range beats {
 		if t, ok := parseHeartbeatTime(b.LastSeen); ok {
 			heartbeat[b.KnowledgeID] = t
+		} else {
+			unknown[b.KnowledgeID] = struct{}{}
 		}
 	}
 
 	out := candidates[:0]
 	for _, k := range candidates {
+		if _, indeterminate := unknown[k.ID]; indeterminate {
+			continue
+		}
 		if last, ok := heartbeat[k.ID]; ok && last.After(cutoff) {
 			// Active span heartbeat — leave alone.
 			continue
@@ -275,21 +289,23 @@ func (h *HousekeepingService) filterByLastSpanActivity(ctx context.Context, cand
 // missing span heartbeat is expected and recovering it would be a false
 // positive. When no inspector is wired (nil) the gate is a pass-through
 // so behaviour matches the pre-existing span-only sweep. On inspector
-// error we fail safe by KEEPING the candidate as stuck (recover it),
-// matching the span heartbeat query's fail-safe direction.
+// error we fail closed by dropping the candidate from this mutation batch.
 func (h *HousekeepingService) filterOutQueued(
 	ctx context.Context, candidates []types.Knowledge,
 ) (kept []types.Knowledge, skipped int) {
-	if h.inspector == nil || len(candidates) == 0 {
+	if len(candidates) == 0 {
 		return candidates, 0
+	}
+	if h.inspector == nil {
+		return nil, len(candidates)
 	}
 	out := candidates[:0]
 	for _, k := range candidates {
 		queued, err := h.inspector.HasQueuedTasksForKnowledge(ctx, k.ID)
 		if err != nil {
 			logger.Warnf(ctx,
-				"[Housekeeping] queue probe failed for %s: %v (will fail safe and treat as stuck)", k.ID, err)
-			out = append(out, k)
+				"[Housekeeping] queue probe failed for %s: %v (preserving candidate)", k.ID, err)
+			skipped++
 			continue
 		}
 		if queued {
@@ -303,9 +319,7 @@ func (h *HousekeepingService) filterOutQueued(
 
 // parseHeartbeatTime accepts the timestamp formats Postgres and SQLite
 // emit for a TIMESTAMP column read back through MAX(). Returns false if
-// none parse — the caller treats unparseable rows as "no heartbeat",
-// which fails safe (the row gets recovered as stuck rather than
-// silently preserved).
+// none parse — the caller treats that candidate as unknown and preserves it.
 func parseHeartbeatTime(s string) (time.Time, bool) {
 	if s == "" {
 		return time.Time{}, false

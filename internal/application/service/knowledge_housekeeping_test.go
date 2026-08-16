@@ -270,6 +270,23 @@ func TestHousekeeping_NoFalseKill_TasksStillQueued(t *testing.T) {
 		"finalizing row with tasks still queued must NOT be flipped to failed")
 }
 
+func TestHousekeeping_DoesNotBroadlyTerminalizeFinalizingOwner(t *testing.T) {
+	db := setupHousekeepingDB(t)
+	svc := newHousekeepingSvcForTest(db)
+	stale := time.Now().Add(-3 * time.Hour)
+	insertKnowledge(t, db, "kid-finalizing-owner", types.ParseStatusFinalizing, stale)
+	insertSpan(t, db, "kid-finalizing-owner", 1, "post-owner", types.SpanStatusRunning, stale)
+
+	svc.runSweep(context.Background())
+
+	var status string
+	require.NoError(t, db.Raw(
+		`SELECT parse_status FROM knowledges WHERE id = ?`, "kid-finalizing-owner",
+	).Row().Scan(&status))
+	assert.Equal(t, types.ParseStatusFinalizing, status,
+		"finalizing requires exact owner recovery; housekeeping cannot split knowledge from spans")
+}
+
 // TestHousekeeping_QueueProbeError_FailsSafe confirms the fail-safe
 // direction: when the queue probe errors we still recover the row rather
 // than leaving it stranded forever.
@@ -287,8 +304,25 @@ func TestHousekeeping_QueueProbeError_FailsSafe(t *testing.T) {
 	require.NoError(t, db.Raw(
 		`SELECT parse_status FROM knowledges WHERE id = ?`, "kid-probeerr",
 	).Row().Scan(&status))
-	assert.Equal(t, types.ParseStatusFailed, status,
-		"queue probe error must fail safe and still recover the stuck row")
+	assert.Equal(t, types.ParseStatusProcessing, status,
+		"queue probe error is unknown ownership and must preserve the row")
+}
+
+func TestHousekeeping_SpanHeartbeatQueryErrorPreservesCandidates(t *testing.T) {
+	db := setupHousekeepingDB(t)
+	svc := newHousekeepingSvcForTest(db)
+	stale := time.Now().Add(-3 * time.Hour)
+	insertKnowledge(t, db, "kid-span-probeerr", types.ParseStatusProcessing, stale)
+	require.NoError(t, db.Exec("DROP TABLE knowledge_processing_spans").Error)
+
+	svc.runSweep(context.Background())
+
+	var status string
+	require.NoError(t, db.Raw(
+		`SELECT parse_status FROM knowledges WHERE id = ?`, "kid-span-probeerr",
+	).Row().Scan(&status))
+	assert.Equal(t, types.ParseStatusProcessing, status,
+		"span heartbeat read failure is unknown ownership and must preserve every candidate")
 }
 
 // TestHousekeeping_PreservesRecentlyTouched: any knowledge whose

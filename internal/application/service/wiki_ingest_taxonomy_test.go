@@ -31,35 +31,6 @@ func TestFormatExistingTaxonomyForPromptEmpty(t *testing.T) {
 	}
 }
 
-func TestParseTaxonomyAssignments(t *testing.T) {
-	raw := "```json\n{\"assignments\":[" +
-		"{\"slug\":\"entity/zhang-san\",\"path\":[\"人物\"]}," +
-		"{\"slug\":\"concept/spring\",\"path\":[\"节日\",\"传统节日\"]}," +
-		"{\"slug\":\"  \",\"path\":[\"X\"]}," +
-		"{\"slug\":\"entity/unclassified\",\"path\":[]}" +
-		"]}\n```"
-
-	got := parseTaxonomyAssignments(raw)
-	if len(got) != 3 {
-		t.Fatalf("parseTaxonomyAssignments() returned %d entries, want 3 (blank slug dropped): %v", len(got), got)
-	}
-	if strings.Join(got["entity/zhang-san"], "/") != "人物" {
-		t.Fatalf("zhang-san path = %v, want [人物]", got["entity/zhang-san"])
-	}
-	if strings.Join(got["concept/spring"], "/") != "节日/传统节日" {
-		t.Fatalf("spring path = %v, want [节日 传统节日]", got["concept/spring"])
-	}
-	if p, ok := got["entity/unclassified"]; !ok || len(p) != 0 {
-		t.Fatalf("unclassified path = %v (ok=%v), want empty slice present", p, ok)
-	}
-}
-
-func TestParseTaxonomyAssignmentsMalformed(t *testing.T) {
-	if got := parseTaxonomyAssignments("not json at all"); got != nil {
-		t.Fatalf("parseTaxonomyAssignments(garbage) = %v, want nil", got)
-	}
-}
-
 func TestCosineSimilarity(t *testing.T) {
 	if got := cosineSimilarity([]float32{1, 0}, []float32{1, 0}); got < 0.999 {
 		t.Fatalf("identical vectors sim = %v, want ~1", got)

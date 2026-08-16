@@ -3,6 +3,9 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +13,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -32,7 +36,10 @@ CREATE TABLE IF NOT EXISTS task_pending_ops (
     payload     TEXT NOT NULL DEFAULT '{}',
     fail_count  INTEGER NOT NULL DEFAULT 0,
     enqueued_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    claimed_at  DATETIME
+    claimed_at  DATETIME,
+    claim_token VARCHAR(64),
+    claimed_by_task_id VARCHAR(255),
+    claim_heartbeat_at DATETIME
 );
 `
 
@@ -78,6 +85,127 @@ func setupTaskQueueTestDB(t *testing.T) *gorm.DB {
 	require.NoError(t, db.Exec(taskPendingOpsTestDDL).Error)
 	require.NoError(t, db.Exec(taskDeadLettersTestDDL).Error)
 	return db
+}
+
+func TestAckKnowledgeBaseDeletionRequiresExactSingleOutboxRow(t *testing.T) {
+	db := setupTaskQueueTestDB(t)
+	repo := &taskPendingOpsRepository{db: db}
+	payload, err := json.Marshal(types.KBDeletePayload{TenantID: 7, KnowledgeBaseID: "kb-1"})
+	require.NoError(t, err)
+	require.NoError(t, repo.Enqueue(t.Context(), &types.TaskPendingOp{
+		TenantID: 7, TaskType: types.TypeKBDelete,
+		Scope: types.TaskScopeKnowledgeBaseDeletion, ScopeID: "kb-1", Op: "delete",
+		DedupKey: "kb-delete:7:kb-1", Payload: payload,
+	}))
+	for _, forged := range []struct {
+		tenant    uint64
+		kb, dedup string
+	}{{8, "kb-1", "kb-delete:7:kb-1"}, {7, "kb-forged", "kb-delete:7:kb-1"}, {7, "kb-1", "kb-delete:7:forged"}} {
+		require.Error(t, repo.AckKnowledgeBaseDeletion(t.Context(), forged.tenant, forged.kb, forged.dedup))
+	}
+	var rows int64
+	require.NoError(t, db.Model(&types.TaskPendingOp{}).Count(&rows).Error)
+	require.Equal(t, int64(1), rows)
+	require.NoError(t, repo.AckKnowledgeBaseDeletion(t.Context(), 7, "kb-1", "kb-delete:7:kb-1"))
+	require.NoError(t, db.Model(&types.TaskPendingOp{}).Count(&rows).Error)
+	require.Zero(t, rows)
+	require.Error(t, repo.AckKnowledgeBaseDeletion(t.Context(), 7, "kb-1", "kb-delete:7:kb-1"))
+}
+
+func TestDeleteKnowledgeBaseScopePreservesDeletionOutbox(t *testing.T) {
+	db := setupTaskQueueTestDB(t)
+	repo := &taskPendingOpsRepository{db: db}
+	for _, scope := range []string{types.TaskScopeKnowledgeBase, types.TaskScopeKnowledgeBaseDeletion} {
+		require.NoError(t, repo.Enqueue(t.Context(), &types.TaskPendingOp{
+			TenantID: 7, TaskType: types.TypeKBDelete, Scope: scope, ScopeID: "kb-1",
+			Op: "delete", DedupKey: scope, Payload: []byte(`{}`),
+		}))
+	}
+
+	require.NoError(t, repo.DeleteByScope(t.Context(), types.TaskScopeKnowledgeBase, "kb-1"))
+	var rows []types.TaskPendingOp
+	require.NoError(t, db.Find(&rows).Error)
+	require.Len(t, rows, 1)
+	assert.Equal(t, types.TaskScopeKnowledgeBaseDeletion, rows[0].Scope)
+}
+
+func setupPostgresTaskQueueTest(t *testing.T) (*gorm.DB, *gorm.DB) {
+	t.Helper()
+	dsn := os.Getenv("WEKNORA_TEST_POSTGRES_DSN")
+	if dsn == "" || os.Getenv("WEKNORA_TEST_POSTGRES_EPHEMERAL") != "1" {
+		t.Skip("WEKNORA_TEST_POSTGRES_DSN is required for PostgreSQL integration tests")
+	}
+	base, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	baseSQL, err := base.DB()
+	require.NoError(t, err)
+	schema := fmt.Sprintf("g002_claim_%d", time.Now().UnixNano())
+	require.NoError(t, base.Exec("CREATE SCHEMA "+schema).Error)
+	t.Cleanup(func() {
+		_ = base.Exec("DROP SCHEMA " + schema + " CASCADE").Error
+		_ = baseSQL.Close()
+	})
+	separator := "?"
+	if strings.Contains(dsn, "?") {
+		separator = "&"
+	}
+	schemaDSN := dsn + separator + "search_path=" + schema
+	open := func() *gorm.DB {
+		db, openErr := gorm.Open(postgres.Open(schemaDSN), &gorm.Config{})
+		require.NoError(t, openErr)
+		sqlDB, sqlErr := db.DB()
+		require.NoError(t, sqlErr)
+		t.Cleanup(func() { _ = sqlDB.Close() })
+		return db
+	}
+	first, second := open(), open()
+	require.NoError(t, first.Exec(`CREATE TABLE task_pending_ops (
+		id BIGSERIAL PRIMARY KEY,
+		tenant_id BIGINT NOT NULL,
+		task_type VARCHAR(64) NOT NULL,
+		scope VARCHAR(32) NOT NULL,
+		scope_id VARCHAR(64) NOT NULL,
+		op VARCHAR(32) NOT NULL,
+		dedup_key VARCHAR(128) NOT NULL DEFAULT '',
+		payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+		fail_count INTEGER NOT NULL DEFAULT 0,
+		enqueued_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+		claimed_at TIMESTAMPTZ,
+		claim_token VARCHAR(64),
+		claimed_by_task_id VARCHAR(255),
+		claim_heartbeat_at TIMESTAMPTZ
+	)`).Error)
+	return first, second
+}
+
+func TestTaskPendingOps_PostgresLegacyMutationsCannotTouchTokenOwner(t *testing.T) {
+	ownerDB, legacyDB := setupPostgresTaskQueueTest(t)
+	ctx := context.Background()
+	ownerRepo := NewTaskPendingOpsRepository(ownerDB)
+	legacyRepo := NewTaskPendingOpsRepository(legacyDB)
+	op := makePendingOp(types.TypeWikiIngest, types.TaskScopeKnowledgeBase, "kb-claim", "ingest", "kid-claim", []byte(`{}`))
+	require.NoError(t, ownerRepo.Enqueue(ctx, op))
+
+	claimRepo := ownerRepo.(interfaces.TaskPendingOpsClaimLease)
+	owner := types.TaskClaimOwner{Token: "successor-token", TaskID: "successor-task"}
+	claimed, err := claimRepo.ClaimBatchOwned(ctx, types.TypeWikiIngest, types.TaskScopeKnowledgeBase, "kb-claim", 1, time.Now(), owner)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	id := claimed[0].ID
+
+	require.NoError(t, legacyRepo.ReleaseByIDs(ctx, []int64{id}))
+	count, err := legacyRepo.IncrFailCount(ctx, id)
+	require.NoError(t, err)
+	assert.Zero(t, count, "legacy failure update must report no mutation for a token-owned row")
+	require.NoError(t, legacyRepo.DeleteByIDs(ctx, []int64{id}))
+
+	var stored types.TaskPendingOp
+	require.NoError(t, ownerDB.First(&stored, id).Error)
+	assert.Equal(t, owner.Token, stored.ClaimToken)
+	assert.Equal(t, owner.TaskID, stored.ClaimedByTaskID)
+	assert.NotNil(t, stored.ClaimedAt)
+	assert.NotNil(t, stored.ClaimHeartbeatAt)
+	assert.Zero(t, stored.FailCount)
 }
 
 func makePendingOp(taskType, scope, scopeID, op, dedup string, payload []byte) *types.TaskPendingOp {
@@ -524,6 +652,53 @@ func TestTaskPendingOps_ClaimBatch_MarksAndReturnsDisjoint(t *testing.T) {
 	third, err := repo.ClaimBatch(ctx, "wiki:ingest", "knowledge_base", "kb", 10, stale)
 	require.NoError(t, err)
 	assert.Len(t, third, 0)
+}
+
+func TestTaskPendingOps_ClaimLeaseRenewAndReleaseAreOwnerSafe(t *testing.T) {
+	db := setupTaskQueueTestDB(t)
+	repo := NewTaskPendingOpsRepository(db)
+	lease, ok := repo.(interfaces.TaskPendingOpsClaimLease)
+	require.True(t, ok)
+	ctx := context.Background()
+
+	op := makePendingOp("wiki:ingest", "knowledge_base", "kb", "ingest", "k-lease", nil)
+	require.NoError(t, repo.Enqueue(ctx, op))
+	owner1 := types.TaskClaimOwner{Token: "claim-one", TaskID: "asynq-one"}
+	claimed, err := lease.ClaimBatchOwned(ctx, "wiki:ingest", "knowledge_base", "kb", 1, time.Now().Add(-time.Hour), owner1)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	require.NotNil(t, claimed[0].ClaimedAt)
+	assert.Equal(t, owner1.Token, claimed[0].ClaimToken)
+	assert.Equal(t, owner1.TaskID, claimed[0].ClaimedByTaskID)
+	require.NotNil(t, claimed[0].ClaimHeartbeatAt)
+	require.NoError(t, lease.RenewClaims(ctx, []int64{op.ID}, owner1))
+
+	owner2 := types.TaskClaimOwner{Token: "claim-two", TaskID: "asynq-two"}
+	claimed, err = lease.ClaimBatchOwned(ctx, "wiki:ingest", "knowledge_base", "kb", 1, time.Now().Add(time.Hour), owner2)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+
+	require.Error(t, lease.RenewClaims(ctx, []int64{op.ID}, owner1),
+		"a stale owner must not renew its successor lease")
+	require.Error(t, lease.ReleaseClaims(ctx, []int64{op.ID}, owner1),
+		"a stale owner must not clear its successor lease")
+	require.Error(t, lease.DeleteClaims(ctx, []int64{op.ID}, owner1),
+		"a stale owner must not delete its successor row")
+
+	snapshot, err := lease.InspectClaim(ctx, "wiki:ingest", "knowledge_base", "kb", "k-lease")
+	require.NoError(t, err)
+	require.True(t, snapshot.Found)
+	require.True(t, snapshot.Consistent)
+	assert.Equal(t, owner2.Token, snapshot.ClaimToken)
+	assert.Equal(t, owner2.TaskID, snapshot.ClaimedByTaskID)
+
+	require.NoError(t, lease.ReleaseClaims(ctx, []int64{op.ID}, owner2))
+	var stored types.TaskPendingOp
+	require.NoError(t, db.First(&stored, op.ID).Error)
+	assert.Nil(t, stored.ClaimedAt)
+	assert.Nil(t, stored.ClaimHeartbeatAt)
+	assert.Empty(t, stored.ClaimToken)
+	assert.Empty(t, stored.ClaimedByTaskID)
 }
 
 // TestTaskPendingOps_ClaimBatch_KeepsSameKeyTogether verifies the

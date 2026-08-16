@@ -60,3 +60,33 @@ func TestSaveChunkRevisionIsAtomicAndOptimistic(t *testing.T) {
 	require.Equal(t, int64(1), count)
 	require.False(t, errors.Is(gorm.ErrRecordNotFound, ErrChunkRevisionConflict))
 }
+
+func TestCompareAndSwapChunkMetadataRequiresRevisionAndExactMetadata(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:"+uuid.NewString()+"?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&types.Chunk{}))
+	repo := NewChunkRepository(db)
+	chunk := &types.Chunk{
+		ID: uuid.NewString(), TenantID: 1, KnowledgeBaseID: "kb", KnowledgeID: "knowledge",
+		Content: "body", ChunkType: types.ChunkTypeText, ContentRevision: 2,
+		Metadata: types.JSON(`{"generated_questions":[{"id":"old","question":"old"}]}`),
+	}
+	require.NoError(t, repo.CreateChunks(context.Background(), []*types.Chunk{chunk}))
+
+	next := types.JSON(`{"generated_questions":[{"id":"new","question":"new"}]}`)
+	swapped, err := repo.CompareAndSwapChunkMetadata(
+		context.Background(), 1, chunk.ID, 1, chunk.Metadata, next)
+	require.NoError(t, err)
+	require.False(t, swapped)
+	swapped, err = repo.CompareAndSwapChunkMetadata(
+		context.Background(), 1, chunk.ID, 2, types.JSON(`{"concurrent":true}`), next)
+	require.NoError(t, err)
+	require.False(t, swapped)
+	swapped, err = repo.CompareAndSwapChunkMetadata(
+		context.Background(), 1, chunk.ID, 2, chunk.Metadata, next)
+	require.NoError(t, err)
+	require.True(t, swapped)
+	stored, err := repo.GetChunkByID(context.Background(), 1, chunk.ID)
+	require.NoError(t, err)
+	require.JSONEq(t, string(next), string(stored.Metadata))
+}

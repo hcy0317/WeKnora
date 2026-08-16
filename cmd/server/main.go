@@ -54,6 +54,14 @@ func main() {
 	runtime.LogStartupEnv(context.Background())
 	runtime.MarkServerStarted()
 
+	if os.Getenv("WEKNORA_MIGRATE_ONLY") == "true" {
+		if err := container.RunMigrationsOnly(); err != nil {
+			logger.Fatalf(context.Background(), "One-shot database migration failed: %v", err)
+		}
+		logger.Info(context.Background(), "One-shot database migration completed")
+		return
+	}
+
 	// Build dependency injection container
 	c := container.BuildContainer(runtime.GetContainer())
 

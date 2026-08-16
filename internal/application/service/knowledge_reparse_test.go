@@ -19,15 +19,14 @@ func TestResetKnowledgeForReparseClearsPreviousAttemptState(t *testing.T) {
 		EmbeddingModelID:     "old-model",
 		PendingSubtasksCount: 3,
 	}
-	kb := &types.KnowledgeBase{EmbeddingModelID: "new-model"}
-
-	resetKnowledgeForReparse(knowledge, kb)
+	resetKnowledgeForReparse(knowledge)
 
 	require.Equal(t, types.ParseStatusPending, knowledge.ParseStatus)
 	require.Equal(t, "disabled", knowledge.EnableStatus)
 	require.Empty(t, knowledge.Description)
 	require.Nil(t, knowledge.ProcessedAt)
 	require.Empty(t, knowledge.ErrorMessage)
-	require.Equal(t, "new-model", knowledge.EmbeddingModelID)
+	require.Equal(t, "old-model", knowledge.EmbeddingModelID,
+		"the cleanup worker owns the atomic switch to the target embedding model")
 	require.Zero(t, knowledge.PendingSubtasksCount)
 }

@@ -45,35 +45,37 @@ var (
 // knowledgeService implements the knowledge service interface
 // service 实现知识服务接口
 type knowledgeService struct {
-	config          *config.Config
-	retrieveEngine  interfaces.RetrieveEngineRegistry
-	ownership       retriever.TenantStoreOwnership
-	repo            interfaces.KnowledgeRepository
-	kbService       interfaces.KnowledgeBaseService
-	tenantRepo      interfaces.TenantRepository
-	tenantService   interfaces.TenantService
-	documentReader  interfaces.DocumentReader
-	chunkService    interfaces.ChunkService
-	chunkRepo       interfaces.ChunkRepository
-	tagRepo         interfaces.KnowledgeTagRepository
-	tagService      interfaces.KnowledgeTagService
-	fileSvc         interfaces.FileService
-	storageResolver interfaces.StorageBackendResolver
-	resourceCatalog interfaces.ResourceCatalog
-	modelService    interfaces.ModelService
-	task            interfaces.TaskEnqueuer
-	taskInspector   interfaces.TaskInspector
-	graphEngine     interfaces.RetrieveGraphRepository
-	redisClient     *redis.Client
-	kbShareService  interfaces.KBShareService
-	imageResolver   *docparser.ImageResolver
-	taskPendingRepo interfaces.TaskPendingOpsRepository
+	config               *config.Config
+	retrieveEngine       interfaces.RetrieveEngineRegistry
+	ownership            retriever.TenantStoreOwnership
+	repo                 interfaces.KnowledgeRepository
+	kbService            interfaces.KnowledgeBaseService
+	tenantRepo           interfaces.TenantRepository
+	tenantService        interfaces.TenantService
+	documentReader       interfaces.DocumentReader
+	chunkService         interfaces.ChunkService
+	chunkRepo            interfaces.ChunkRepository
+	tagRepo              interfaces.KnowledgeTagRepository
+	tagService           interfaces.KnowledgeTagService
+	fileSvc              interfaces.FileService
+	storageResolver      interfaces.StorageBackendResolver
+	resourceCatalog      interfaces.ResourceCatalog
+	modelService         interfaces.ModelService
+	task                 interfaces.TaskEnqueuer
+	taskInspector        interfaces.TaskInspector
+	graphEngine          interfaces.RetrieveGraphRepository
+	redisClient          *redis.Client
+	kbShareService       interfaces.KBShareService
+	imageResolver        *docparser.ImageResolver
+	taskPendingRepo      interfaces.TaskPendingOpsRepository
+	questionManifestRepo interfaces.QuestionGenerationManifestRepository
 
 	// In-memory fallbacks for Lite mode (no Redis)
-	memFAQProgress      sync.Map // taskID -> *types.FAQImportProgress
-	memFAQRunningImport sync.Map // kbID -> *runningFAQImportInfo
-	wikiRepo            interfaces.WikiPageRepository
-	wikiService         interfaces.WikiPageService
+	memFAQProgress       sync.Map // taskID -> *types.FAQImportProgress
+	memFAQRunningImport  sync.Map // kbID -> *runningFAQImportInfo
+	parserEngineFallback parserEngineFallbackTracker
+	wikiRepo             interfaces.WikiPageRepository
+	wikiService          interfaces.WikiPageService
 
 	// spanTracker records the per-attempt span tree for the parsing
 	// pipeline. Best-effort: a nil tracker (test harness) is safely
@@ -116,37 +118,39 @@ func NewKnowledgeService(
 	wikiRepo interfaces.WikiPageRepository,
 	wikiService interfaces.WikiPageService,
 	taskPendingRepo interfaces.TaskPendingOpsRepository,
+	questionManifestRepo interfaces.QuestionGenerationManifestRepository,
 	spanTracker SpanTracker,
 	audit interfaces.AuditLogService,
 ) (interfaces.KnowledgeService, error) {
 	return &knowledgeService{
-		config:          config,
-		repo:            repo,
-		kbService:       kbService,
-		tenantRepo:      tenantRepo,
-		tenantService:   tenantService,
-		documentReader:  documentReader,
-		chunkService:    chunkService,
-		chunkRepo:       chunkRepo,
-		tagRepo:         tagRepo,
-		tagService:      tagService,
-		fileSvc:         fileSvc,
-		storageResolver: storageResolver,
-		resourceCatalog: resourceCatalog,
-		modelService:    modelService,
-		task:            task,
-		taskInspector:   taskInspector,
-		graphEngine:     graphEngine,
-		retrieveEngine:  retrieveEngine,
-		ownership:       ownership,
-		redisClient:     redisClient,
-		kbShareService:  kbShareService,
-		imageResolver:   imageResolver,
-		wikiRepo:        wikiRepo,
-		wikiService:     wikiService,
-		taskPendingRepo: taskPendingRepo,
-		spanTracker:     spanTracker,
-		audit:           audit,
+		config:               config,
+		repo:                 repo,
+		kbService:            kbService,
+		tenantRepo:           tenantRepo,
+		tenantService:        tenantService,
+		documentReader:       documentReader,
+		chunkService:         chunkService,
+		chunkRepo:            chunkRepo,
+		tagRepo:              tagRepo,
+		tagService:           tagService,
+		fileSvc:              fileSvc,
+		storageResolver:      storageResolver,
+		resourceCatalog:      resourceCatalog,
+		modelService:         modelService,
+		task:                 task,
+		taskInspector:        taskInspector,
+		graphEngine:          graphEngine,
+		retrieveEngine:       retrieveEngine,
+		ownership:            ownership,
+		redisClient:          redisClient,
+		kbShareService:       kbShareService,
+		imageResolver:        imageResolver,
+		wikiRepo:             wikiRepo,
+		wikiService:          wikiService,
+		taskPendingRepo:      taskPendingRepo,
+		questionManifestRepo: questionManifestRepo,
+		spanTracker:          spanTracker,
+		audit:                audit,
 	}, nil
 }
 
@@ -199,6 +203,33 @@ func attemptSuperseded(ctx context.Context, tracker SpanTracker, knowledgeID str
 	return tracker.LatestAttempt(ctx, knowledgeID) > attempt
 }
 
+type strictAttemptTracker interface {
+	LatestAttemptStrict(context.Context, string) (int, error)
+}
+
+// attemptSupersededStrict is the fail-closed variant used before destructive
+// cleanup and shared state publication. A tracker lookup failure is retryable;
+// it must never be interpreted as attempt zero and allowed to delete data.
+func attemptSupersededStrict(
+	ctx context.Context, tracker SpanTracker, knowledgeID string, attempt int,
+) (bool, error) {
+	if attempt <= 0 || knowledgeID == "" {
+		return false, nil
+	}
+	if strict, ok := tracker.(strictAttemptTracker); ok {
+		latest, err := strict.LatestAttemptStrict(ctx, knowledgeID)
+		if err != nil {
+			return false, err
+		}
+		return latest > attempt, nil
+	}
+	latest := tracker.LatestAttempt(ctx, knowledgeID)
+	if latest <= 0 {
+		return false, errors.New("strict latest attempt lookup is unavailable")
+	}
+	return latest > attempt, nil
+}
+
 // finalizeSubtaskDetachedTimeout bounds the detached decrement so a wedged DB
 // connection can't hang a worker goroutine forever in its terminal defer.
 const finalizeSubtaskDetachedTimeout = 10 * time.Second
@@ -228,20 +259,29 @@ const finalizeSubtaskDetachedTimeout = 10 * time.Second
 func finalizeSubtaskDetached(
 	ctx context.Context,
 	repo interfaces.KnowledgeRepository,
-	knowledgeID, source string,
+	knowledgeID string,
+	attempt int,
+	source string,
 	retErr error,
 	superseded, final bool,
-) {
-	willDrain := repo != nil && knowledgeID != "" && !superseded && (retErr == nil || final)
+) bool {
+	willDrain := repo != nil && knowledgeID != "" && attempt > 0 && !superseded && (retErr == nil || final)
 	if !willDrain {
-		return
+		return false
 	}
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeSubtaskDetachedTimeout)
 	defer cancel()
-	if _, _, err := repo.FinalizeSubtask(dctx, knowledgeID); err != nil {
+	_, _, err := repo.FinalizeSubtaskForAttempt(dctx, knowledgeID, attempt)
+	if err != nil {
 		logger.Warnf(ctx, "finalize subtask decrement failed source=%s knowledge=%s err=%v",
 			source, knowledgeID, err)
+		// The child is terminal even when the legacy observer decrement fails;
+		// authoritative repository reduction must still run.
+		return true
 	}
+	// Every terminal child transition triggers the durable reducer. The legacy
+	// observer counter reaching zero is neither necessary nor sufficient.
+	return true
 }
 
 // beginStage / endStage / failStage / skipStage are the by-name shims
@@ -358,6 +398,22 @@ func (s *knowledgeService) failPostprocessSubspan(
 		return
 	}
 	s.tracker().FailSpan(ctx, span, code, msg, err)
+}
+
+func markTerminalPostprocessFailure(ctx context.Context, tracker SpanTracker, span *Span) {
+	if tracker == nil || span == nil {
+		return
+	}
+	input := make(types.JSONMap, len(span.Input)+1)
+	for key, value := range span.Input {
+		input[key] = value
+	}
+	input["terminal_failure"] = true
+	terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeSubtaskDetachedTimeout)
+	defer cancel()
+	if err := tracker.UpdateSpanInput(terminalCtx, span, input); err != nil {
+		logger.Warnf(ctx, "mark terminal postprocess failure span=%s: %v", span.SpanID, err)
+	}
 }
 
 // getParserEngineOverridesFromContext returns parser engine overrides from tenant in context (e.g. MinerU endpoint, API key).

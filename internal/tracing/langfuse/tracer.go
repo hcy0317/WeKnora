@@ -3,9 +3,12 @@ package langfuse
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/types"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -20,6 +23,7 @@ type Trace struct {
 	ID      string
 	span    trace.Span
 	manager *Manager
+	mu      sync.Mutex
 	// metadata holds the metadata set at StartTrace so Finish can merge (not
 	// overwrite) the finish-time metadata into it before serializing.
 	metadata map[string]interface{}
@@ -27,11 +31,17 @@ type Trace struct {
 
 // Generation represents a single model invocation (LLM / embedding / VLM / ASR).
 type Generation struct {
-	ID      string
-	span    trace.Span
-	manager *Manager
-	model   string
-	name    string
+	ID         string
+	span       trace.Span
+	manager    *Manager
+	model      string
+	name       string
+	ctx        context.Context
+	metadata   map[string]interface{}
+	progressMu sync.Mutex
+	progress   types.JSONMap
+	knowledge  KnowledgeTraceContext
+	startedAt  time.Time
 	// autoTrace is a non-nil root trace this generation implicitly opened
 	// because ctx carried none; Finish must End it so the root is exported.
 	autoTrace *Trace
@@ -136,11 +146,61 @@ func (t *Trace) Finish(output interface{}, metadata map[string]interface{}) {
 		return
 	}
 	attrs := []attribute.KeyValue{jsonAttr(attrTraceOutput, output)}
-	if merged := mergeMetadata(t.metadata, metadata); merged != nil {
+	t.mu.Lock()
+	t.metadata = mergeMetadata(t.metadata, metadata)
+	merged := mergeMetadata(t.metadata, nil)
+	t.mu.Unlock()
+	if merged != nil {
 		attrs = append(attrs, jsonAttr(attrTraceMetadata, merged))
 	}
 	t.span.SetAttributes(attrs...)
 	t.span.End()
+}
+
+// annotateKnowledgeID adds document correlation at trace level while the
+// originating root span is still local. A single-document request keeps a
+// scalar value for convenient filtering; a batch request promotes the field
+// to a de-duplicated array instead of silently overwriting an earlier ID.
+func (t *Trace) annotateKnowledgeID(knowledgeID string) {
+	if t == nil || t.span == nil || knowledgeID == "" {
+		return
+	}
+	t.mu.Lock()
+	if t.metadata == nil {
+		t.metadata = make(map[string]interface{})
+	}
+	t.metadata["knowledge_id"] = mergeKnowledgeID(t.metadata["knowledge_id"], knowledgeID)
+	metadata := mergeMetadata(t.metadata, nil)
+	t.mu.Unlock()
+	t.span.SetAttributes(jsonAttr(attrTraceMetadata, metadata))
+}
+
+func mergeKnowledgeID(current interface{}, knowledgeID string) interface{} {
+	switch value := current.(type) {
+	case nil:
+		return knowledgeID
+	case string:
+		if value == knowledgeID {
+			return value
+		}
+		return []string{value, knowledgeID}
+	case []string:
+		for _, existing := range value {
+			if existing == knowledgeID {
+				return value
+			}
+		}
+		return append(value, knowledgeID)
+	case []interface{}:
+		for _, existing := range value {
+			if existing == knowledgeID {
+				return value
+			}
+		}
+		return append(value, knowledgeID)
+	default:
+		return knowledgeID
+	}
 }
 
 // ResumeTrace reconstructs a *Trace handle from an externally-provided W3C
@@ -267,23 +327,70 @@ func (m *Manager) StartGeneration(ctx context.Context, opts GenerationOptions) (
 		// gets exported and this generation's parent points at nothing).
 		ctx, autoTrace = m.StartTrace(ctx, TraceOptions{Name: opts.Name})
 	}
+	startedAt := time.Now()
+	knowledge, _ := knowledgeTraceContextFromContext(ctx)
+	purpose, _ := opts.Metadata["call_purpose"].(string)
+	metadata := enrichGenerationMetadata(opts.Metadata, knowledge, opts.Name, purpose)
 	attrs := []attribute.KeyValue{
 		attribute.String(attrObsType, obsTypeGeneration),
 		attribute.String(attrObsModel, opts.Model),
 		jsonAttr(attrObsInput, opts.Input),
-		jsonAttr(attrObsMetadata, opts.Metadata),
+		jsonAttr(attrObsMetadata, metadata),
 		jsonAttr(attrObsModelParams, opts.ModelParameters),
 	}
-	ctx, span := m.tracer.Start(ctx, opts.Name, trace.WithTimestamp(time.Now()), trace.WithAttributes(attrs...))
+	ctx, span := m.tracer.Start(ctx, opts.Name, trace.WithTimestamp(startedAt), trace.WithAttributes(attrs...))
 	g := &Generation{
-		ID:        span.SpanContext().SpanID().String(),
-		span:      span,
-		manager:   m,
-		model:     opts.Model,
-		name:      opts.Name,
+		ID:       span.SpanContext().SpanID().String(),
+		span:     span,
+		manager:  m,
+		model:    opts.Model,
+		name:     opts.Name,
+		ctx:      ctx,
+		metadata: metadata,
+		progress: types.JSONMap{
+			"state":      "created",
+			"created_at": startedAt.UTC().Format(time.RFC3339Nano),
+		},
+		knowledge: knowledge,
+		startedAt: startedAt,
 		autoTrace: autoTrace,
 	}
+	// Mirror the open observation immediately. Long-running Wiki Responses
+	// streams can spend many minutes before the first answer token; waiting for
+	// Finish made the processing timeline look as though no LLM request existed.
+	// Finish upserts the same span id, while retries use fresh ids and therefore
+	// remain visible as separate historical attempts.
+	g.recordKnowledgeUsage(nil, nil, nil, time.Time{})
 	return ctx, g
+}
+
+// RecordProgress mirrors a coarse transport milestone into the same running
+// generation row. The model body is intentionally absent; only the final
+// completed output is persisted by Finish.
+func (g *Generation) RecordProgress(progress GenerationProgress) {
+	if g == nil || g.manager == nil || !g.manager.Enabled() || g.span == nil || progress.State == "" {
+		return
+	}
+	if progress.At.IsZero() {
+		progress.At = time.Now()
+	}
+	g.progressMu.Lock()
+	if g.progress == nil {
+		g.progress = types.JSONMap{}
+	}
+	g.progress["state"] = progress.State
+	g.progress[progress.State+"_at"] = progress.At.UTC().Format(time.RFC3339Nano)
+	if progress.Protocol != "" {
+		g.progress["protocol"] = progress.Protocol
+	}
+	if progress.Endpoint != "" {
+		g.progress["endpoint"] = progress.Endpoint
+	}
+	if progress.EventType != "" {
+		g.progress["first_event_type"] = progress.EventType
+	}
+	g.progressMu.Unlock()
+	g.recordKnowledgeUsage(nil, nil, nil, time.Time{})
 }
 
 // Finish updates a generation with its final output, token usage and any
@@ -292,6 +399,7 @@ func (g *Generation) Finish(output interface{}, usage *TokenUsage, err error) {
 	if g == nil || g.manager == nil || !g.manager.Enabled() || g.span == nil {
 		return
 	}
+	finishedAt := time.Now()
 	attrs := []attribute.KeyValue{jsonAttr(attrObsOutput, output)}
 	if usage != nil {
 		attrs = append(attrs, jsonAttr(attrObsUsageDetails, usage))
@@ -302,8 +410,107 @@ func (g *Generation) Finish(output interface{}, usage *TokenUsage, err error) {
 		g.span.SetStatus(codes.Error, err.Error())
 	}
 	g.span.End()
+	g.recordKnowledgeUsage(output, usage, err, finishedAt)
 	if g.autoTrace != nil {
 		g.autoTrace.Finish(nil, nil)
+	}
+}
+
+func (g *Generation) recordKnowledgeUsage(
+	output interface{},
+	usage *TokenUsage,
+	callErr error,
+	finishedAt time.Time,
+) {
+	if g == nil || g.manager == nil || g.knowledge.KnowledgeID == "" || g.knowledge.Attempt <= 0 {
+		return
+	}
+	modelType := modelTypeFromGenerationName(g.name)
+	purpose, _ := g.metadata["call_purpose"].(string)
+	modelID, _ := g.metadata["model_id"].(string)
+	status := types.SpanStatusRunning
+	if !finishedAt.IsZero() {
+		status = types.SpanStatusDone
+	}
+	record := types.KnowledgeGenerationUsage{
+		KnowledgeID:    g.knowledge.KnowledgeID,
+		Attempt:        g.knowledge.Attempt,
+		TraceID:        g.span.SpanContext().TraceID().String(),
+		SpanID:         g.ID,
+		Stage:          resolveGenerationStage(g.knowledge, g.name, purpose),
+		TaskType:       g.knowledge.TaskType,
+		Name:           g.name,
+		ModelType:      modelType,
+		ModelID:        modelID,
+		ModelName:      g.model,
+		Purpose:        purpose,
+		Output:         normalizeKnowledgeGenerationOutput(output),
+		Progress:       g.snapshotProgress(),
+		Estimated:      generationUsageEstimated(modelType) && usage != nil,
+		UsageAvailable: usage != nil,
+		Unit:           "TOKENS",
+		Status:         status,
+		StartedAt:      g.startedAt,
+		FinishedAt:     finishedAt,
+	}
+	if usage != nil {
+		record.InputTokens = usage.Input
+		record.OutputTokens = usage.Output
+		record.TotalTokens = usage.Total
+		if record.TotalTokens == 0 {
+			record.TotalTokens = usage.Input + usage.Output
+		}
+		record.CacheReadTokens = usage.CacheRead
+		record.CacheWriteTokens = usage.CacheWrite
+		record.CacheMissTokens = usage.CacheMiss
+		if usage.Unit != "" {
+			record.Unit = usage.Unit
+		}
+	}
+	if callErr != nil {
+		record.Status = types.SpanStatusFailed
+		if errors.Is(callErr, context.Canceled) {
+			record.Status = types.SpanStatusCancelled
+		}
+		record.ErrorMessage = callErr.Error()
+	}
+	g.manager.recordKnowledgeUsage(context.WithoutCancel(g.ctx), record)
+}
+
+func (g *Generation) snapshotProgress() types.JSONMap {
+	if g == nil {
+		return nil
+	}
+	g.progressMu.Lock()
+	defer g.progressMu.Unlock()
+	if len(g.progress) == 0 {
+		return nil
+	}
+	copy := make(types.JSONMap, len(g.progress))
+	for key, value := range g.progress {
+		copy[key] = value
+	}
+	return copy
+}
+
+func normalizeKnowledgeGenerationOutput(output interface{}) types.JSONMap {
+	switch value := output.(type) {
+	case nil:
+		return nil
+	case types.JSONMap:
+		copy := make(types.JSONMap, len(value))
+		for key, item := range value {
+			copy[key] = item
+		}
+		return copy
+	case map[string]interface{}:
+		copy := make(types.JSONMap, len(value))
+		for key, item := range value {
+			copy[key] = item
+		}
+		return copy
+	default:
+		return types.JSONMap{"content": value}
 	}
 }
 

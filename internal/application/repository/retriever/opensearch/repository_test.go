@@ -16,6 +16,7 @@ import (
 
 	"github.com/opensearch-project/opensearch-go/v4"
 	osapi "github.com/opensearch-project/opensearch-go/v4/opensearchapi"
+	"github.com/stretchr/testify/require"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -696,6 +697,35 @@ func TestInspectBulkResponse_AllSucceeded_NoError(t *testing.T) {
 	}
 }
 
+func TestInspectBulkResponseRequiresExactRecognizedItems(t *testing.T) {
+	tests := []struct {
+		name, body string
+		wantErr    bool
+	}{
+		{name: "empty", body: `{"errors":false,"items":[]}`, wantErr: true},
+		{name: "partial", body: `{"errors":false,"items":[{"index":{"status":201}}]}`, wantErr: true},
+		{name: "wrong operation", body: `{"errors":false,"items":[{"create":{"status":201}},{"index":{"status":201}}]}`, wantErr: true},
+		{name: "missing status", body: `{"errors":false,"items":[{"index":{}},{"index":{"status":201}}]}`, wantErr: true},
+		{name: "non 2xx without error", body: `{"errors":false,"items":[{"index":{"status":500}},{"index":{"status":201}}]}`, wantErr: true},
+		{name: "contradictory item failure", body: `{"errors":false,"items":[{"index":{"status":429,"error":{"type":"rejected","reason":"sensitive content"}}},{"index":{"status":201}}]}`, wantErr: true},
+		{name: "exact", body: `{"errors":false,"items":[{"index":{"status":200}},{"index":{"status":201}}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := inspectBulkResponse(strings.NewReader(tt.body), 2)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestInspectBulkResponseRejectsNilBody(t *testing.T) {
+	require.Error(t, inspectBulkResponse(nil, 1))
+}
+
 func TestInspectBulkResponse_TotalCount(t *testing.T) {
 	t.Parallel()
 	// 7 items, 3 failed. Public error must surface count=3 + up to 5
@@ -727,6 +757,25 @@ func TestInspectBulkResponse_TotalCount(t *testing.T) {
 	// Type (bounded enum) is OK to include.
 	if !strings.Contains(msg, "mapper_parsing_exception") {
 		t.Errorf("error should surface error.type for diagnosis: %s", msg)
+	}
+}
+
+func TestInspectBulkResponse_ErrorsTrueUnknownShapeFailsClosed(t *testing.T) {
+	t.Parallel()
+	err := inspectBulkResponse(strings.NewReader(`{"errors":true,"items":[{"future_operation":{"status":500}}]}`))
+	if err == nil {
+		t.Fatal("errors=true with unknown item shape must fail closed")
+	}
+}
+
+func TestInspectBulkResponse_ErrorDoesNotLeakReasonForUnknownShape(t *testing.T) {
+	t.Parallel()
+	err := inspectBulkResponse(strings.NewReader(`{"errors":true,"items":[{"future_operation":{"reason":"SECRET document content"}}]}`))
+	if err == nil {
+		t.Fatal("errors=true with unknown item shape must fail closed")
+	}
+	if strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("error leaked backend content: %v", err)
 	}
 }
 

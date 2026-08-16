@@ -3,6 +3,8 @@ package vlm
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/models/openaiapi"
 	"github.com/Tencent/WeKnora/internal/models/provider"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	openai "github.com/sashabaranov/go-openai"
@@ -40,11 +43,17 @@ func vlmHTTPTimeout() time.Duration {
 
 // RemoteAPIVLM implements VLM via an OpenAI-compatible chat completions API.
 type RemoteAPIVLM struct {
-	modelName   string
-	modelID     string
-	client      *openai.Client
-	baseURL     string
-	temperature float32
+	modelName                string
+	modelID                  string
+	client                   *openai.Client
+	baseURL                  string
+	apiKey                   string
+	customHeaders            map[string]string
+	httpClient               *http.Client
+	autoProtocol             bool
+	temperature              float32
+	reasoningEffort          string
+	configurationFingerprint string
 }
 
 // NewRemoteAPIVLM creates a remote-API backed VLM instance.
@@ -78,15 +87,16 @@ func NewRemoteAPIVLM(config *Config) (*RemoteAPIVLM, error) {
 		}
 	}
 	httpClient := newVLMHTTPClient(vlmHTTPTimeout())
+	requestClient := httpClient
 
 	// 注入用户自定义 HTTP header（类似 OpenAI Python SDK 的 extra_headers）
 	if len(config.CustomHeaders) > 0 {
-		apiCfg.HTTPClient = secutils.WrapHTTPClientWithHeaders(httpClient, config.CustomHeaders)
-	} else {
-		apiCfg.HTTPClient = httpClient
+		requestClient = secutils.WrapHTTPClientWithHeaders(httpClient, config.CustomHeaders)
 	}
+	apiCfg.HTTPClient = requestClient
 
 	temp := defaultTemp
+	reasoningEffort := ""
 	if config.Extra != nil {
 		if v, ok := config.Extra["temperature"]; ok {
 			if vs, ok := v.(string); ok {
@@ -95,15 +105,35 @@ func NewRemoteAPIVLM(config *Config) (*RemoteAPIVLM, error) {
 				}
 			}
 		}
+		if v, ok := config.Extra["reasoning_effort"].(string); ok {
+			reasoningEffort = strings.TrimSpace(v)
+		}
 	}
 
 	return &RemoteAPIVLM{
-		modelName:   config.ModelName,
-		modelID:     config.ModelID,
-		client:      openai.NewClientWithConfig(apiCfg),
-		baseURL:     config.BaseURL,
-		temperature: temp,
+		modelName:       config.ModelName,
+		modelID:         config.ModelID,
+		client:          openai.NewClientWithConfig(apiCfg),
+		baseURL:         strings.TrimRight(apiCfg.BaseURL, "/"),
+		apiKey:          config.APIKey,
+		customHeaders:   config.CustomHeaders,
+		httpClient:      requestClient,
+		autoProtocol:    apiCfg.APIType == openai.APITypeOpenAI && providerName != provider.ProviderWeKnoraCloud,
+		temperature:     temp,
+		reasoningEffort: reasoningEffort,
+		configurationFingerprint: openaiapi.SavedModelConfigFingerprint(openaiapi.SavedModelConfig{
+			Provider: string(providerName), InterfaceType: normalizedVLMInterface(config.InterfaceType),
+			APIVersion: apiCfg.APIVersion, ExtraConfig: config.Extra, Headers: config.CustomHeaders,
+			Auth: map[string]string{"api_key": config.APIKey, "app_id": config.AppID, "app_secret": config.AppSecret},
+		}),
 	}, nil
+}
+
+func normalizedVLMInterface(interfaceType string) string {
+	if normalized := strings.ToLower(strings.TrimSpace(interfaceType)); normalized != "" {
+		return normalized
+	}
+	return "openai"
 }
 
 // Predict sends an image with a text prompt to the OpenAI-compatible API.
@@ -117,9 +147,12 @@ func (v *RemoteAPIVLM) Predict(ctx context.Context, imgBytesList [][]byte, promp
 	})
 
 	// Add images
-	for _, imgBytes := range imgBytesList {
+	for i, imgBytes := range imgBytesList {
 		if len(imgBytes) > 0 {
-			mimeType := detectImageMIME(imgBytes)
+			mimeType, err := detectImageMIME(imgBytes)
+			if err != nil {
+				return "", fmt.Errorf("OpenAI VLM image %d: %w", i, err)
+			}
 			b64 := base64.StdEncoding.EncodeToString(imgBytes)
 			dataURI := fmt.Sprintf("data:%s;base64,%s", mimeType, b64)
 			parts = append(parts, openai.ChatMessagePart{
@@ -133,7 +166,8 @@ func (v *RemoteAPIVLM) Predict(ctx context.Context, imgBytesList [][]byte, promp
 	}
 
 	req := openai.ChatCompletionRequest{
-		Model: v.modelName,
+		Model:           v.modelName,
+		ReasoningEffort: v.reasoningEffort,
 		Messages: []openai.ChatCompletionMessage{
 			{
 				Role:         openai.ChatMessageRoleUser,
@@ -143,7 +177,6 @@ func (v *RemoteAPIVLM) Predict(ctx context.Context, imgBytesList [][]byte, promp
 		MaxTokens:   defaultMaxToks,
 		Temperature: v.temperature,
 	}
-	shapeReasoningVLMRequest(&req)
 
 	totalImageSize := 0
 	for _, img := range imgBytesList {
@@ -151,64 +184,115 @@ func (v *RemoteAPIVLM) Predict(ctx context.Context, imgBytesList [][]byte, promp
 	}
 	logger.Infof(ctx, "[VLM] Calling OpenAI-compatible API, model=%s, baseURL=%s, numImages=%d, totalImageSize=%d",
 		v.modelName, v.baseURL, len(imgBytesList), totalImageSize)
-
-	resp, err := v.client.CreateChatCompletion(ctx, req)
+	if v.autoProtocol {
+		return v.predictWithNegotiatedProtocol(ctx, req)
+	}
+	content, err := v.predictWithSDKChatRequestShape(ctx, req)
 	if err != nil {
 		return "", fmt.Errorf("OpenAI VLM request: %w", err)
-	}
-	if len(resp.Choices) == 0 {
-		return "", fmt.Errorf("OpenAI VLM returned no choices")
-	}
-
-	choice := resp.Choices[0]
-	content := choice.Message.Content
-	if strings.TrimSpace(content) == "" && choice.FinishReason == openai.FinishReasonLength {
-		// Reasoning models spend max_completion_tokens on reasoning before any
-		// visible output, so an exhausted budget yields an empty message rather
-		// than an API error. Returning "" here would be recorded as
-		// "no_extracted_content" and look identical to an image with no text.
-		return "", fmt.Errorf(
-			"OpenAI VLM returned no content: completion truncated at %d tokens (finish_reason=length)",
-			defaultMaxToks,
-		)
 	}
 	logger.Infof(ctx, "[VLM] OpenAI response received, len=%d", len(content))
 	return content, nil
 }
 
-// shapeReasoningVLMRequest adapts an OpenAI-compatible VLM request for
-// reasoning (o-series) and GPT-5 models, which reject `max_tokens` and every
-// non-default sampling parameter.
-//
-// This mirrors shapeOpenAIReasoning in internal/models/chat, which fixed the
-// same incompatibility on the chat path for issue #1283. The VLM path was
-// never wired to it, so image OCR and captioning failed for every one of these
-// models (issue #2537).
-//
-// Both quirks have to be handled together: migrating max_tokens alone still
-// fails, because the VLM default temperature (0.1) is itself rejected.
-func shapeReasoningVLMRequest(req *openai.ChatCompletionRequest) {
-	if !provider.IsOpenAIReasoningOrGPT5Model(req.Model) {
-		return
+func (v *RemoteAPIVLM) predictWithSDKChatRequestShape(
+	ctx context.Context,
+	request openai.ChatCompletionRequest,
+) (string, error) {
+	cacheKey := v.protocolCacheKey()
+	shape := openaiapi.PreferredChatRequestShape(cacheKey)
+	content, status, err := v.predictWithSDKChatProtocol(ctx, request, shape)
+	if err == nil {
+		if shape == openaiapi.ChatRequestShapeMaxCompletionNeutral {
+			openaiapi.MarkChatRequestShapeSuccess(cacheKey, shape)
+		}
+		return content, nil
 	}
-	if req.MaxCompletionTokens == 0 && req.MaxTokens > 0 {
-		req.MaxCompletionTokens = req.MaxTokens
+	if shape != openaiapi.ChatRequestShapeDefault ||
+		!openaiapi.ShouldRetryChatWithMaxCompletionNeutral(status, err) {
+		return content, err
 	}
-	req.MaxTokens = 0
-	req.Temperature = 0
-	req.TopP = 0
-	req.FrequencyPenalty = 0
-	req.PresencePenalty = 0
+	content, _, err = v.predictWithSDKChatProtocol(
+		ctx, request, openaiapi.ChatRequestShapeMaxCompletionNeutral,
+	)
+	if err == nil {
+		openaiapi.MarkChatRequestShapeSuccess(cacheKey, openaiapi.ChatRequestShapeMaxCompletionNeutral)
+	}
+	return content, err
+}
+
+func (v *RemoteAPIVLM) predictWithSDKChatProtocol(
+	ctx context.Context,
+	request openai.ChatCompletionRequest,
+	shape openaiapi.ChatRequestShape,
+) (string, int, error) {
+	body, err := openaiapi.BuildChatRequestWithShape(request, shape)
+	if err != nil {
+		return "", 0, err
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return "", 0, fmt.Errorf("marshal shaped OpenAI VLM request: %w", err)
+	}
+	var shaped openai.ChatCompletionRequest
+	if err := json.Unmarshal(encoded, &shaped); err != nil {
+		return "", 0, fmt.Errorf("decode shaped OpenAI VLM request: %w", err)
+	}
+	response, err := v.client.CreateChatCompletion(ctx, shaped)
+	if err != nil {
+		return "", openAIRequestStatus(err), err
+	}
+	content, err := vlmChatCompletionContent(&response)
+	return content, http.StatusOK, err
+}
+
+func openAIRequestStatus(err error) int {
+	var apiErr *openai.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.HTTPStatusCode
+	}
+	var requestErr *openai.RequestError
+	if errors.As(err, &requestErr) {
+		return requestErr.HTTPStatusCode
+	}
+	return 0
+}
+
+func vlmChatCompletionContent(resp *openai.ChatCompletionResponse) (string, error) {
+	if resp == nil || len(resp.Choices) == 0 {
+		return "", fmt.Errorf("OpenAI VLM returned no choices")
+	}
+	choice := resp.Choices[0]
+	content := choice.Message.Content
+	if strings.TrimSpace(content) == "" && choice.FinishReason == openai.FinishReasonLength {
+		return "", fmt.Errorf(
+			"OpenAI VLM returned no content: completion truncated at %d tokens (finish_reason=length)",
+			defaultMaxToks,
+		)
+	}
+	return content, nil
 }
 
 func (v *RemoteAPIVLM) GetModelName() string { return v.modelName }
 func (v *RemoteAPIVLM) GetModelID() string   { return v.modelID }
 
-// detectImageMIME returns the MIME type for the given image bytes.
-func detectImageMIME(data []byte) string {
+// detectImageMIME returns an API-supported MIME type for actual image bytes.
+// Unknown formats must never be relabelled as PNG: the data URI MIME and the
+// encoded payload have to describe the same format or every OpenAI-compatible
+// endpoint will reject the request as an invalid image.
+func detectImageMIME(data []byte) (string, error) {
 	ct := http.DetectContentType(data)
-	if strings.HasPrefix(ct, "image/") {
-		return ct
+	switch ct {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+		return ct, nil
 	}
-	return "image/png"
+	// Go versions before WebP sniffing support report a valid WebP payload as
+	// application/octet-stream. Recognize its RIFF container explicitly.
+	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		return "image/webp", nil
+	}
+	return "", fmt.Errorf(
+		"unsupported or invalid image data (%s); expected JPEG, PNG, GIF, or WebP",
+		ct,
+	)
 }

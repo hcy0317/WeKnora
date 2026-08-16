@@ -43,6 +43,7 @@ const props = defineProps<{
   batchMode: boolean;
   canEdit: boolean;
   canDownload: boolean;
+  processingMutationAllowed: boolean;
   canMutateKnowledge: boolean;
   traceAvailableById: Record<string, boolean>;
   tagList: Tag[];
@@ -391,6 +392,7 @@ const handleAction = (action: 'download' | 'edit' | 'view-trace' | 'reparse' | '
                 <DocumentActionMenu
                   :item="item"
                   :can-download="canDownload"
+                  :processing-mutation-allowed="processingMutationAllowed"
                   :can-mutate-knowledge="canMutateKnowledge"
                   :trace-visible="isTraceMenuVisible(item)"
                   @download="handleAction('download', item)"

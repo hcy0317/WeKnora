@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -15,6 +16,103 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 )
+
+func TestQueueStateHasMatchPropagatesBackendError(t *testing.T) {
+	inspector := &asynqTaskInspector{}
+	wantErr := errors.New("redis unavailable")
+	matched, err := inspector.queueStateHasMatch(
+		context.Background(), types.QueueSummary, "pending",
+		func(string, ...asynq.ListOption) ([]*asynq.TaskInfo, error) { return nil, wantErr },
+		func(string, []byte) bool { return false },
+	)
+	if !errors.Is(err, wantErr) || matched {
+		t.Fatalf("queueStateHasMatch() = matched %v, err %v; want false, %v", matched, err, wantErr)
+	}
+}
+
+func TestGetRuntimeTaskTreatsMissingAsKnownAbsent(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	inspector := &asynqTaskInspector{
+		inspector: asynq.NewInspectorFromRedisClient(client), redis: client,
+	}
+	task, supported, err := inspector.GetRuntimeTask(
+		context.Background(), types.QueueWiki, "missing-task",
+	)
+	if err != nil || !supported || task != nil {
+		t.Fatalf("GetRuntimeTask(missing) = task %#v, supported %v, err %v; want nil, true, nil",
+			task, supported, err)
+	}
+}
+
+func TestProcessingOwnerRecoveryLeaseSerializesSameLogicalOwner(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	inspector := &asynqTaskInspector{redis: client}
+	ref := types.ProcessingOwnerRef{
+		TenantID: 7, KnowledgeID: "knowledge-lease", Attempt: 3, Name: "postprocess.wiki",
+	}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstResult := make(chan error, 1)
+	go func() {
+		_, acquired, err := inspector.WithProcessingOwnerRecoveryLease(
+			context.Background(), ref,
+			types.TaskClaimOwner{Token: "startup-token", TaskID: "startup-recovery"},
+			time.Minute,
+			func() error {
+				close(firstEntered)
+				<-releaseFirst
+				return nil
+			},
+		)
+		if err == nil && !acquired {
+			err = errors.New("first recovery lease was not acquired")
+		}
+		firstResult <- err
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first recovery lease callback did not start")
+	}
+
+	secondCallback := false
+	supported, acquired, err := inspector.WithProcessingOwnerRecoveryLease(
+		context.Background(), ref,
+		types.TaskClaimOwner{Token: "worker-token", TaskID: "worker-task"},
+		time.Minute,
+		func() error {
+			secondCallback = true
+			return nil
+		},
+	)
+	if err != nil || !supported || acquired || secondCallback {
+		t.Fatalf("contending lease = supported %v acquired %v callback %v err %v; want true false false nil",
+			supported, acquired, secondCallback, err)
+	}
+	close(releaseFirst)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("first recovery lease: %v", err)
+	}
+
+	thirdCallback := false
+	supported, acquired, err = inspector.WithProcessingOwnerRecoveryLease(
+		context.Background(), ref,
+		types.TaskClaimOwner{Token: "worker-token", TaskID: "worker-task"},
+		time.Minute,
+		func() error {
+			thirdCallback = true
+			return nil
+		},
+	)
+	if err != nil || !supported || !acquired || !thirdCallback {
+		t.Fatalf("post-release lease = supported %v acquired %v callback %v err %v; want true true true nil",
+			supported, acquired, thirdCallback, err)
+	}
+}
 
 func TestQueueStatsDoesNotWarnForQueuesThatDoNotExist(t *testing.T) {
 	server := miniredis.RunT(t)

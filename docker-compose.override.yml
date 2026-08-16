@@ -1,0 +1,280 @@
+services:
+  frontend:
+    image: weknora-ui:local-patched
+    ports: !reset []
+    volumes:
+      - ./local-overlays/upload-monitor/upload-monitor.js:/usr/share/nginx/html/weknora-upload-monitor.js:ro
+      - ./local-overlays/upload-monitor/upload-monitor.conf:/etc/nginx/conf.d/upload-monitor.conf:ro
+    networks:
+      WeKnora-network:
+      hcy-ingress:
+        aliases:
+          - weknora-frontend
+
+  app:
+    image: weknora-app:local-patched
+    environment:
+      - SSRF_WHITELIST_EXTRA=sub2api.long-antares.ts.net,*.long-antares.ts.net,searxng,accelerator-router,speaches,paddleocr-vl
+      - NEO4J_ENABLE=true
+      - VLM_HTTP_TIMEOUT_SECONDS=1200
+    dns:
+      - 100.100.100.100
+      - 1.1.1.1
+    networks:
+      WeKnora-network:
+      hcy-ingress:
+        aliases:
+          - weknora-app
+
+  langfuse-web:
+    ports: !reset []
+    cpus: "1.0"
+    mem_limit: 2g
+    environment:
+      HOSTNAME: 0.0.0.0
+    networks:
+      WeKnora-network:
+      hcy-ingress:
+        aliases:
+          - weknora-langfuse
+
+  langfuse-worker:
+    cpus: "0.75"
+    mem_limit: 1g
+
+  langfuse-clickhouse:
+    cpus: "0.75"
+    mem_limit: 1536m
+
+  langfuse-minio:
+    ports: !reset []
+    cpus: "0.25"
+    mem_limit: 512m
+    environment:
+      MINIO_BROWSER_REDIRECT_URL: http://minio.localhost
+      MINIO_SERVER_URL: http://s3.localhost
+    networks:
+      WeKnora-network:
+      hcy-ingress:
+        aliases:
+          - weknora-minio
+
+  qwen-reranker:
+    build:
+      context: ./rerank-service
+    container_name: WeKnora-qwen-reranker
+    environment:
+      # Compatibility service name; the CPU fallback is intentionally a small
+      # multilingual INT8 ONNX model so it remains usable under GPU pressure.
+      - MODEL_ID=jinaai/jina-reranker-v2-base-multilingual
+      - MODEL_MAX_LENGTH=1024
+      - MODEL_BATCH_SIZE=16
+      - MODEL_DEVICE=cpu
+      - MODEL_BACKEND=onnx
+      - MODEL_FILE_NAME=onnx/model_int8.onnx
+      - MODEL_TRUST_REMOTE_CODE=1
+      - MODEL_REVISION=9cfeff2df7d40d1b78e75e5e9cebec92a99813c9
+      - HF_HUB_DISABLE_XET=1
+      - HF_HOME=/models/huggingface
+    volumes:
+      - reranker-cache:/models/huggingface
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 10m
+    networks:
+      - WeKnora-network
+    cpus: "3.0"
+    mem_limit: 3g
+    restart: unless-stopped
+
+  qwen-reranker-gpu:
+    profiles: ["gpu"]
+    build:
+      context: ./rerank-service
+      dockerfile: Dockerfile.gpu
+    container_name: WeKnora-qwen-reranker-gpu
+    environment:
+      - MODEL_ID=Qwen/Qwen3-Reranker-0.6B
+      - MODEL_MAX_LENGTH=2048
+      - MODEL_BATCH_SIZE=8
+      - MODEL_DEVICE=cuda
+      - GPU_REQUIRED=1
+      - HF_HOME=/models/huggingface
+    volumes:
+      - reranker-cache:/models/huggingface
+    expose:
+      - "8000"
+    gpus: all
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 3m
+    networks:
+      - WeKnora-network
+    restart: unless-stopped
+
+  accelerator-router:
+    image: node:24-alpine
+    container_name: WeKnora-accelerator-router
+    command: ["node", "/srv/server.mjs"]
+    environment:
+      - PORT=18083
+      - RERANK_CPU_URL=http://qwen-reranker:8000
+      - RERANK_GPU_URL=http://qwen-reranker-gpu:8000
+      - GPU_HEALTH_TIMEOUT_MS=350
+      - MAX_BODY_BYTES=16777216
+    volumes:
+      - ./accelerator-router/server.mjs:/srv/server.mjs:ro
+    expose:
+      - "18083"
+    depends_on:
+      qwen-reranker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18083/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - WeKnora-network
+    restart: unless-stopped
+
+  speaches:
+    image: ghcr.io/speaches-ai/speaches:latest-cpu
+    container_name: WeKnora-speaches
+    environment:
+      - HF_HUB_DISABLE_XET=1
+      - HF_HUB_DOWNLOAD_TIMEOUT=600
+      - WHISPER__INFERENCE_DEVICE=cpu
+      - WHISPER__COMPUTE_TYPE=int8
+      - WHISPER__CPU_THREADS=3
+    volumes:
+      - speaches-cache:/home/ubuntu/.cache/huggingface/hub
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - WeKnora-network
+    cpus: "3.0"
+    mem_limit: 4g
+    restart: unless-stopped
+
+  paddleocr-vl-cpu:
+    profiles: ["paddle-cpu"]
+    build:
+      context: ./paddleocr-vl-service
+    container_name: WeKnora-paddleocr-vl-cpu
+    environment:
+      - PADDLE_PDX_MODEL_SOURCE=BOS
+      - OMP_NUM_THREADS=3
+      - MKL_NUM_THREADS=3
+    volumes:
+      - paddleocr-cache:/root/.paddlex
+      - paddleocr-model-cache:/root/.cache
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/docs', timeout=10)"]
+      interval: 60s
+      timeout: 15s
+      retries: 10
+      start_period: 20m
+    networks:
+      - WeKnora-network
+    cpus: "3.0"
+    mem_limit: 6g
+    restart: unless-stopped
+
+  paddleocr-vl:
+    profiles: ["paddle-gpu"]
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:latest-nvidia-gpu
+    user: root
+    container_name: WeKnora-paddleocr-vl
+    environment:
+      - PADDLE_PDX_MODEL_SOURCE=BOS
+      - VLM_BACKEND=vllm
+      - OMP_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+    command: ["paddlex", "--serve", "--pipeline", "/home/paddleocr/pipeline_config_vllm.yaml", "--device", "cpu"]
+    volumes:
+      - paddleocr-cache:/home/paddleocr/.paddlex
+      - paddleocr-model-cache:/home/paddleocr/.cache
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=10)"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 10m
+    depends_on:
+      paddleocr-vlm-server:
+        condition: service_healthy
+    networks:
+      - WeKnora-network
+    gpus: all
+    mem_limit: 4g
+    restart: unless-stopped
+
+  paddleocr-vlm-server:
+    profiles: ["paddle-gpu"]
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu
+    user: root
+    container_name: WeKnora-paddleocr-vlm-server
+    command:
+      - paddleocr
+      - genai_server
+      - --model_name
+      - PaddleOCR-VL-1.6-0.9B
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --backend
+      - vllm
+      - --backend_config
+      - /home/paddleocr/vllm_config.yaml
+    environment:
+      - PADDLE_PDX_MODEL_SOURCE=BOS
+    volumes:
+      - ./paddleocr-vl-service/vllm_config.yaml:/home/paddleocr/vllm_config.yaml:ro
+      - paddleocr-cache:/home/paddleocr/.paddlex
+      - paddleocr-model-cache:/home/paddleocr/.cache
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8080/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+      start_period: 10m
+    networks:
+      - WeKnora-network
+    gpus: all
+    shm_size: 2g
+    mem_limit: 4g
+    restart: unless-stopped
+
+volumes:
+  paddleocr-cache:
+  paddleocr-model-cache:
+  reranker-cache:
+  speaches-cache:
+
+networks:
+  hcy-ingress:
+    external: true
+    name: hcy-ingress

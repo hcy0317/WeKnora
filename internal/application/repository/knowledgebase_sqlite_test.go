@@ -1,6 +1,9 @@
 package repository
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -245,7 +248,7 @@ func TestCountByVectorStoreID(t *testing.T) {
 	kbCross.TenantID = 2
 	require.NoError(t, db.Create(kbCross).Error)
 
-	// Soft-deleted row bound to store-A (must not count under auto-scope).
+	// Soft-deleted rows retain their binding until async deletion finalizes.
 	kbDeleted := makeKB(kbStrPtr("store-A"))
 	require.NoError(t, db.Create(kbDeleted).Error)
 	require.NoError(t, db.Delete(kbDeleted).Error)
@@ -257,13 +260,13 @@ func TestCountByVectorStoreID(t *testing.T) {
 	t.Run("nil db handle uses default", func(t *testing.T) {
 		count, err := repo.CountByVectorStoreID(ctx, nil, 1, "store-A")
 		require.NoError(t, err)
-		assert.Equal(t, int64(2), count, "tenant 1 has 2 active KBs on store-A")
+		assert.Equal(t, int64(3), count, "soft-deleted KB bindings must block store deletion")
 	})
 
 	t.Run("explicit db handle works the same", func(t *testing.T) {
 		count, err := repo.CountByVectorStoreID(ctx, db, 1, "store-A")
 		require.NoError(t, err)
-		assert.Equal(t, int64(2), count)
+		assert.Equal(t, int64(3), count)
 	})
 
 	t.Run("different store id", func(t *testing.T) {
@@ -303,9 +306,153 @@ func TestCountByVectorStoreID(t *testing.T) {
 				return err
 			}
 			assert.Equal(t, c1, c2, "two reads within the same tx must agree")
-			assert.Equal(t, int64(2), c1)
+			assert.Equal(t, int64(3), c1)
 			return nil
 		})
 		require.NoError(t, err)
 	})
+}
+
+func TestFinalizeKnowledgeBaseDeletionClearsOnlyMatchingSoftDeletedBindingAndManifests(t *testing.T) {
+	db := setupKBTestDB(t)
+	require.NoError(t, db.AutoMigrate(&types.QuestionGenerationManifest{}))
+	repo := &knowledgeBaseRepository{db: db}
+	kb := makeKB(kbStrPtr("store-A"))
+	require.NoError(t, db.Create(kb).Error)
+	require.NoError(t, db.Delete(kb).Error)
+	other := makeKB(kbStrPtr("store-A"))
+	other.TenantID = 2
+	require.NoError(t, db.Create(other).Error)
+	require.NoError(t, db.Delete(other).Error)
+	manifest := &types.QuestionGenerationManifest{
+		ID: "manifest-1", TenantID: kb.TenantID, KnowledgeBaseID: kb.ID,
+		KnowledgeID: "knowledge-1", ChunkID: "chunk-1", ContentRevision: 1,
+		BatchIndex: 0, IdentityVersion: 1, GenerationKey: "generation-1",
+		EmbeddingDimension: 1, State: types.QuestionGenerationManifestIndexing,
+		EffectiveEngines: types.JSON("[]"), Questions: types.JSON("[]"),
+		IndexEntries: types.JSON("[]"), DesiredSourceIDs: types.JSON("[]"),
+		AbandonedSourceIDs: types.JSON("[]"),
+	}
+	require.NoError(t, db.Create(manifest).Error)
+
+	require.Error(t, repo.FinalizeKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, "store-forged"))
+	require.Error(t, repo.FinalizeKnowledgeBaseDeletion(t.Context(), 2, kb.ID, "store-A"))
+	require.ErrorContains(t, repo.FinalizeKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, "store-A"), "manifest")
+	require.NoError(t, db.Delete(manifest).Error)
+	require.NoError(t, repo.FinalizeKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, "store-A"))
+	require.NoError(t, repo.FinalizeKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, "store-A"), "retry must be idempotent")
+
+	var stored types.KnowledgeBase
+	require.NoError(t, db.Unscoped().Where("tenant_id = ? AND id = ?", kb.TenantID, kb.ID).First(&stored).Error)
+	require.Nil(t, stored.VectorStoreID)
+	var otherStored types.KnowledgeBase
+	require.NoError(t, db.Unscoped().Where("tenant_id = ? AND id = ?", other.TenantID, other.ID).First(&otherStored).Error)
+	require.Equal(t, "store-A", *otherStored.VectorStoreID)
+}
+
+func TestPrepareKnowledgeBaseDeletionIsAtomicAndIdentityScoped(t *testing.T) {
+	db := setupKBTestDB(t)
+	require.NoError(t, db.AutoMigrate(&types.TaskPendingOp{}))
+	repo := &knowledgeBaseRepository{db: db}
+	kb := makeKB(kbStrPtr("store-A"))
+	require.NoError(t, db.Create(kb).Error)
+	payload := json.RawMessage(`{"tenant_id":1,"knowledge_base_id":"` + kb.ID + `"}`)
+	valid := func() *types.TaskPendingOp {
+		return &types.TaskPendingOp{
+			TenantID: kb.TenantID, TaskType: types.TypeKBDelete,
+			Scope: types.TaskScopeKnowledgeBaseDeletion, ScopeID: kb.ID,
+			Op: "delete", DedupKey: "kb-delete:1:" + kb.ID, Payload: payload,
+		}
+	}
+	for _, forged := range []*types.TaskPendingOp{
+		func() *types.TaskPendingOp { op := valid(); op.TenantID = 2; return op }(),
+		func() *types.TaskPendingOp { op := valid(); op.ScopeID = "other-kb"; return op }(),
+		func() *types.TaskPendingOp { op := valid(); op.DedupKey = ""; return op }(),
+		func() *types.TaskPendingOp { op := valid(); op.DedupKey = "kb-delete:1:forged"; return op }(),
+		func() *types.TaskPendingOp { op := valid(); op.Payload = nil; return op }(),
+		func() *types.TaskPendingOp {
+			op := valid()
+			op.Payload = json.RawMessage(`{"tenant_id":1,"knowledge_base_id":"forged"}`)
+			return op
+		}(),
+	} {
+		require.Error(t, repo.PrepareKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, forged))
+	}
+	var outboxRows int64
+	require.NoError(t, db.Model(&types.TaskPendingOp{}).Count(&outboxRows).Error)
+	require.Zero(t, outboxRows)
+
+	forgedExisting := valid()
+	forgedExisting.Payload = json.RawMessage(`{"tenant_id":1,"knowledge_base_id":"forged"}`)
+	require.NoError(t, db.Create(forgedExisting).Error)
+	require.ErrorContains(t, repo.PrepareKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, valid()), "existing outbox payload mismatch")
+	require.NoError(t, db.Where("scope = ? AND scope_id = ?", types.TaskScopeKnowledgeBaseDeletion, kb.ID).Delete(&types.TaskPendingOp{}).Error)
+	var active int64
+	require.NoError(t, db.Model(&types.KnowledgeBase{}).Where("tenant_id = ? AND id = ?", kb.TenantID, kb.ID).Count(&active).Error)
+	require.Equal(t, int64(1), active, "mismatched residue must not soft-delete KB")
+
+	require.NoError(t, db.Create(valid()).Error)
+	require.NoError(t, db.Create(valid()).Error)
+	require.ErrorContains(t, repo.PrepareKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, valid()), "duplicate outbox rows")
+	require.NoError(t, db.Where("scope = ? AND scope_id = ?", types.TaskScopeKnowledgeBaseDeletion, kb.ID).Delete(&types.TaskPendingOp{}).Error)
+	require.NoError(t, db.Model(&types.KnowledgeBase{}).Where("tenant_id = ? AND id = ?", kb.TenantID, kb.ID).Count(&active).Error)
+	require.Equal(t, int64(1), active, "duplicate residue must not soft-delete KB")
+
+	callback := "test:fail-kb-delete-outbox"
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement != nil && tx.Statement.Table == "task_pending_ops" {
+			tx.AddError(errors.New("injected outbox insert failure"))
+		}
+	}))
+	require.ErrorContains(t, repo.PrepareKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, valid()), "injected")
+	require.NoError(t, db.Callback().Create().Remove(callback))
+	require.NoError(t, db.Model(&types.KnowledgeBase{}).Where("tenant_id = ? AND id = ?", kb.TenantID, kb.ID).Count(&active).Error)
+	require.Equal(t, int64(1), active, "outbox failure must roll back soft delete")
+
+	require.NoError(t, repo.PrepareKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, valid()))
+	require.NoError(t, db.Model(&types.TaskPendingOp{}).Where("scope = ? AND scope_id = ?",
+		types.TaskScopeKnowledgeBaseDeletion, kb.ID).Count(&active).Error)
+	require.Equal(t, int64(1), active)
+	require.NoError(t, db.Model(&types.KnowledgeBase{}).Where("tenant_id = ? AND id = ?", kb.TenantID, kb.ID).Count(&active).Error)
+	require.Zero(t, active)
+}
+
+func TestAuthorizeKnowledgeBaseDeletionRequiresSoftDeleteAndExactOutbox(t *testing.T) {
+	db := setupKBTestDB(t)
+	require.NoError(t, db.AutoMigrate(&types.TaskPendingOp{}))
+	repo := &knowledgeBaseRepository{db: db}
+	kb := makeKB(kbStrPtr("store-A"))
+	require.NoError(t, db.Create(kb).Error)
+	dedup := fmt.Sprintf("kb-delete:%d:%s", kb.TenantID, kb.ID)
+	payload, err := json.Marshal(types.KBDeletePayload{TenantID: kb.TenantID, KnowledgeBaseID: kb.ID})
+	require.NoError(t, err)
+	op := &types.TaskPendingOp{
+		TenantID: kb.TenantID, TaskType: types.TypeKBDelete,
+		Scope: types.TaskScopeKnowledgeBaseDeletion, ScopeID: kb.ID,
+		Op: "delete", DedupKey: dedup, Payload: payload,
+	}
+
+	executing := &types.KBDeletePayload{TenantID: kb.TenantID, KnowledgeBaseID: kb.ID}
+	require.ErrorContains(t, repo.AuthorizeKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, dedup, executing), "not soft-deleted")
+	require.NoError(t, repo.PrepareKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, op))
+	require.NoError(t, repo.AuthorizeKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, dedup, executing))
+	storeID := "forged-store"
+	for _, altered := range []*types.KBDeletePayload{
+		{TenantID: kb.TenantID, KnowledgeBaseID: kb.ID, VectorStoreID: &storeID},
+		{TenantID: kb.TenantID, KnowledgeBaseID: kb.ID, DataSourceIDs: []string{"forged-ds"}},
+		{TenantID: kb.TenantID, KnowledgeBaseID: kb.ID, EffectiveEngines: []types.RetrieverEngineParams{{
+			RetrieverEngineType: "forged", RetrieverType: types.VectorRetrieverType,
+		}}},
+	} {
+		require.ErrorContains(t,
+			repo.AuthorizeKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, dedup, altered),
+			"does not match durable snapshot")
+	}
+
+	forged, err := json.Marshal(types.KBDeletePayload{TenantID: kb.TenantID + 1, KnowledgeBaseID: kb.ID})
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&types.TaskPendingOp{}).Where("dedup_key = ?", dedup).Update("payload", forged).Error)
+	require.ErrorContains(t, repo.AuthorizeKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, dedup, executing), "payload identity")
+	require.NoError(t, db.Where("dedup_key = ?", dedup).Delete(&types.TaskPendingOp{}).Error)
+	require.ErrorContains(t, repo.AuthorizeKnowledgeBaseDeletion(t.Context(), kb.TenantID, kb.ID, dedup, executing), "expected one outbox row")
 }

@@ -50,7 +50,7 @@ func (r *chunkRepository) CreateChunks(ctx context.Context, chunks []*types.Chun
 		}
 	}
 
-	db := r.db.WithContext(ctx)
+	db := dbWithContext(ctx, r.db)
 
 	// SQLite doesn't support autoIncrement on non-PK columns,
 	// so we must pre-assign SeqIDs manually (safe: single connection).
@@ -71,7 +71,7 @@ func (r *chunkRepository) CreateChunks(ctx context.Context, chunks []*types.Chun
 // GetChunkByID retrieves a chunk by its ID and tenant ID
 func (r *chunkRepository) GetChunkByID(ctx context.Context, tenantID uint64, id string) (*types.Chunk, error) {
 	var chunk types.Chunk
-	if err := r.db.WithContext(ctx).Where("tenant_id = ? AND id = ?", tenantID, id).First(&chunk).Error; err != nil {
+	if err := dbWithContext(ctx, r.db).Where("tenant_id = ? AND id = ?", tenantID, id).First(&chunk).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrChunkNotFound
 		}
@@ -307,7 +307,22 @@ func (r *chunkRepository) ListChunksByParentIDs(
 // except SeqID (auto-increment, must not be overwritten).
 // Make sure the chunk object is complete (e.g., fetched from DB) before calling this method.
 func (r *chunkRepository) UpdateChunk(ctx context.Context, chunk *types.Chunk) error {
-	return r.db.WithContext(ctx).Omit("SeqID").Save(chunk).Error
+	return dbWithContext(ctx, r.db).Omit("SeqID").Save(chunk).Error
+}
+
+func (r *chunkRepository) CompareAndSwapChunkMetadata(
+	ctx context.Context, tenantID uint64, chunkID string, expectedRevision int,
+	expectedMetadata, nextMetadata types.JSON,
+) (bool, error) {
+	db := dbWithContext(ctx, r.db).Model(&types.Chunk{}).
+		Where("id = ? AND tenant_id = ? AND content_revision = ?", chunkID, tenantID, expectedRevision)
+	if len(expectedMetadata) == 0 {
+		db = db.Where("metadata IS NULL")
+	} else {
+		db = db.Where("metadata = ?", expectedMetadata)
+	}
+	result := db.Update("metadata", nextMetadata)
+	return result.RowsAffected == 1, result.Error
 }
 
 func (r *chunkRepository) CreateChunkRevision(ctx context.Context, revision *types.ChunkRevision) error {

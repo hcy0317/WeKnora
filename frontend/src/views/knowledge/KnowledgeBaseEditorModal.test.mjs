@@ -30,3 +30,34 @@ test('shows a post-create hint after the first successful save', () => {
   assert.match(source, /settings-footer-note/)
   assert.match(source, /knowledgeEditor\.postCreateHint\.followUpDesc/)
 })
+
+test('knowledge graph toggle stays aligned with the indexing strategy', () => {
+  assert.match(
+    source,
+    /formData\.value\.indexingStrategy\.graphEnabled = !!config\.enabled/
+  )
+})
+
+test('enabled knowledge graph configuration is validated before either save request', () => {
+  const validation = source.match(
+    /const validateForm = \(\): boolean => \{([\s\S]*?)^\}/m
+  )?.[1]
+
+  assert.ok(validation, 'expected to find validateForm')
+  assert.match(validation, /graphConfig\?\.enabled/)
+  assert.match(validation, /graphConfig\.text\.trim\(\)/)
+  assert.match(validation, /graphConfig\.tags\.length/)
+  assert.match(validation, /graphConfig\.nodes\.length/)
+  assert.match(validation, /graphConfig\.relations\.length/)
+  assert.match(validation, /currentSection\.value = 'graph'/)
+  assert.match(validation, /graphSettings\.configIncomplete/)
+
+  const submit = source.match(
+    /const handleSubmit = async \(\) => \{([\s\S]*?)^const doSubmit/m
+  )?.[1]
+  assert.ok(submit, 'expected to find handleSubmit')
+  assert.ok(
+    submit.indexOf('validateForm()') < submit.indexOf('doSubmit()'),
+    'validation must run before submission starts'
+  )
+})

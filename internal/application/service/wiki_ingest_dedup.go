@@ -64,6 +64,263 @@ type dedupSurface struct {
 	nameGramSets []map[string]struct{}
 }
 
+// canonicalItemRecord is the small, persistence-independent shape used by
+// deterministic identity compaction. preferred marks a slug that already
+// exists in the wiki; an existing slug must win over a freshly generated
+// spelling variant so repeated ingests cannot make the canonical slug bounce.
+type canonicalItemRecord struct {
+	item      extractedItem
+	kind      string
+	preferred bool
+}
+
+// normalizedIdentitySurface normalizes only presentation differences. It is
+// deliberately stricter than the fuzzy dedup score: related subjects such as
+// "玉米纹枯病" and "纹枯病" remain distinct, while "同玉609" and
+// "同玉 609" compare equal.
+func normalizedIdentitySurface(value string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(value)) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func extractedItemIdentitySurfaces(item extractedItem) map[string]struct{} {
+	out := make(map[string]struct{}, 1+len(item.Aliases))
+	for _, value := range append([]string{item.Name}, item.Aliases...) {
+		if normalized := normalizedIdentitySurface(value); normalized != "" {
+			out[normalized] = struct{}{}
+		}
+	}
+	return out
+}
+
+func wikiPageIdentitySurfaces(page *types.WikiPageLite) map[string]struct{} {
+	if page == nil {
+		return nil
+	}
+	out := make(map[string]struct{}, 1+len(page.Aliases))
+	for _, value := range append([]string{page.Title}, []string(page.Aliases)...) {
+		if normalized := normalizedIdentitySurface(value); normalized != "" {
+			out[normalized] = struct{}{}
+		}
+	}
+	return out
+}
+
+func identitySurfacesIntersect(left, right map[string]struct{}) bool {
+	if len(left) > len(right) {
+		left, right = right, left
+	}
+	for surface := range left {
+		if _, ok := right[surface]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func slugKind(slug string) string {
+	if slash := strings.Index(slug, "/"); slash > 0 {
+		return strings.ToLower(slug[:slash])
+	}
+	return ""
+}
+
+// compactSlugIdentity removes only separators from the slug body. This catches
+// pinyin segmentation drift such as tongyu-609 vs tong-yu-609 without using a
+// broad fuzzy match that could collapse merely related subjects.
+func compactSlugIdentity(slug string) string {
+	if slash := strings.Index(slug, "/"); slash >= 0 {
+		slug = slug[slash+1:]
+	}
+	return normalizedIdentitySurface(slug)
+}
+
+func canonicalRecordsShareIdentity(left, right canonicalItemRecord) bool {
+	if left.item.Slug != "" && left.item.Slug == right.item.Slug {
+		return true
+	}
+	if identitySurfacesIntersect(extractedItemIdentitySurfaces(left.item), extractedItemIdentitySurfaces(right.item)) {
+		return true
+	}
+	return left.kind == right.kind && left.kind != "" &&
+		compactSlugIdentity(left.item.Slug) != "" &&
+		compactSlugIdentity(left.item.Slug) == compactSlugIdentity(right.item.Slug)
+}
+
+func mergeExtractedItem(dst *extractedItem, src extractedItem) {
+	if dst.Name == "" || len([]rune(src.Name)) > len([]rune(dst.Name)) {
+		dst.Name = src.Name
+	}
+	dst.Description = mergeIndependentFactText(dst.Description, src.Description)
+	dst.Details = mergeIndependentFactText(dst.Details, src.Details)
+	dst.Aliases = uniqueNonEmptyStrings(append(dst.Aliases, src.Aliases...))
+	dst.SourceChunks = uniqueNonEmptyStrings(append(dst.SourceChunks, src.SourceChunks...))
+}
+
+// canonicalizeItemRecords groups only deterministic identities, merges their
+// facts, and returns old-slug -> canonical-slug aliases. Existing slugs win;
+// otherwise entities win an exact cross-type collision, then lexical slug
+// order makes the result stable across goroutine/map iteration order.
+func canonicalizeItemRecords(records []canonicalItemRecord) ([]canonicalItemRecord, map[string]string) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+
+	parent := make([]int, len(records))
+	for i := range parent {
+		parent[i] = i
+	}
+	var find func(int) int
+	find = func(index int) int {
+		if parent[index] != index {
+			parent[index] = find(parent[index])
+		}
+		return parent[index]
+	}
+	union := func(left, right int) {
+		leftRoot, rightRoot := find(left), find(right)
+		if leftRoot != rightRoot {
+			parent[rightRoot] = leftRoot
+		}
+	}
+	for i := range records {
+		for j := i + 1; j < len(records); j++ {
+			if canonicalRecordsShareIdentity(records[i], records[j]) {
+				union(i, j)
+			}
+		}
+	}
+
+	components := make(map[int][]int)
+	var componentOrder []int
+	for index := range records {
+		root := find(index)
+		if _, ok := components[root]; !ok {
+			componentOrder = append(componentOrder, root)
+		}
+		components[root] = append(components[root], index)
+	}
+
+	aliases := make(map[string]string)
+	out := make([]canonicalItemRecord, 0, len(components))
+	for _, root := range componentOrder {
+		indexes := components[root]
+		winner := indexes[0]
+		better := func(candidate, current canonicalItemRecord) bool {
+			if candidate.preferred != current.preferred {
+				return candidate.preferred
+			}
+			if !candidate.preferred && candidate.kind != current.kind {
+				if candidate.kind == types.WikiPageTypeEntity {
+					return true
+				}
+				if current.kind == types.WikiPageTypeEntity {
+					return false
+				}
+			}
+			return candidate.item.Slug < current.item.Slug
+		}
+		for _, index := range indexes[1:] {
+			if better(records[index], records[winner]) {
+				winner = index
+			}
+		}
+
+		canonical := records[winner]
+		canonical.item = extractedItem{Slug: records[winner].item.Slug}
+		for _, index := range indexes {
+			mergeExtractedItem(&canonical.item, records[index].item)
+			oldSlug := records[index].item.Slug
+			if oldSlug != "" && oldSlug != canonical.item.Slug {
+				aliases[oldSlug] = canonical.item.Slug
+			}
+		}
+		out = append(out, canonical)
+	}
+	if len(aliases) == 0 {
+		aliases = nil
+	}
+	return out, aliases
+}
+
+// compactExtractedItems removes deterministic duplicates produced inside one
+// extraction run (including across 6000-rune shards and citation new_slugs).
+func compactExtractedItems(entities, concepts []extractedItem) ([]extractedItem, []extractedItem) {
+	records := make([]canonicalItemRecord, 0, len(entities)+len(concepts))
+	for _, item := range entities {
+		records = append(records, canonicalItemRecord{item: item, kind: types.WikiPageTypeEntity})
+	}
+	for _, item := range concepts {
+		records = append(records, canonicalItemRecord{item: item, kind: types.WikiPageTypeConcept})
+	}
+	canonical, _ := canonicalizeItemRecords(records)
+
+	entities = make([]extractedItem, 0, len(canonical))
+	concepts = make([]extractedItem, 0, len(canonical))
+	for _, record := range canonical {
+		kind := slugKind(record.item.Slug)
+		if kind == "" {
+			kind = record.kind
+		}
+		if kind == types.WikiPageTypeConcept {
+			concepts = append(concepts, record.item)
+		} else {
+			entities = append(entities, record.item)
+		}
+	}
+	return entities, concepts
+}
+
+// deterministicExistingMergeTarget resolves exact identities before asking
+// the LLM about genuinely fuzzy near-matches. Same-type targets are preferred;
+// an exact title/alias match may cross the entity/concept boundary so one real
+// subject cannot persist twice solely because the model changed its type tag.
+func deterministicExistingMergeTarget(
+	item extractedItem,
+	itemType string,
+	candidates map[string]bool,
+	pages map[string]*types.WikiPageLite,
+) string {
+	itemSurfaces := extractedItemIdentitySurfaces(item)
+	var sameType, crossType []string
+	for slug := range candidates {
+		page := pages[slug]
+		if page == nil || page.Slug == "" {
+			continue
+		}
+		pageType := page.PageType
+		if pageType == "" {
+			pageType = slugKind(page.Slug)
+		}
+		exactSurface := identitySurfacesIntersect(itemSurfaces, wikiPageIdentitySurfaces(page))
+		same := pageType == itemType
+		sameCompactSlug := same && compactSlugIdentity(item.Slug) != "" &&
+			compactSlugIdentity(item.Slug) == compactSlugIdentity(page.Slug)
+		if !exactSurface && !sameCompactSlug {
+			continue
+		}
+		if same {
+			sameType = append(sameType, page.Slug)
+		} else if exactSurface {
+			crossType = append(crossType, page.Slug)
+		}
+	}
+	if len(sameType) > 0 {
+		sort.Strings(sameType)
+		return sameType[0]
+	}
+	if len(crossType) > 0 {
+		sort.Strings(crossType)
+		return crossType[0]
+	}
+	return ""
+}
+
 // countEntityConceptPages returns how many of the given pages are
 // entity- or concept-typed. Used only for logging the prefilter's
 // reduction ratio.

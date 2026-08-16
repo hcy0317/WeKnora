@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/types"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
@@ -165,6 +166,94 @@ func TestManager_FullRoundTrip(t *testing.T) {
 		return
 	}
 	t.Fatal("generation span not exported")
+}
+
+func TestGeneration_KnowledgeCorrelationAndUsageRecorder(t *testing.T) {
+	m, exp := newTestManager(t)
+	recorded := make(chan types.KnowledgeGenerationUsage, 2)
+	m.SetKnowledgeUsageRecorder(func(_ context.Context, usage types.KnowledgeGenerationUsage) {
+		recorded <- usage
+	})
+	ctx := withKnowledgeTraceContext(context.Background(), KnowledgeTraceContext{
+		KnowledgeID: "knowledge-1",
+		Attempt:     3,
+		Stage:       "postprocess.summary",
+		TaskType:    types.TypeSummaryGeneration,
+	})
+	_, gen := m.StartGeneration(ctx, GenerationOptions{
+		Name:  "chat.completion",
+		Model: "gpt-test",
+		Metadata: map[string]interface{}{
+			"model_id":     "model-1",
+			"call_purpose": "document_summary",
+		},
+	})
+	started := <-recorded
+	if started.Status != types.SpanStatusRunning || !started.FinishedAt.IsZero() {
+		t.Fatalf("generation start record = %+v, want running with no finish time", started)
+	}
+	if started.SpanID == "" {
+		t.Fatal("generation start record must carry the stable span id")
+	}
+	gen.Finish(nil, &TokenUsage{
+		Input: 100, Output: 20, Total: 120, CacheRead: 80, CacheMiss: 20, Unit: "TOKENS",
+	}, nil)
+
+	select {
+	case usage := <-recorded:
+		if usage.KnowledgeID != "knowledge-1" || usage.Attempt != 3 || usage.Stage != "postprocess.summary" {
+			t.Fatalf("unexpected correlation: %+v", usage)
+		}
+		if usage.InputTokens != 100 || usage.OutputTokens != 20 || usage.CacheReadTokens != 80 {
+			t.Fatalf("unexpected usage: %+v", usage)
+		}
+		if usage.SpanID != started.SpanID {
+			t.Fatalf("finish span id = %q, want initial running span id %q", usage.SpanID, started.SpanID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("knowledge usage recorder was not called")
+	}
+
+	for _, span := range exp.GetSpans() {
+		if span.Name != "chat.completion" {
+			continue
+		}
+		metadata := spanAttr(span.Attributes, attrObsMetadata)
+		if !strings.Contains(metadata, `"knowledge_id":"knowledge-1"`) ||
+			!strings.Contains(metadata, `"processing_stage":"postprocess.summary"`) {
+			t.Fatalf("generation metadata lacks knowledge correlation: %s", metadata)
+		}
+		return
+	}
+	t.Fatal("generation span not exported")
+}
+
+func TestGeneration_CancelledCallPreservesCancelledStatus(t *testing.T) {
+	m, _ := newTestManager(t)
+	recorded := make(chan types.KnowledgeGenerationUsage, 2)
+	m.SetKnowledgeUsageRecorder(func(_ context.Context, usage types.KnowledgeGenerationUsage) {
+		recorded <- usage
+	})
+	ctx := withKnowledgeTraceContext(context.Background(), KnowledgeTraceContext{
+		KnowledgeID: "knowledge-cancelled",
+		Attempt:     2,
+		Stage:       "postprocess.wiki.extract",
+		TaskType:    types.TypeWikiIngest,
+	})
+	_, gen := m.StartGeneration(ctx, GenerationOptions{Name: "chat.response.stream", Model: "gpt-test"})
+	started := <-recorded
+	gen.Finish(nil, nil, context.Canceled)
+	finished := <-recorded
+
+	if started.Status != types.SpanStatusRunning {
+		t.Fatalf("start status = %q, want running", started.Status)
+	}
+	if finished.Status != types.SpanStatusCancelled {
+		t.Fatalf("finish status = %q, want cancelled", finished.Status)
+	}
+	if finished.SpanID != started.SpanID {
+		t.Fatalf("cancelled finish span id = %q, want %q", finished.SpanID, started.SpanID)
+	}
 }
 
 // TestSpan_FinishMetadataMerged verifies that metadata supplied at Finish is

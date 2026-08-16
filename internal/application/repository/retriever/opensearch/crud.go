@@ -128,12 +128,13 @@ func (r *Repository) BatchSave(
 	if err != nil {
 		return wrapTransport(err)
 	}
-	if resp != nil {
-		defer drainAndClose(resp.Inspect().Response.Body)
+	if resp == nil {
+		return fmt.Errorf("opensearch: bulk returned no response: %w", ErrTransport)
 	}
+	defer drainAndClose(resp.Inspect().Response.Body)
 	// Cap response body at 64MB (bulks of 1000 items are ~1-2MB success,
 	// can balloon with full per-item errors).
-	return inspectBulkResponse(io.LimitReader(resp.Inspect().Response.Body, 64<<20))
+	return inspectBulkResponse(io.LimitReader(resp.Inspect().Response.Body, 64<<20), len(infos))
 }
 
 // estimateBulkBodyBytes returns a rough NDJSON size in bytes. Slight
@@ -181,7 +182,10 @@ func buildBulkBody(alias string, infos []*types.IndexInfo, emb [][]float32, para
 // Does NOT include det.Error.Reason in the wrapped public error
 // (Reason can contain document content fragments). Only ID + bounded
 // enum Type is included. Full per-item Reason goes to log.Debug.
-func inspectBulkResponse(body io.Reader) error {
+func inspectBulkResponse(body io.Reader, expectedItems ...int) error {
+	if body == nil {
+		return fmt.Errorf("opensearch: bulk returned no response body: %w", ErrTransport)
+	}
 	var r struct {
 		Errors bool `json:"errors"`
 		Items  []map[string]struct {
@@ -196,21 +200,31 @@ func inspectBulkResponse(body io.Reader) error {
 	if err := json.NewDecoder(body).Decode(&r); err != nil {
 		return fmt.Errorf("opensearch: parse bulk response: %w", ErrTransport)
 	}
-	if !r.Errors {
-		return nil
-	}
 	log := logger.GetLogger(context.Background())
+	if len(expectedItems) > 0 && len(r.Items) != expectedItems[0] {
+		return fmt.Errorf("opensearch: bulk response item count mismatch: got %d, want %d: %w",
+			len(r.Items), expectedItems[0], ErrTransport)
+	}
 	var msgs []string
 	total := 0
 	for _, item := range r.Items {
+		if len(item) != 1 {
+			return fmt.Errorf("opensearch: bulk response contained an invalid item: %w", ErrTransport)
+		}
 		for op, det := range item { // {"index": {...}}
+			if op != "index" {
+				return fmt.Errorf("opensearch: bulk response contained an unexpected operation: %w", ErrTransport)
+			}
 			if det.Error == nil {
+				if det.Status < 200 || det.Status >= 300 {
+					return fmt.Errorf("opensearch: bulk response contained an unsuccessful item status: %w", ErrTransport)
+				}
 				continue
 			}
 			total++
 			// Full reason → debug log only (may contain doc content).
-			log.Debugf("[OpenSearch] bulk item err: op=%s id=%s type=%s reason=%s",
-				op, det.ID, det.Error.Type, det.Error.Reason)
+			log.Debugf("[OpenSearch] bulk item err: op=%s id=%s type=%s",
+				op, det.ID, det.Error.Type)
 			if len(msgs) < 5 {
 				// Public message: ID (operator-meaningful) + Type (bounded enum).
 				msgs = append(msgs, fmt.Sprintf("[%s %s] %s", op, det.ID, det.Error.Type))
@@ -218,7 +232,10 @@ func inspectBulkResponse(body io.Reader) error {
 		}
 	}
 	if total == 0 {
-		return nil // shouldn't happen if r.Errors=true, but defensive
+		if r.Errors {
+			return fmt.Errorf("opensearch: bulk response reported unknown item errors: %w", ErrTransport)
+		}
+		return nil
 	}
 	return fmt.Errorf("opensearch: bulk partial failure (%d items failed, first 5: %s): %w",
 		total, strings.Join(msgs, "; "), ErrTransport)
@@ -398,8 +415,9 @@ func (r *Repository) deleteByTerms(
 	if err != nil {
 		return wrapTransport(err)
 	}
-	if resp != nil {
-		drainAndClose(resp.Inspect().Response.Body)
+	if resp == nil {
+		return fmt.Errorf("opensearch: delete by query returned no response: %w", ErrTransport)
 	}
-	return nil
+	defer drainAndClose(resp.Inspect().Response.Body)
+	return inspectByQueryResponse(io.LimitReader(resp.Inspect().Response.Body, 16<<20))
 }

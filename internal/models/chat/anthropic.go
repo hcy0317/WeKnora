@@ -18,11 +18,12 @@ import (
 const anthropicVersion = "2023-06-01"
 
 type AnthropicChat struct {
-	modelName     string
-	modelID       string
-	baseURL       string
-	apiKey        string
-	customHeaders map[string]string
+	modelName       string
+	modelID         string
+	baseURL         string
+	apiKey          string
+	reasoningEffort string
+	customHeaders   map[string]string
 }
 
 type anthropicMessage struct {
@@ -31,13 +32,18 @@ type anthropicMessage struct {
 }
 
 type anthropicRequest struct {
-	Model       string             `json:"model"`
-	MaxTokens   int                `json:"max_tokens"`
-	Stream      bool               `json:"stream,omitempty"`
-	System      string             `json:"system,omitempty"`
-	Messages    []anthropicMessage `json:"messages"`
-	Temperature *float64           `json:"temperature,omitempty"`
-	TopP        *float64           `json:"top_p,omitempty"`
+	Model        string                 `json:"model"`
+	MaxTokens    int                    `json:"max_tokens"`
+	Stream       bool                   `json:"stream,omitempty"`
+	System       string                 `json:"system,omitempty"`
+	Messages     []anthropicMessage     `json:"messages"`
+	Temperature  *float64               `json:"temperature,omitempty"`
+	TopP         *float64               `json:"top_p,omitempty"`
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
+}
+
+type anthropicOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type anthropicResponse struct {
@@ -104,11 +110,12 @@ func NewAnthropicChat(config *ChatConfig) (*AnthropicChat, error) {
 	}
 
 	return &AnthropicChat{
-		modelName:     config.ModelName,
-		modelID:       config.ModelID,
-		baseURL:       baseURL,
-		apiKey:        config.APIKey,
-		customHeaders: config.CustomHeaders,
+		modelName:       config.ModelName,
+		modelID:         config.ModelID,
+		baseURL:         baseURL,
+		apiKey:          config.APIKey,
+		reasoningEffort: parseReasoningEffort(config.ExtraConfig),
+		customHeaders:   config.CustomHeaders,
 	}, nil
 }
 
@@ -255,6 +262,9 @@ func (c *AnthropicChat) buildRequest(messages []Message, opts *ChatOptions) anth
 		Model:     c.modelName,
 		MaxTokens: 1024,
 		Messages:  make([]anthropicMessage, 0, len(messages)),
+	}
+	if c.reasoningEffort != "" {
+		req.OutputConfig = &anthropicOutputConfig{Effort: c.reasoningEffort}
 	}
 	if opts != nil {
 		if opts.MaxTokens > 0 {

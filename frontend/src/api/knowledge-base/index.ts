@@ -365,6 +365,58 @@ export function getKnowledgeSpans(id: string, attempt?: number) {
   return get(`/api/v1/knowledge/${id}/spans${qs}`);
 }
 
+export interface KnowledgeSpanRetryResult {
+  source_attempt: number;
+  source_span_id: string;
+  new_attempt: number;
+  new_span_id: string;
+  target_name: string;
+  task_id: string;
+}
+
+export interface KnowledgeRetryResponse<T> {
+  success: boolean;
+  message?: string;
+  data: T;
+}
+
+export interface KnowledgeFailedItemsRetryResult {
+  knowledge_id: string;
+  source_attempt: number;
+  client_request_id: string;
+  new_attempt: number;
+  targets: Array<{
+    source_span_id: string;
+    target_name: string;
+    state: string;
+    new_span_id: string;
+    task_id: string;
+  }>;
+}
+
+export function retryKnowledgeSpan(
+  id: string,
+  attempt: number,
+  spanId: string,
+  data: { client_request_id: string },
+) {
+  return post<KnowledgeRetryResponse<KnowledgeSpanRetryResult>>(
+    `/api/v1/knowledge/${id}/attempts/${attempt}/spans/${encodeURIComponent(spanId)}/retry`,
+    data,
+  );
+}
+
+export function retryFailedKnowledgeItems(
+  id: string,
+  attempt: number,
+  data: { client_request_id: string },
+) {
+  return post<KnowledgeRetryResponse<KnowledgeFailedItemsRetryResult>>(
+    `/api/v1/knowledge/${id}/attempts/${attempt}/retry-failed`,
+    data,
+  );
+}
+
 export function delKnowledgeDetails(id: string) {
   return del(`/api/v1/knowledge/${id}`);
 }

@@ -3,6 +3,7 @@ package langfuse
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strconv"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -33,6 +34,11 @@ func InjectTracing(ctx context.Context, carrier types.LangfuseTracingCarrier) {
 	if !mgr.Enabled() {
 		return
 	}
+	if knowledgeID := knowledgeIDFromCarrier(carrier); knowledgeID != "" {
+		if trace, ok := TraceFromContext(ctx); ok {
+			trace.annotateKnowledgeID(knowledgeID)
+		}
+	}
 	tc := types.TracingContext{}
 	c := propagation.MapCarrier{}
 	propagator.Inject(ctx, c)
@@ -45,6 +51,30 @@ func InjectTracing(ctx context.Context, carrier types.LangfuseTracingCarrier) {
 	tc.LangfuseUserID = userIDFromCtx(ctx)
 	tc.LangfuseSessionID = sessionIDFromCtx(ctx)
 	carrier.SetLangfuseTracing(tc)
+}
+
+// knowledgeIDFromCarrier reads the common top-level KnowledgeID field without
+// serializing the complete payload. Some ingestion payloads contain the full
+// document text, so a JSON round-trip here would add avoidable memory pressure.
+func knowledgeIDFromCarrier(carrier types.LangfuseTracingCarrier) string {
+	value := reflect.ValueOf(carrier)
+	if !value.IsValid() {
+		return ""
+	}
+	if value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return ""
+		}
+		value = value.Elem()
+	}
+	if value.Kind() != reflect.Struct {
+		return ""
+	}
+	field := value.FieldByName("KnowledgeID")
+	if !field.IsValid() || field.Kind() != reflect.String {
+		return ""
+	}
+	return field.String()
 }
 
 // peekTracingContext pulls just the Langfuse tracing fields out of a raw
@@ -88,6 +118,7 @@ func AsynqMiddleware() asynq.MiddlewareFunc {
 			}
 
 			tc := peekTracingContext(task.Payload())
+			knowledgeTrace := peekKnowledgeTraceContext(task.Payload(), task.Type())
 			taskID, _ := asynq.GetTaskID(ctx)
 			retryCount, _ := asynq.GetRetryCount(ctx)
 			maxRetry, _ := asynq.GetMaxRetry(ctx)
@@ -101,6 +132,10 @@ func AsynqMiddleware() asynq.MiddlewareFunc {
 				"max_retry":     maxRetry,
 				"payload_bytes": len(task.Payload()),
 			}
+			for key, value := range knowledgeTraceMetadata(knowledgeTrace) {
+				meta[key] = value
+			}
+			ctx = withKnowledgeTraceContext(ctx, knowledgeTrace)
 
 			// If the upstream enqueuer stamped a traceparent, resume that trace
 			// (worker spans become children of the HTTP trace). Otherwise start

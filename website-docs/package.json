@@ -6,6 +6,7 @@
     "dev": "vitepress dev",
     "build": "vitepress build",
     "preview": "vitepress preview",
+    "smoke:knowledge-retry": "node scripts/knowledge-retry-smoke.mjs",
     "check:mermaid": "node scripts/check-mermaid.mjs",
     "check:links": "node scripts/check-links.mjs",
     "check": "npm run check:links && npm run check:mermaid"

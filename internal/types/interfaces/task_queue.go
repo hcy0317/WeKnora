@@ -55,17 +55,19 @@ type TaskPendingOpsRepository interface {
 	// a claimed-but-not-consumed row becomes immediately eligible for the
 	// next ClaimBatch. No-op for empty input. Used by the wiki retry path
 	// to re-queue a transiently-failed op without waiting for its claim to
-	// go stale. Harmless on rows that were never claimed (Lite mode).
+	// go stale. It only mutates tokenless legacy/Lite rows; owner-scoped
+	// consumers must use ReleaseClaims.
 	ReleaseByIDs(ctx context.Context, ids []int64) error
 
 	// DeleteByIDs removes the given rows. No-op for empty input. Used
 	// to consume a successfully-processed batch, and to drop ops that
-	// have been moved to task_dead_letters.
+	// have been moved to task_dead_letters. It only removes tokenless
+	// legacy/Lite rows; owner-scoped consumers must use DeleteClaims.
 	DeleteByIDs(ctx context.Context, ids []int64) error
 
 	// IncrFailCount increments fail_count for one row and returns the
 	// new value. Returns (0, nil) if the row does not exist (race with
-	// DeleteByIDs is benign).
+	// DeleteByIDs is benign). Token-owned rows are fenced out and return 0.
 	IncrFailCount(ctx context.Context, id int64) (int, error)
 
 	// PendingCount returns the number of rows currently queued for the
@@ -83,6 +85,28 @@ type TaskPendingOpsRepository interface {
 	DeleteByDedupKey(ctx context.Context, taskType, scope, scopeID, dedupKey, op string) error
 }
 
+// TaskPendingOpsClaimLease is the owner-safe extension used by long-running
+// consumers. claim_token is stable for one ownership term while
+// claim_heartbeat_at advances on renewal. Every owner mutation compares both
+// claim_token and claimed_by_task_id so a delayed worker cannot affect a
+// successor claim.
+type TaskPendingOpsClaimLease interface {
+	ClaimBatchOwned(
+		ctx context.Context,
+		taskType, scope, scopeID string,
+		limit int,
+		staleBefore time.Time,
+		owner types.TaskClaimOwner,
+	) ([]*types.TaskPendingOp, error)
+	RenewClaims(ctx context.Context, ids []int64, owner types.TaskClaimOwner) error
+	ReleaseClaims(ctx context.Context, ids []int64, owner types.TaskClaimOwner) error
+	DeleteClaims(ctx context.Context, ids []int64, owner types.TaskClaimOwner) error
+	IncrClaimFailCount(ctx context.Context, id int64, owner types.TaskClaimOwner) (int, error)
+	InspectClaim(
+		ctx context.Context, taskType, scope, scopeID, dedupKey string,
+	) (*types.TaskPendingOpClaimSnapshot, error)
+}
+
 // TaskPendingOpsScopeCleaner is an optional extension for callers that need
 // to discard every durable pending operation owned by a deleted scope. It is
 // intentionally separate from TaskPendingOpsRepository so alternate queue
@@ -90,6 +114,10 @@ type TaskPendingOpsRepository interface {
 // lifecycle-only operation.
 type TaskPendingOpsScopeCleaner interface {
 	DeleteByScope(ctx context.Context, scope, scopeID string) error
+}
+
+type KnowledgeBaseDeletionOutboxAcker interface {
+	AckKnowledgeBaseDeletion(ctx context.Context, tenantID uint64, knowledgeBaseID, dedupKey string) error
 }
 
 // TaskPendingOpsKnowledgeBaseGuard atomically persists a KB-scoped operation

@@ -2,6 +2,7 @@ package neo4j
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -45,45 +46,101 @@ func (n *Neo4jRepository) Label(namespace types.NameSpace) string {
 // AddGraph adds a graph to the Neo4j repository
 func (n *Neo4jRepository) AddGraph(ctx context.Context, namespace types.NameSpace, graphs []*types.GraphData) error {
 	if n.driver == nil {
-		logger.Warnf(ctx, "NOT SUPPORT RETRIEVE GRAPH")
-		return nil
+		err := fmt.Errorf("neo4j graph backend is disabled or unavailable")
+		logger.Errorf(ctx, "failed to add graph: %v", err)
+		return err
 	}
+	if strings.TrimSpace(namespace.KnowledgeBase) == "" || strings.TrimSpace(namespace.Knowledge) == "" {
+		return errors.New("graph namespace knowledge_base and knowledge are required")
+	}
+	if err := validateGraphBatch(graphs); err != nil {
+		return err
+	}
+	session := n.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		for _, graph := range graphs {
+			if graph == nil {
+				continue
+			}
+			if err := n.addGraphTx(ctx, tx, namespace, graph); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		logger.Errorf(ctx, "failed to add graph: %v", err)
+		return err
+	}
+	return nil
+}
+
+// validateGraphBatch validates every identity before the first Cypher query is
+// executed. This makes an invalid suffix fail closed without relying on Neo4j
+// transaction rollback to erase a valid prefix.
+func validateGraphBatch(graphs []*types.GraphData) error {
 	for _, graph := range graphs {
-		if err := n.addGraph(ctx, namespace, graph); err != nil {
-			return err
+		if graph == nil {
+			continue
+		}
+		for _, node := range graph.Node {
+			if node == nil {
+				return errors.New("graph contains a nil node")
+			}
+			if strings.TrimSpace(node.Name) == "" {
+				return errors.New("graph node name is required")
+			}
+		}
+		for _, rel := range graph.Relation {
+			if rel == nil {
+				return errors.New("graph contains a nil relationship")
+			}
+			if strings.TrimSpace(rel.Type) == "" {
+				return errors.New("graph relationship type is required")
+			}
+			if strings.TrimSpace(rel.Node1) == "" || strings.TrimSpace(rel.Node2) == "" {
+				return errors.New("graph relationship source and target are required")
+			}
 		}
 	}
 	return nil
 }
 
-// addGraph adds a graph to the Neo4j repository
-func (n *Neo4jRepository) addGraph(ctx context.Context, namespace types.NameSpace, graph *types.GraphData) error {
-	session := n.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
-	defer session.Close(ctx)
-
-	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
-		// Node import query
+// addGraphTx adds one extracted graph through the transaction owned by
+// AddGraph. A batch containing multiple GraphData values therefore commits or
+// rolls back as a unit instead of exposing the successful prefix of the batch.
+func (n *Neo4jRepository) addGraphTx(
+	ctx context.Context,
+	tx neo4j.ManagedTransaction,
+	namespace types.NameSpace,
+	graph *types.GraphData,
+) error {
+	if len(graph.Node) > 0 {
 		node_import_query := `
 			UNWIND $data AS row
-			CALL apoc.merge.node(row.labels, {name: row.name, kg: row.knowledge_id}, row.props, {}) YIELD node
-			SET node.chunks = apoc.coll.union(node.chunks, row.chunks)
+			CALL apoc.merge.node(row.labels, {name: row.name, kg: row.knowledge_id}, {}, {}) YIELD node
+			SET node.chunks = apoc.coll.union(coalesce(node.chunks, []), row.chunks)
+			SET node.attributes = apoc.coll.union(coalesce(node.attributes, []), row.attributes)
 			RETURN distinct 'done' AS result
 		`
-		nodeData := []map[string]interface{}{}
+		nodeData := make([]map[string]interface{}, 0, len(graph.Node))
 		for _, node := range graph.Node {
 			nodeData = append(nodeData, map[string]interface{}{
 				"name":         node.Name,
 				"knowledge_id": namespace.Knowledge,
-				"props":        map[string][]string{"attributes": node.Attributes},
+				"attributes":   node.Attributes,
 				"chunks":       node.Chunks,
 				"labels":       n.Labels(namespace),
 			})
 		}
 		if _, err := tx.Run(ctx, node_import_query, map[string]interface{}{"data": nodeData}); err != nil {
-			return nil, fmt.Errorf("failed to create nodes: %v", err)
+			return fmt.Errorf("failed to create nodes: %v", err)
 		}
+	}
 
-		// Relationship import query
+	if len(graph.Relation) > 0 {
 		rel_import_query := `
 			UNWIND $data AS row
 			CALL apoc.merge.node(row.source_labels, {name: row.source, kg: row.knowledge_id}, {}, {}) YIELD node as source
@@ -91,7 +148,7 @@ func (n *Neo4jRepository) addGraph(ctx context.Context, namespace types.NameSpac
 			CALL apoc.merge.relationship(source, row.type, {}, row.attributes, target) YIELD rel
 			RETURN distinct 'done'
 		`
-		relData := []map[string]interface{}{}
+		relData := make([]map[string]interface{}, 0, len(graph.Relation))
 		for _, rel := range graph.Relation {
 			relData = append(relData, map[string]interface{}{
 				"source":        rel.Node1,
@@ -100,16 +157,12 @@ func (n *Neo4jRepository) addGraph(ctx context.Context, namespace types.NameSpac
 				"type":          rel.Type,
 				"source_labels": n.Labels(namespace),
 				"target_labels": n.Labels(namespace),
+				"attributes":    map[string]interface{}{},
 			})
 		}
 		if _, err := tx.Run(ctx, rel_import_query, map[string]interface{}{"data": relData}); err != nil {
-			return nil, fmt.Errorf("failed to create relationships: %v", err)
+			return fmt.Errorf("failed to create relationships: %v", err)
 		}
-		return nil, nil
-	})
-	if err != nil {
-		logger.Errorf(ctx, "failed to add graph: %v", err)
-		return err
 	}
 	return nil
 }
@@ -134,7 +187,7 @@ func (n *Neo4jRepository) DelGraph(ctx context.Context, namespaces []types.NameS
 					{batchSize: 1000, parallel: true, params: {knowledge_id: $knowledge_id}}
 				) YIELD batches, total
 				RETURN total
-        	`
+			`
 			if _, err := tx.Run(ctx, deleteRelsQuery, map[string]interface{}{"knowledge_id": namespace.Knowledge}); err != nil {
 				return nil, fmt.Errorf("failed to delete relationships: %v", err)
 			}
@@ -146,7 +199,7 @@ func (n *Neo4jRepository) DelGraph(ctx context.Context, namespaces []types.NameS
 					{batchSize: 1000, parallel: true, params: {knowledge_id: $knowledge_id}}
 				) YIELD batches, total
 				RETURN total
-        	`
+			`
 			if _, err := tx.Run(ctx, deleteNodesQuery, map[string]interface{}{"knowledge_id": namespace.Knowledge}); err != nil {
 				return nil, fmt.Errorf("failed to delete nodes: %v", err)
 			}

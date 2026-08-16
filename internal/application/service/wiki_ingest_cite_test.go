@@ -1,11 +1,111 @@
 package service
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/types"
 )
+
+func TestRunWikiExtractionBatchesBoundsEachRequestAndMergesResults(t *testing.T) {
+	content := strings.Repeat("甲", maxRunesPerWikiExtractionBatch+17)
+	var seen []string
+	got, batchCount, err := runWikiExtractionBatches(content, func(batch string, _ combinedExtraction) (combinedExtraction, error) {
+		seen = append(seen, batch)
+		index := len(seen)
+		return combinedExtraction{Entities: []extractedItem{{
+			Name:        "主体",
+			Slug:        "entity/main",
+			Aliases:     []string{"主体别名"},
+			Description: fmt.Sprintf("第%d片独立事实", index),
+			Details:     strings.Repeat("详情", index),
+		}}}, nil
+	})
+	if err != nil {
+		t.Fatalf("runWikiExtractionBatches() error = %v", err)
+	}
+	if batchCount != 2 || len(seen) != 2 {
+		t.Fatalf("batch count = %d / calls=%d, want 2", batchCount, len(seen))
+	}
+	for index, batch := range seen {
+		if len([]rune(batch)) > maxRunesPerWikiExtractionBatch {
+			t.Fatalf("batch %d has %d runes, limit %d", index, len([]rune(batch)), maxRunesPerWikiExtractionBatch)
+		}
+	}
+	if strings.Join(seen, "") != content {
+		t.Fatal("batching lost or reordered source content")
+	}
+	if len(got.Entities) != 1 || got.Entities[0].Details != "详情详情" ||
+		got.Entities[0].Description != "第1片独立事实\n\n第2片独立事实" {
+		t.Fatalf("merged entities = %+v, want one item preserving independent facts", got.Entities)
+	}
+}
+
+func TestRunWikiExtractionBatchesSharesAccumulatedCandidatesAndCanonicalizesVariants(t *testing.T) {
+	content := strings.Repeat("甲", maxRunesPerWikiExtractionBatch+1)
+	call := 0
+	got, batchCount, err := runWikiExtractionBatches(content,
+		func(_ string, accumulated combinedExtraction) (combinedExtraction, error) {
+			call++
+			switch call {
+			case 1:
+				if len(accumulated.Entities) != 0 || len(accumulated.Concepts) != 0 {
+					t.Fatalf("first batch accumulated = %+v, want empty", accumulated)
+				}
+				return combinedExtraction{Entities: []extractedItem{{
+					Name: "同玉609", Slug: "entity/tongyu-609", Description: "第一片事实",
+				}}}, nil
+			case 2:
+				if len(accumulated.Entities) != 1 || accumulated.Entities[0].Name != "同玉609" {
+					t.Fatalf("second batch accumulated = %+v, want first-batch candidate", accumulated)
+				}
+				// Simulate a model ignoring continuity and varying only pinyin
+				// segmentation. The deterministic merge must still collapse it.
+				return combinedExtraction{Entities: []extractedItem{{
+					Name: "同玉609", Slug: "entity/tong-yu-609", Description: "第二片事实",
+				}}}, nil
+			default:
+				t.Fatalf("unexpected extraction call %d", call)
+				return combinedExtraction{}, nil
+			}
+		})
+	if err != nil {
+		t.Fatalf("runWikiExtractionBatches() error = %v", err)
+	}
+	if batchCount != 2 || call != 2 {
+		t.Fatalf("batch count = %d / calls=%d, want 2", batchCount, call)
+	}
+	if len(got.Entities) != 1 {
+		t.Fatalf("entities = %+v, want one canonical entity", got.Entities)
+	}
+	if got.Entities[0].Slug != "entity/tong-yu-609" {
+		t.Fatalf("canonical slug = %q, want stable lexical slug", got.Entities[0].Slug)
+	}
+	if got.Entities[0].Description != "第一片事实\n\n第二片事实" {
+		t.Fatalf("description = %q, want both independent facts", got.Entities[0].Description)
+	}
+}
+
+func TestRunCitationBatchWorkersFailsAtomicallyWhenMiddleBatchFails(t *testing.T) {
+	batches := []chunkBatch{{}, {}, {}}
+	results, err := runCitationBatchWorkers(context.Background(), batches,
+		func(_ context.Context, index int, _ chunkBatch) (citationBatchResult, error) {
+			if index == 1 {
+				return citationBatchResult{}, errors.New("truncated JSON")
+			}
+			return citationBatchResult{Citations: map[string][]string{"entity/main": {"c000"}}}, nil
+		})
+	if err == nil || !strings.Contains(err.Error(), "citation batch 2/3") {
+		t.Fatalf("runCitationBatchWorkers() error = %v, want indexed batch failure", err)
+	}
+	if results != nil {
+		t.Fatalf("results = %#v, want nil atomic failure", results)
+	}
+}
 
 // TestMergeCitationsIntoItems_PopulatesSourceChunksOnCandidates verifies that
 // citations returned by the chunk-classification pass are attached back onto
@@ -115,6 +215,29 @@ func TestMergeCitationsIntoItems_AddsNewSlugsAndUnionsChunksAcrossBatches(t *tes
 	newC := findBySlug(gotC, "concept/new-concept")
 	if newC == nil || !equalStrings(newC.SourceChunks, []string{"c010"}) {
 		t.Errorf("concept/new-concept missing or wrong chunks: %+v", newC)
+	}
+}
+
+func TestMergeCitationsIntoItemsCanonicalizesNewSlugVariantAgainstCandidate(t *testing.T) {
+	entities := []extractedItem{{
+		Name: "同玉609", Slug: "entity/tongyu-609", SourceChunks: []string{"c001"},
+	}}
+	newSlugs := []newSlugFromCitation{{
+		Type: "entity", Name: "同玉609", Slug: "entity/tong-yu-609", SourceChunks: []string{"c002"},
+	}}
+
+	gotE, gotC, _ := mergeCitationsIntoItems(entities, nil, map[string][]string{
+		"entity/tongyu-609": {"c001"},
+	}, newSlugs)
+	if len(gotE) != 1 || len(gotC) != 0 {
+		t.Fatalf("got %d entities + %d concepts: %+v %+v", len(gotE), len(gotC), gotE, gotC)
+	}
+	if gotE[0].Slug != "entity/tong-yu-609" {
+		t.Fatalf("canonical slug = %q, want entity/tong-yu-609", gotE[0].Slug)
+	}
+	sort.Strings(gotE[0].SourceChunks)
+	if !equalStrings(gotE[0].SourceChunks, []string{"c001", "c002"}) {
+		t.Fatalf("source chunks = %v, want union", gotE[0].SourceChunks)
 	}
 }
 

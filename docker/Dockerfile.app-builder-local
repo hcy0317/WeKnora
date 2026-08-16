@@ -1,0 +1,27 @@
+FROM golang:1.26-bookworm
+
+ARG GOPROXY_ARG=https://goproxy.cn,direct
+ARG GOSUMDB_ARG=off
+ARG APK_MIRROR_ARG=mirrors.tencent.com
+
+ENV GOPROXY=${GOPROXY_ARG}
+ENV GOSUMDB=${GOSUMDB_ARG}
+ENV GOMAXPROCS=2
+ENV PATH=/usr/local/go/bin:${PATH}
+
+WORKDIR /app
+
+RUN if [ -n "$APK_MIRROR_ARG" ]; then \
+        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
+    fi && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends build-essential git libsqlite3-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOFLAGS="-p=1" make build-prod

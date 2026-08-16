@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/types"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -37,6 +38,9 @@ type Manager struct {
 	tracer trace.Tracer
 
 	closed atomic.Bool
+
+	usageMu       sync.RWMutex
+	usageRecorder func(context.Context, types.KnowledgeGenerationUsage)
 }
 
 var (
@@ -131,6 +135,31 @@ func (m *Manager) Tracer() trace.Tracer {
 		return noop.NewTracerProvider().Tracer(langfuseScopeName)
 	}
 	return m.tracer
+}
+
+// SetKnowledgeUsageRecorder installs the best-effort sink that mirrors each
+// document-scoped Generation into WeKnora's per-document processing trace.
+// Langfuse remains the detailed prompt/response store; this sink persists only
+// correlation and usage totals for fast in-product aggregation.
+func (m *Manager) SetKnowledgeUsageRecorder(recorder func(context.Context, types.KnowledgeGenerationUsage)) {
+	if m == nil {
+		return
+	}
+	m.usageMu.Lock()
+	m.usageRecorder = recorder
+	m.usageMu.Unlock()
+}
+
+func (m *Manager) recordKnowledgeUsage(ctx context.Context, record types.KnowledgeGenerationUsage) {
+	if m == nil || record.KnowledgeID == "" || record.Attempt <= 0 {
+		return
+	}
+	m.usageMu.RLock()
+	recorder := m.usageRecorder
+	m.usageMu.RUnlock()
+	if recorder != nil {
+		recorder(ctx, record)
+	}
 }
 
 // Shutdown flushes pending spans and releases the exporter. Safe to call

@@ -290,6 +290,16 @@ const canEdit = computed(() => {
   return orgStore.canEditKB(kbId.value, false);
 });
 
+// Processing POSTs (retry / reparse / cancel) have a stricter route-level
+// role gate than general KB editing: the active tenant membership must be
+// Contributor+ (shown as Editor in the product) before creator/Admin/share
+// ownership is evaluated. Keep this separate from canEdit so a KB creator
+// who is currently a tenant Viewer never sees controls that the server will
+// reject with 403.
+const processingMutationAllowed = computed(() =>
+  canEdit.value && authStore.hasRole('contributor'),
+);
+
 // Can manage (delete, settings, etc.): same isViaShare-first rule. For
 // shared KBs only an 'admin' share grant qualifies — editor/viewer (and
 // even being the creator viewed via share) never grant delete/settings.
@@ -495,6 +505,7 @@ const awaitBatchReparseReflection = async (ids: string[]) => {
 };
 
 const confirmBatchReparse = async () => {
+  if (!processingMutationAllowed.value) return;
   if (batchReparsing.value || batchDeleting.value || selectedIds.value.size === 0) return;
   const allIds = Array.from(selectedIds.value);
   const ids = allIds.filter((id) => {
@@ -1880,7 +1891,7 @@ const handleViewTrace = (index: number, item: KnowledgeCard) => {
 
 const confirmRebuildKnowledge = async (index: number, item: KnowledgeCard) => {
   if (isFAQ.value) return;
-  if (!canEdit.value) return;
+  if (!processingMutationAllowed.value) return;
   if (!item?.id) {
     MessagePlugin.warning(t('knowledgeEditor.messages.missingId'));
     return;
@@ -1928,6 +1939,7 @@ const confirmRebuildKnowledge = async (index: number, item: KnowledgeCard) => {
 };
 
 const submitReparse = async (id: string, processConfig?: KnowledgeProcessOverrides) => {
+  if (!processingMutationAllowed.value) return;
   try {
     await reparseKnowledge(id, processConfig ? { process_config: processConfig } : undefined);
     delete traceAvailableById[id];
@@ -2139,6 +2151,7 @@ const onBatchTagConfirm = async (tagIds: string[]) => {
 };
 
 const confirmCancelParseKnowledge = async (item: KnowledgeCard) => {
+  if (!processingMutationAllowed.value) return;
   if (!item?.id) return;
   try {
     await cancelKnowledgeParse(item.id);
@@ -2178,6 +2191,7 @@ const handleCardAction = (
   const idx = (cardList.value || []).findIndex((i: KnowledgeCard) => i.id === item.id);
   if (action === 'download') return downloadKnowledge(item);
   if (action === 'edit') return handleManualEdit(idx, item);
+  if ((action === 'reparse' || action === 'cancel-parse') && !processingMutationAllowed.value) return;
   if (action === 'reparse') {
     if (isParseInFlight(item.parse_status)) return onReparseMenuClick(idx, item);
     return confirmRebuildKnowledge(idx, item);
@@ -2197,6 +2211,7 @@ const handleListAction = (
   const idx = (cardList.value || []).findIndex((i: KnowledgeCard) => i.id === item.id);
   if (action === 'download') return downloadKnowledge(item);
   if (action === 'edit') return handleManualEdit(idx, item);
+  if ((action === 'reparse' || action === 'cancel-parse') && !processingMutationAllowed.value) return;
   if (action === 'reparse') return confirmRebuildKnowledge(idx, item);
   if (action === 'cancel-parse') return confirmCancelParseKnowledge(item);
   if (action === 'move') return handleMoveKnowledge(item);
@@ -2597,6 +2612,7 @@ async function createNewSession(value: string): Promise<void> {
                     :batch-mode="batchMode"
                     :can-edit="canEdit"
                     :can-download="canDownloadKnowledge"
+                    :processing-mutation-allowed="processingMutationAllowed"
                     :can-mutate-knowledge="canMutateKnowledge"
                     :trace-available-by-id="traceAvailableById"
                     :tag-list="tagList"
@@ -2623,7 +2639,9 @@ async function createNewSession(value: string): Promise<void> {
                 <template v-else-if="(cardList.length || currentChildFolders.length) && viewMode === 'list'">
                   <DocumentListView :items="cardList" :folders="currentChildFolders" :folder-options="folderOptions"
                     :selected-ids="selectedIds" :tag-list="tagList"
-                    :can-edit="canEdit" :can-download="canDownloadKnowledge" :can-mutate-knowledge="canMutateKnowledge"
+                    :can-edit="canEdit" :can-download="canDownloadKnowledge"
+                    :processing-mutation-allowed="processingMutationAllowed"
+                    :can-mutate-knowledge="canMutateKnowledge"
                     :trace-visible-ids="traceAvailableById"
                     :move-menu-mode="moveMenuMode"
                     :move-target-kbs="moveTargetKbs"
@@ -2658,6 +2676,7 @@ async function createNewSession(value: string): Promise<void> {
               <div class="doc-batch-bar-anchor" v-show="batchMode || selectedIds.size > 0">
                 <DocumentBatchBar :count="selectedIds.size" :delete-loading="batchDeleting"
                   :reparse-loading="batchReparsing" :tag-loading="batchTagging" :visible="batchMode || selectedIds.size > 0"
+                  :show-reparse="processingMutationAllowed"
                   :show-move-to-folder="canEdit" :folder-options="folderOptions"
                   @cancel="handleBatchCancel" @delete="confirmBatchDelete" @reparse="confirmBatchReparse"
                   @batch-tag="handleBatchTag"
@@ -2670,6 +2689,7 @@ async function createNewSession(value: string): Promise<void> {
 
       <!-- DocContent drawer (shared by documents tab and wiki source refs) -->
       <DocContent ref="docContentRef" :visible="isCardDetails" :details="details" :canEditKB="canEdit"
+        :processingMutationAllowed="processingMutationAllowed"
         :canDownloadKB="canDownloadKnowledge" :kbId="kbId"
         @closeDoc="closeDoc" @getDoc="getDoc" @summaryStateChange="syncDocumentSummaryState">
       </DocContent>

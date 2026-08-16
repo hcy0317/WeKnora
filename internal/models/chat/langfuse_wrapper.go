@@ -2,6 +2,8 @@ package chat
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
@@ -27,7 +29,7 @@ func (l *langfuseChat) Chat(ctx context.Context, messages []Message, opts *ChatO
 
 	purpose, prefixFingerprint := types.LLMCallMetadataFromContext(ctx)
 	genCtx, gen := mgr.StartGeneration(ctx, langfuse.GenerationOptions{
-		Name:            "chat.completion",
+		Name:            "chat.response",
 		Model:           l.inner.GetModelName(),
 		Input:           buildLangfuseMessages(messages),
 		ModelParameters: buildLangfuseModelParams(opts),
@@ -62,7 +64,7 @@ func (l *langfuseChat) ChatStream(ctx context.Context, messages []Message, opts 
 
 	purpose, prefixFingerprint := types.LLMCallMetadataFromContext(ctx)
 	genCtx, gen := mgr.StartGeneration(ctx, langfuse.GenerationOptions{
-		Name:            "chat.completion.stream",
+		Name:            "chat.response.stream",
 		Model:           l.inner.GetModelName(),
 		Input:           buildLangfuseMessages(messages),
 		ModelParameters: buildLangfuseModelParams(opts),
@@ -74,6 +76,7 @@ func (l *langfuseChat) ChatStream(ctx context.Context, messages []Message, opts 
 			"prompt_prefix_fingerprint": prefixFingerprint,
 		},
 	})
+	genCtx = langfuse.WithGenerationProgressObserver(genCtx, gen.RecordProgress)
 
 	ch, err := l.inner.ChatStream(genCtx, messages, opts)
 	if err != nil {
@@ -81,8 +84,9 @@ func (l *langfuseChat) ChatStream(ctx context.Context, messages []Message, opts 
 		return ch, err
 	}
 	if ch == nil {
-		gen.Finish(nil, nil, nil)
-		return nil, nil
+		streamErr := errors.New("provider returned a nil stream channel")
+		gen.Finish(nil, nil, streamErr)
+		return nil, streamErr
 	}
 
 	wrapped := make(chan types.StreamResponse)
@@ -94,8 +98,51 @@ func (l *langfuseChat) ChatStream(ctx context.Context, messages []Message, opts 
 		var toolCalls []types.LLMToolCall
 		var finishReason string
 		var firstToken bool
+		var streamErr error
+		var successfulTerminal bool
 
-		for resp := range ch {
+		defer func() {
+			if ctxErr := genCtx.Err(); ctxErr != nil && streamErr == nil && !successfulTerminal {
+				// A consumer cancellation can close a decorated stream before the
+				// provider's terminal error event reaches this wrapper. Preserve that
+				// cancellation as the generation outcome instead of recording a false
+				// zero-token success.
+				streamErr = ctxErr
+			}
+			if streamErr == nil && !successfulTerminal {
+				streamErr = errors.New("provider stream closed without a successful terminal event")
+			}
+
+			var output interface{}
+			if len(contentBuf) > 0 || len(reasoningBuf) > 0 || len(toolCalls) > 0 || finishReason != "" {
+				output = buildLangfuseGenerationOutput(
+					string(contentBuf), string(reasoningBuf), finishReason, toolCalls,
+				)
+			}
+			gen.Finish(output, convertUsage(usage), streamErr)
+		}()
+
+		for {
+			var resp types.StreamResponse
+			var ok bool
+			select {
+			case <-genCtx.Done():
+				return
+			case resp, ok = <-ch:
+				if !ok {
+					return
+				}
+			}
+			if resp.ResponseType == types.ResponseTypeError && streamErr == nil {
+				detail := strings.TrimSpace(resp.Content)
+				if detail == "" {
+					detail = "provider returned an empty stream error"
+				}
+				streamErr = errors.New(detail)
+			}
+			if resp.ResponseType == types.ResponseTypeAnswer && resp.Done {
+				successfulTerminal = true
+			}
 			if resp.ResponseType == types.ResponseTypeThinking && resp.Content != "" {
 				if !firstToken {
 					gen.MarkCompletionStart(time.Now())
@@ -123,13 +170,10 @@ func (l *langfuseChat) ChatStream(ctx context.Context, messages []Message, opts 
 			if resp.FinishReason != "" {
 				finishReason = resp.FinishReason
 			}
-			wrapped <- resp
+			if !sendStreamResponse(genCtx, wrapped, resp) {
+				return
+			}
 		}
-
-		output := buildLangfuseGenerationOutput(
-			string(contentBuf), string(reasoningBuf), finishReason, toolCalls,
-		)
-		gen.Finish(output, convertUsage(usage), nil)
 	}()
 	return wrapped, nil
 }

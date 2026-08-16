@@ -62,6 +62,86 @@ func TestDedupMergeRejectReason(t *testing.T) {
 	}
 }
 
+func TestCompactExtractedItemsMergesSlugVariantsAndExactCrossTypeDuplicate(t *testing.T) {
+	entities := []extractedItem{
+		{
+			Name: "同玉609", Slug: "entity/tongyu-609",
+			Description: "实体事实", SourceChunks: []string{"c001"},
+		},
+		{
+			Name: "同玉609", Slug: "entity/tong-yu-609",
+			Details: "补充详情", SourceChunks: []string{"c002"},
+		},
+	}
+	concepts := []extractedItem{{
+		Name: "同玉609", Slug: "concept/tong-yu-609", Aliases: []string{"同玉 609"},
+		SourceChunks: []string{"c003"},
+	}}
+
+	gotE, gotC := compactExtractedItems(entities, concepts)
+	if len(gotE) != 1 || len(gotC) != 0 {
+		t.Fatalf("got %d entities + %d concepts: %+v %+v", len(gotE), len(gotC), gotE, gotC)
+	}
+	got := gotE[0]
+	if got.Slug != "entity/tong-yu-609" {
+		t.Fatalf("canonical slug = %q, want entity/tong-yu-609", got.Slug)
+	}
+	if got.Description != "实体事实" || got.Details != "补充详情" {
+		t.Fatalf("merged facts = description %q details %q", got.Description, got.Details)
+	}
+	if strings.Join(got.SourceChunks, ",") != "c001,c002,c003" {
+		t.Fatalf("source chunks = %v, want stable union", got.SourceChunks)
+	}
+}
+
+func TestCompactExtractedItemsKeepsRelatedButDistinctSubjects(t *testing.T) {
+	concepts := []extractedItem{
+		{Name: "玉米纹枯病", Slug: "concept/yumi-wenku-bing"},
+		{Name: "纹枯病", Slug: "concept/wenku-bing"},
+	}
+
+	gotE, gotC := compactExtractedItems(nil, concepts)
+	if len(gotE) != 0 || len(gotC) != 2 {
+		t.Fatalf("got %d entities + %d concepts: %+v %+v, want distinct concepts", len(gotE), len(gotC), gotE, gotC)
+	}
+}
+
+func TestDeterministicExistingMergeTargetPrefersStableExistingCanonical(t *testing.T) {
+	item := extractedItem{Name: "同玉609", Slug: "entity/tongyu-609"}
+	pages := map[string]*types.WikiPageLite{
+		"entity/tongyu-609": {
+			Slug: "entity/tongyu-609", Title: "同玉609", PageType: types.WikiPageTypeEntity,
+		},
+		"entity/tong-yu-609": {
+			Slug: "entity/tong-yu-609", Title: "同玉609", PageType: types.WikiPageTypeEntity,
+		},
+	}
+	candidates := map[string]bool{
+		"entity/tongyu-609":  true,
+		"entity/tong-yu-609": true,
+	}
+
+	got := deterministicExistingMergeTarget(item, types.WikiPageTypeEntity, candidates, pages)
+	if got != "entity/tong-yu-609" {
+		t.Fatalf("target = %q, want stable lexical existing canonical", got)
+	}
+}
+
+func TestDeterministicExistingMergeTargetReusesExactSurfaceAcrossType(t *testing.T) {
+	item := extractedItem{Name: "玉米纹枯病", Slug: "entity/yumi-wenku-bing"}
+	pages := map[string]*types.WikiPageLite{
+		"concept/yumi-wen-ku-bing": {
+			Slug: "concept/yumi-wen-ku-bing", Title: "玉米纹枯病", PageType: types.WikiPageTypeConcept,
+		},
+	}
+	candidates := map[string]bool{"concept/yumi-wen-ku-bing": true}
+
+	got := deterministicExistingMergeTarget(item, types.WikiPageTypeEntity, candidates, pages)
+	if got != "concept/yumi-wen-ku-bing" {
+		t.Fatalf("target = %q, want exact existing surface despite type disagreement", got)
+	}
+}
+
 // helper: build a minimal entity/concept WikiPage.
 func makePage(slug, title, typ string, aliases ...string) *types.WikiPage {
 	return &types.WikiPage{

@@ -373,46 +373,79 @@ func (e *elasticsearchRepository) processBulkResponse(ctx context.Context,
 	resp *esapi.Response, totalDocuments int,
 ) error {
 	log := logger.GetLogger(ctx)
+	if resp == nil || resp.Body == nil {
+		return errors.New("bulk request returned no response")
+	}
 
 	// Check for bulk operation errors
 	if resp.IsError() {
-		log.Errorf("[ElasticsearchV7] Bulk operation failed: %s", resp.String())
-		return fmt.Errorf("failed to index documents: %s", resp.String())
+		log.Errorf("[ElasticsearchV7] Bulk operation failed with status %d", resp.StatusCode)
+		return fmt.Errorf("failed to index documents: backend returned status %d", resp.StatusCode)
 	}
 
 	// Parse bulk response to check for individual document errors
 	var bulkResponse map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&bulkResponse); err != nil {
-		log.Warnf("[ElasticsearchV7] Could not parse bulk response: %v", err)
-		return nil
+		log.Errorf("[ElasticsearchV7] Could not parse bulk response: %v", err)
+		return fmt.Errorf("failed to parse bulk response: %w", err)
 	}
 
-	// Check for errors in individual operations
-	if hasErrors, ok := bulkResponse["errors"].(bool); ok && hasErrors {
-		errorCount := e.countBulkErrors(ctx, bulkResponse, totalDocuments)
-		if errorCount > 0 {
-			log.Warnf("[ElasticsearchV7] %d/%d documents failed to index", errorCount, totalDocuments)
+	// Always inspect item results. A contradictory top-level errors=false
+	// must not hide a failed item.
+	items, ok := bulkResponse["items"].([]interface{})
+	if !ok || len(items) != totalDocuments {
+		return fmt.Errorf("bulk response item count mismatch: got %d, want %d", len(items), totalDocuments)
+	}
+	errorCount := 0
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok || len(itemMap) != 1 {
+			return errors.New("bulk response contained an invalid item")
 		}
+		for operation, raw := range itemMap {
+			if operation != "index" {
+				return errors.New("bulk response contained an unexpected operation")
+			}
+			response, ok := raw.(map[string]interface{})
+			if !ok {
+				return errors.New("bulk response contained an invalid operation result")
+			}
+			if response["error"] != nil {
+				errorCount++
+				continue
+			}
+			status, ok := response["status"].(float64)
+			if !ok || status < 200 || status >= 300 {
+				return errors.New("bulk response contained an unsuccessful item status")
+			}
+		}
+	}
+	if errorCount > 0 {
+		return fmt.Errorf("failed to index %d/%d documents", errorCount, totalDocuments)
+	}
+
+	hasErrors, ok := bulkResponse["errors"].(bool)
+	if !ok {
+		return errors.New("bulk response omitted errors status")
+	}
+	if hasErrors {
+		// Elasticsearch's top-level errors flag is authoritative. Fail closed
+		// even when an unfamiliar item shape prevents us from counting it.
+		return errors.New("bulk response reported item errors")
 	}
 
 	return nil
 }
 
 // countBulkErrors counts the number of errors in a bulk response
-func (e *elasticsearchRepository) countBulkErrors(ctx context.Context,
-	bulkResponse map[string]interface{}, totalDocuments int,
-) int {
-	log := logger.GetLogger(ctx)
-	log.Warn("[ElasticsearchV7] Bulk operation completed with some errors")
-
+func (e *elasticsearchRepository) countBulkErrors(bulkResponse map[string]interface{}) int {
 	errorCount := 0
 	if items, ok := bulkResponse["items"].([]interface{}); ok {
 		for _, item := range items {
 			if itemMap, ok := item.(map[string]interface{}); ok {
-				if indexResp, ok := itemMap["index"].(map[string]interface{}); ok {
-					if indexResp["error"] != nil {
+				for _, operationResponse := range itemMap {
+					if response, ok := operationResponse.(map[string]interface{}); ok && response["error"] != nil {
 						errorCount++
-						log.Errorf("[ElasticsearchV7] Item error: %v", indexResp["error"])
 					}
 				}
 			}
@@ -469,22 +502,33 @@ func (e *elasticsearchRepository) deleteByFieldList(ctx context.Context, field s
 	defer resp.Body.Close()
 
 	if resp.IsError() {
-		errMsg := fmt.Sprintf("failed to delete by query: %s", resp.String())
-		log.Errorf("[ElasticsearchV7] %s", errMsg)
-		return fmt.Errorf("failed to delete by query: %s", resp.String())
+		log.Errorf("[ElasticsearchV7] Delete by query failed with status %d", resp.StatusCode)
+		return fmt.Errorf("failed to delete by query: backend returned status %d", resp.StatusCode)
 	}
 
-	// Try to extract deletion count from response
-	var deleteResponse map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&deleteResponse); err != nil {
-		log.Warnf("[ElasticsearchV7] Could not parse delete response: %v", err)
-	} else {
-		if deleted, ok := deleteResponse["deleted"].(float64); ok {
-			log.Infof("[ElasticsearchV7] Successfully deleted %d documents by %s", int(deleted), field)
-		} else {
-			log.Infof("[ElasticsearchV7] Successfully deleted documents by %s", field)
-		}
+	var deleteResponse struct {
+		Deleted          *int               `json:"deleted"`
+		TimedOut         *bool              `json:"timed_out"`
+		VersionConflicts *int               `json:"version_conflicts"`
+		Failures         *[]json.RawMessage `json:"failures"`
 	}
+	if err := json.NewDecoder(resp.Body).Decode(&deleteResponse); err != nil {
+		return fmt.Errorf("failed to parse delete by query response")
+	}
+	if deleteResponse.Deleted == nil || deleteResponse.TimedOut == nil ||
+		deleteResponse.VersionConflicts == nil || deleteResponse.Failures == nil {
+		return errors.New("delete by query returned an incomplete response")
+	}
+	if *deleteResponse.TimedOut {
+		return errors.New("delete by query timed out")
+	}
+	if *deleteResponse.VersionConflicts > 0 {
+		return fmt.Errorf("delete by query had %d version conflicts", *deleteResponse.VersionConflicts)
+	}
+	if len(*deleteResponse.Failures) > 0 {
+		return fmt.Errorf("delete by query had %d failures", len(*deleteResponse.Failures))
+	}
+	log.Infof("[ElasticsearchV7] Successfully deleted %d documents by %s", *deleteResponse.Deleted, field)
 
 	return nil
 }

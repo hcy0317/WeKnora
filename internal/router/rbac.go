@@ -469,6 +469,24 @@ func (g *rbacGuards) OwnedKnowledgeKBOrAdmin() gin.HandlerFunc {
 	return middleware.RequireOwnershipOrRole(types.TenantRoleAdmin, g.knowledgeKBCreator, g.cfg)
 }
 
+// OwnedKnowledgeKBOrAdminOrSharedEditor preserves the tenant-local creator or
+// Admin boundary while allowing an organization Editor to mutate content in a
+// legitimately shared KB. It must run after KBAccessWrite has stashed access.
+func (g *rbacGuards) OwnedKnowledgeKBOrAdminOrSharedEditor() gin.HandlerFunc {
+	ownedOrAdmin := g.OwnedKnowledgeKBOrAdmin()
+	return func(c *gin.Context) {
+		if access, ok := middleware.KBAccessFromContext(c); ok && access != nil &&
+			access.KnowledgeBase != nil && access.Permission.HasPermission(types.OrgRoleEditor) {
+			callerTenantID := c.GetUint64(types.TenantIDContextKey.String())
+			if callerTenantID != 0 && access.KnowledgeBase.TenantID != callerTenantID {
+				c.Next()
+				return
+			}
+		}
+		ownedOrAdmin(c)
+	}
+}
+
 // OwnedChunkKBOrAdmin: chunk mutations addressed via :knowledge_id.
 // Reuses the same chain helper as OwnedKnowledgeKBOrAdmin so a
 // Contributor with KB ownership can manage all chunks under any of

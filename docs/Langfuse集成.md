@@ -14,6 +14,8 @@ WeKnora 内置了对 [Langfuse](https://langfuse.com) 的轻量级集成，用�
 
 ## 2. 快速开始
 
+> 本机部署使用与当前 WeKnora 追踪实现验证过的 Langfuse v3 profile，并通过 `http://langfuse.localhost` 访问。Langfuse 官方截至 2026-08-08 尚未提供中文 UI 或官方语言插件；中文 i18n 仍在上游 issue #12890 中推进，因此不安装非官方翻译扩展。需要中文辅助时可使用浏览器内置网页翻译。
+
 ### 2.1 获取 Langfuse 凭证
 
 1. 登录 [cloud.langfuse.com](https://cloud.langfuse.com) 或自建 Langfuse 实例。

@@ -1,8 +1,10 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -22,6 +24,74 @@ type wikiTaxonomyItem struct {
 	about    string
 }
 
+type wikiTaxonomyChunkLedger struct {
+	Chunks map[string]map[string][]string `json:"chunks"`
+}
+
+func wikiTaxonomyChunkKey(ordinal int, items []wikiTaxonomyItem) string {
+	snapshot := make([]struct {
+		Slug, Title, PageType, About string
+	}, 0, len(items))
+	for _, item := range items {
+		snapshot = append(snapshot, struct{ Slug, Title, PageType, About string }{
+			Slug: item.slug, Title: item.title, PageType: item.pageType, About: item.about,
+		})
+	}
+	encoded, _ := json.Marshal(snapshot)
+	return fmt.Sprintf("%04d:%s", ordinal, wikiCheckpointDigest(string(encoded)))
+}
+
+func parseExactTaxonomyChunkAssignments(raw string, items []wikiTaxonomyItem) (map[string][]string, error) {
+	raw = cleanLLMJSON(raw)
+	var parsed struct {
+		Assignments []struct {
+			Slug string          `json:"slug"`
+			Path json.RawMessage `json:"path"`
+		} `json:"assignments"`
+	}
+	if raw == "" || json.Unmarshal([]byte(raw), &parsed) != nil {
+		return nil, errors.New("taxonomy chunk output is malformed")
+	}
+	expected := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		expected[item.slug] = struct{}{}
+	}
+	result := make(map[string][]string, len(items))
+	for _, assignment := range parsed.Assignments {
+		slug := strings.TrimSpace(assignment.Slug)
+		if _, ok := expected[slug]; !ok {
+			return nil, fmt.Errorf("taxonomy chunk output contains unexpected slug %q", slug)
+		}
+		if _, duplicate := result[slug]; duplicate {
+			return nil, fmt.Errorf("taxonomy chunk output contains duplicate slug %q", slug)
+		}
+		if len(assignment.Path) == 0 || string(assignment.Path) == "null" {
+			return nil, fmt.Errorf("taxonomy chunk output has invalid path for %q", slug)
+		}
+		var path []string
+		if err := json.Unmarshal(assignment.Path, &path); err != nil {
+			return nil, fmt.Errorf("taxonomy chunk output has invalid path for %q: %w", slug, err)
+		}
+		result[slug] = types.CleanWikiCategoryPath(path)
+	}
+	if len(result) != len(expected) {
+		return nil, fmt.Errorf("taxonomy chunk output coverage mismatch: got %d want %d", len(result), len(expected))
+	}
+	return result, nil
+}
+
+func validateStoredTaxonomyChunk(assignments map[string][]string, items []wikiTaxonomyItem) error {
+	if len(assignments) != len(items) {
+		return errors.New("stored taxonomy chunk coverage differs")
+	}
+	for _, item := range items {
+		if _, ok := assignments[item.slug]; !ok {
+			return fmt.Errorf("stored taxonomy chunk is missing %q", item.slug)
+		}
+	}
+	return nil
+}
+
 // planBatchTaxonomy assigns a directory path to every entity/concept slug in the
 // batch in ONE planning pass (chunked for large batches), so the whole set lands
 // on a single coherent tree that reuses existing folders. This replaces per-page,
@@ -35,39 +105,118 @@ func (s *wikiIngestService) planBatchTaxonomy(
 	kb *types.KnowledgeBase,
 	slugUpdates map[string][]SlugUpdate,
 	lang string,
-) map[string][]string {
+) (map[string][]string, error) {
 	if kb == nil {
-		return nil
+		return nil, nil
 	}
 	items := collectTaxonomyItems(slugUpdates)
 	if len(items) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	// Existing folders anchor reuse. Errors (e.g. a dialect without the query)
-	// just mean the plan designs a fresh tree — no fatal dependency.
+	store, err := s.checkpointStore()
+	if err != nil {
+		return nil, err
+	}
+	workSet := make(map[string]struct{})
+	missingSlugs := make([]string, 0, len(items))
+	for _, item := range items {
+		missingSlugs = append(missingSlugs, item.slug)
+		for _, update := range slugUpdates[item.slug] {
+			if update.WorkID != "" {
+				workSet[update.WorkID] = struct{}{}
+			}
+		}
+	}
+	workIDs := make([]string, 0, len(workSet))
+	for workID := range workSet {
+		workIDs = append(workIDs, workID)
+	}
+	sort.Strings(workIDs)
+	sort.Strings(missingSlugs)
+	workDigest := wikiCheckpointDigest(workIDs...)
+	missingDigest := wikiCheckpointDigest(missingSlugs...)
+	contract := wikiCheckpointDigest(agent.WikiTaxonomyPlanPrompt)
+	mapped, err := store.FindMappedWikiTaxonomyPlan(ctx, kb.TenantID, kb.ID, workDigest, missingDigest, contract)
+	if err != nil {
+		return nil, fmt.Errorf("find mapped taxonomy checkpoint: %w", err)
+	}
+	if mapped != nil {
+		var restored map[string][]string
+		if err := json.Unmarshal(mapped.ResolvedOutput, &restored); err != nil {
+			return nil, fmt.Errorf("restore taxonomy checkpoint: %w", err)
+		}
+		return restored, nil
+	}
+
+	// No completed logical plan exists. Only now snapshot the folder base used
+	// by this generation; prepared plans remain base-specific so drift before a
+	// successful model result supersedes rather than contaminates the old row.
 	var pool [][]string
 	if s.wikiService != nil {
-		paths, err := s.wikiService.ListDistinctCategoryPaths(ctx, kb.ID, wikiTaxonomyFolderPoolMax)
-		if err != nil {
-			logger.Warnf(ctx, "wiki ingest: list category paths for plan failed: %v", err)
+		paths, listErr := s.wikiService.ListDistinctCategoryPaths(ctx, kb.ID, wikiTaxonomyFolderPoolMax)
+		if listErr != nil {
+			logger.Warnf(ctx, "wiki ingest: list category paths for plan failed: %v", listErr)
 		} else {
 			pool = paths
 		}
 	}
-
-	// Preprocess the pool down to the folders relevant to THIS batch, so the
-	// planner reuses established folders without every prompt carrying the whole
-	// directory. Small/healthy taxonomies are fed whole (best recall, no cost).
 	existing := s.selectRelevantFolders(ctx, kb, items, pool)
+	basePaths := append([][]string(nil), existing...)
+	sort.Slice(basePaths, func(i, j int) bool { return strings.Join(basePaths[i], "\x00") < strings.Join(basePaths[j], "\x00") })
+	baseJSON, _ := json.Marshal(basePaths)
+	baseDigest := wikiCheckpointDigest(string(baseJSON))
+	planID := wikiCheckpointDigest(fmt.Sprintf("%d", kb.TenantID), kb.ID, workDigest, missingDigest, contract, baseDigest)
+	plan, err := store.PrepareWikiTaxonomyPlan(ctx, &types.WikiTaxonomyPlan{
+		PlanID: planID, TenantID: kb.TenantID, KnowledgeBaseID: kb.ID,
+		WorkSetDigest: workDigest, MissingSetDigest: missingDigest, FolderBaseDigest: baseDigest,
+		ContractKey: contract, State: types.WikiTaxonomyPlanPrepared, ResolvedOutput: types.JSON([]byte(`{}`)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("prepare taxonomy checkpoint: %w", err)
+	}
+	if plan.State == types.WikiTaxonomyPlanMapped {
+		var restored map[string][]string
+		if err := json.Unmarshal(plan.ResolvedOutput, &restored); err != nil {
+			return nil, fmt.Errorf("restore taxonomy checkpoint: %w", err)
+		}
+		return restored, nil
+	}
+	ledger := wikiTaxonomyChunkLedger{Chunks: make(map[string]map[string][]string)}
+	progressOutput := append(types.JSON(nil), plan.ResolvedOutput...)
+	if len(progressOutput) == 0 {
+		progressOutput = types.JSON([]byte(`{}`))
+	}
+	if string(bytes.TrimSpace(progressOutput)) != "{}" {
+		if err := json.Unmarshal(progressOutput, &ledger); err != nil {
+			return nil, fmt.Errorf("restore taxonomy chunk ledger: %w", err)
+		}
+		if ledger.Chunks == nil {
+			return nil, errors.New("restore taxonomy chunk ledger: chunks are missing")
+		}
+	}
 
 	result := make(map[string][]string, len(items))
-	for start := 0; start < len(items); start += wikiTaxonomyPlanChunkSize {
+	for ordinal, start := 0, 0; start < len(items); ordinal, start = ordinal+1, start+wikiTaxonomyPlanChunkSize {
 		end := start + wikiTaxonomyPlanChunkSize
 		if end > len(items) {
 			end = len(items)
 		}
 		chunk := items[start:end]
+		chunkKey := wikiTaxonomyChunkKey(ordinal, chunk)
+		if saved, ok := ledger.Chunks[chunkKey]; ok {
+			if err := validateStoredTaxonomyChunk(saved, chunk); err != nil {
+				return nil, fmt.Errorf("restore taxonomy chunk %d: %w", ordinal, err)
+			}
+			for _, item := range chunk {
+				path := saved[item.slug]
+				result[item.slug] = path
+				if len(path) > 0 {
+					existing = append(existing, path)
+				}
+			}
+			continue
+		}
 
 		tree := formatExistingTaxonomyForPrompt(existing)
 		if strings.TrimSpace(tree) == "" {
@@ -86,19 +235,37 @@ func (s *wikiIngestService) planBatchTaxonomy(
 			"Language":         lang,
 		})
 		if err != nil {
-			logger.Warnf(ctx, "wiki ingest: taxonomy plan call failed (%d items): %v", len(chunk), err)
-			continue
+			return nil, fmt.Errorf("taxonomy plan chunk %d generation failed: %w", ordinal, err)
 		}
-
-		for slug, path := range parseTaxonomyAssignments(raw) {
-			clean := types.CleanWikiCategoryPath(path)
-			result[slug] = clean
-			if len(clean) > 0 {
-				existing = append(existing, clean) // feed forward so later chunks converge
+		assignments, err := parseExactTaxonomyChunkAssignments(raw, chunk)
+		if err != nil {
+			return nil, fmt.Errorf("taxonomy plan chunk %d validation failed: %w", ordinal, err)
+		}
+		ledger.Chunks[chunkKey] = assignments
+		encodedProgress, err := json.Marshal(ledger)
+		if err != nil {
+			return nil, fmt.Errorf("encode taxonomy chunk %d checkpoint: %w", ordinal, err)
+		}
+		if err := store.SaveWikiTaxonomyPlanProgress(ctx, plan.PlanID, progressOutput, types.JSON(encodedProgress)); err != nil {
+			return nil, fmt.Errorf("persist taxonomy chunk %d checkpoint: %w", ordinal, err)
+		}
+		progressOutput = types.JSON(encodedProgress)
+		for _, item := range chunk {
+			path := assignments[item.slug]
+			result[item.slug] = path
+			if len(path) > 0 {
+				existing = append(existing, path)
 			}
 		}
 	}
-	return result
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("encode taxonomy checkpoint: %w", err)
+	}
+	if err := store.MarkWikiTaxonomyPlanMapped(ctx, plan.PlanID, types.JSON(encoded)); err != nil {
+		return nil, fmt.Errorf("persist taxonomy checkpoint: %w", err)
+	}
+	return result, nil
 }
 
 // resolvePlannedFolders reifies the planner's per-slug paths into real
@@ -293,31 +460,4 @@ func collectTaxonomyItems(slugUpdates map[string][]SlugUpdate) []wikiTaxonomyIte
 		}
 	}
 	return items
-}
-
-// parseTaxonomyAssignments parses the planning LLM's JSON into a slug → path map.
-// Malformed output yields nil; individual entries with a blank slug are dropped.
-func parseTaxonomyAssignments(raw string) map[string][]string {
-	raw = cleanLLMJSON(raw)
-	if raw == "" {
-		return nil
-	}
-	var parsed struct {
-		Assignments []struct {
-			Slug string   `json:"slug"`
-			Path []string `json:"path"`
-		} `json:"assignments"`
-	}
-	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		return nil
-	}
-	out := make(map[string][]string, len(parsed.Assignments))
-	for _, a := range parsed.Assignments {
-		slug := strings.TrimSpace(a.Slug)
-		if slug == "" {
-			continue
-		}
-		out[slug] = a.Path
-	}
-	return out
 }

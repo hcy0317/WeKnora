@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -14,7 +15,6 @@ import (
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 // sqliteEmbedding stores metadata alongside the vec0 virtual table rows
@@ -94,7 +94,7 @@ func initFTS5(db *gorm.DB) {
 		var rows []Row
 		db.Raw("SELECT id, content, source_id, chunk_id, knowledge_id, knowledge_base_id FROM lite_embeddings").Scan(&rows)
 		for _, r := range rows {
-			db.Exec(`INSERT INTO lite_embeddings_fts(rowid, content, source_id, chunk_id, knowledge_id, knowledge_base_id) 
+			db.Exec(`INSERT INTO lite_embeddings_fts(rowid, content, source_id, chunk_id, knowledge_id, knowledge_base_id)
 				VALUES(?, ?, ?, ?, ?, ?)`,
 				r.ID, tokenizeCJKBigram(r.Content), r.SourceID, r.ChunkID, r.KnowledgeID, r.KnowledgeBaseID)
 		}
@@ -105,9 +105,9 @@ func vecTableName(dim int) string {
 	return fmt.Sprintf("vec_embeddings_%d", dim)
 }
 
-func (r *sqliteRepository) ensureVecTable(dim int) {
+func (r *sqliteRepository) ensureVecTable(dim int) error {
 	if dim <= 0 || r.vecTables[dim] {
-		return
+		return nil
 	}
 	tbl := vecTableName(dim)
 	createSQL := fmt.Sprintf(
@@ -117,19 +117,20 @@ func (r *sqliteRepository) ensureVecTable(dim int) {
 	if err := r.db.Exec(createSQL).Error; err != nil {
 		if strings.Contains(err.Error(), "already exists") {
 			r.vecTables[dim] = true
-			return
+			return nil
 		}
 		logger.GetLogger(context.Background()).Errorf("[SQLite] Failed to create vec0 table for dim %d: %v", dim, err)
-		return
+		return fmt.Errorf("create sqlite-vec table for dimension %d: %w", dim, err)
 	}
 	r.vecTables[dim] = true
+	return nil
 }
 
 func (r *sqliteRepository) ensureExistingVecTables() {
 	var dims []int
 	r.db.Model(&sqliteEmbedding{}).Distinct("dimension").Where("dimension > 0").Pluck("dimension", &dims)
 	for _, dim := range dims {
-		r.ensureVecTable(dim)
+		_ = r.ensureVecTable(dim)
 	}
 }
 
@@ -147,14 +148,7 @@ func (r *sqliteRepository) Save(ctx context.Context, indexInfo *types.IndexInfo,
 	if len(emb) > 0 {
 		row.Dimension = len(emb)
 	}
-	if err := r.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(row).Error; err != nil {
-		return err
-	}
-	r.syncFTS5Insert(ctx, row)
-	if len(emb) > 0 && row.ID > 0 {
-		r.insertVec(ctx, row.ID, row.Dimension, emb)
-	}
-	return nil
+	return r.saveRows(ctx, []*sqliteEmbedding{row}, [][]float32{emb})
 }
 
 func (r *sqliteRepository) BatchSave(ctx context.Context, indexInfoList []*types.IndexInfo, params map[string]any) error {
@@ -171,13 +165,60 @@ func (r *sqliteRepository) BatchSave(ctx context.Context, indexInfoList []*types
 			rows[i].Dimension = len(emb)
 		}
 	}
-	if err := r.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(rows).Error; err != nil {
+	return r.saveRows(ctx, rows, embs)
+}
+
+func (r *sqliteRepository) saveRows(ctx context.Context, rows []*sqliteEmbedding, embs [][]float32) error {
+	for _, row := range rows {
+		if row.Dimension > 0 {
+			if err := r.ensureVecTable(row.Dimension); err != nil {
+				return err
+			}
+		}
+	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for i, row := range rows {
+			if err := r.saveRow(tx, row, embs[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (r *sqliteRepository) saveRow(tx *gorm.DB, row *sqliteEmbedding, emb []float32) error {
+	var existing sqliteEmbedding
+	err := tx.Where("source_id = ? AND source_type = ?", row.SourceID, row.SourceType).Take(&existing).Error
+	switch {
+	case err == nil:
+		if err := r.deleteRowsAndVecs(tx, []sqliteEmbedding{existing}); err != nil {
+			return err
+		}
+		row.ID = existing.ID
+		if err := tx.Model(&sqliteEmbedding{}).Where("id = ?", existing.ID).Updates(map[string]any{
+			"chunk_id":          row.ChunkID,
+			"knowledge_id":      row.KnowledgeID,
+			"knowledge_base_id": row.KnowledgeBaseID,
+			"tag_id":            row.TagID,
+			"content":           row.Content,
+			"dimension":         row.Dimension,
+			"is_enabled":        row.IsEnabled,
+		}).Error; err != nil {
+			return err
+		}
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		if err := tx.Create(row).Error; err != nil {
+			return err
+		}
+	default:
 		return err
 	}
-	for i, row := range rows {
-		r.syncFTS5Insert(ctx, row)
-		if len(embs[i]) > 0 && row.ID > 0 {
-			r.insertVec(ctx, row.ID, row.Dimension, embs[i])
+	if err := r.syncFTS5Insert(tx, row); err != nil {
+		return err
+	}
+	if len(emb) > 0 {
+		if err := r.insertVec(tx, row.ID, row.Dimension, emb); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -192,24 +233,28 @@ func (r *sqliteRepository) EstimateStorageSize(_ context.Context, indexInfoList 
 }
 
 func (r *sqliteRepository) DeleteByChunkIDList(ctx context.Context, chunkIDList []string, _ int, _ string) error {
-	var rows []sqliteEmbedding
-	r.db.WithContext(ctx).Where("chunk_id IN ?", chunkIDList).Find(&rows)
-	r.deleteRowsAndVecs(ctx, rows)
-	return r.db.WithContext(ctx).Where("chunk_id IN ?", chunkIDList).Delete(&sqliteEmbedding{}).Error
+	return r.deleteByFieldList(ctx, "chunk_id", chunkIDList)
 }
 
 func (r *sqliteRepository) DeleteBySourceIDList(ctx context.Context, sourceIDList []string, _ int, _ string) error {
-	var rows []sqliteEmbedding
-	r.db.WithContext(ctx).Where("source_id IN ?", sourceIDList).Find(&rows)
-	r.deleteRowsAndVecs(ctx, rows)
-	return r.db.WithContext(ctx).Where("source_id IN ?", sourceIDList).Delete(&sqliteEmbedding{}).Error
+	return r.deleteByFieldList(ctx, "source_id", sourceIDList)
 }
 
 func (r *sqliteRepository) DeleteByKnowledgeIDList(ctx context.Context, knowledgeIDList []string, _ int, _ string) error {
-	var rows []sqliteEmbedding
-	r.db.WithContext(ctx).Where("knowledge_id IN ?", knowledgeIDList).Find(&rows)
-	r.deleteRowsAndVecs(ctx, rows)
-	return r.db.WithContext(ctx).Where("knowledge_id IN ?", knowledgeIDList).Delete(&sqliteEmbedding{}).Error
+	return r.deleteByFieldList(ctx, "knowledge_id", knowledgeIDList)
+}
+
+func (r *sqliteRepository) deleteByFieldList(ctx context.Context, field string, values []string) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var rows []sqliteEmbedding
+		if err := tx.Where(field+" IN ?", values).Find(&rows).Error; err != nil {
+			return err
+		}
+		if err := r.deleteRowsAndVecs(tx, rows); err != nil {
+			return err
+		}
+		return tx.Where(field+" IN ?", values).Delete(&sqliteEmbedding{}).Error
+	})
 }
 
 func (r *sqliteRepository) CopyIndices(ctx context.Context,
@@ -239,7 +284,7 @@ func (r *sqliteRepository) CopyIndices(ctx context.Context,
 			logger.GetLogger(ctx).Warnf("[SQLite] CopyIndices: failed to copy chunk %s: %v", sourceChunkID, err)
 			continue
 		}
-		r.syncFTS5Insert(ctx, &newRow)
+		_ = r.syncFTS5Insert(r.db.WithContext(ctx), &newRow)
 		if src.Dimension > 0 && newRow.ID > 0 {
 			r.copyVec(ctx, src.ID, newRow.ID, src.Dimension)
 		}
@@ -369,7 +414,9 @@ func (r *sqliteRepository) vectorRetrieve(ctx context.Context, params types.Retr
 	}
 
 	dim := len(params.Embedding)
-	r.ensureVecTable(dim)
+	if err := r.ensureVecTable(dim); err != nil {
+		return nil, err
+	}
 
 	queryBlob, err := sqlite_vec.SerializeFloat32(params.Embedding)
 	if err != nil {
@@ -490,17 +537,22 @@ func extractEmbedding(params map[string]any, sourceID string) []float32 {
 	return embMap[sourceID]
 }
 
-func (r *sqliteRepository) insertVec(_ context.Context, rowID uint, dim int, emb []float32) {
-	r.ensureVecTable(dim)
+func (r *sqliteRepository) insertVec(db *gorm.DB, rowID uint, dim int, emb []float32) error {
+	if !r.vecTables[dim] {
+		return fmt.Errorf("sqlite-vec table for dimension %d is not ready", dim)
+	}
 	blob, err := sqlite_vec.SerializeFloat32(emb)
 	if err != nil {
-		return
+		return fmt.Errorf("sqlite-vec serialization failed: %w", err)
 	}
 	sql := fmt.Sprintf("INSERT INTO %s(rowid, embedding) VALUES (?, ?)", vecTableName(dim))
-	r.db.Exec(sql, rowID, blob)
+	if err := db.Exec(sql, rowID, blob).Error; err != nil {
+		return fmt.Errorf("sqlite-vec insert failed: %w", err)
+	}
+	return nil
 }
 
-func (r *sqliteRepository) deleteRowsAndVecs(_ context.Context, rows []sqliteEmbedding) {
+func (r *sqliteRepository) deleteRowsAndVecs(db *gorm.DB, rows []sqliteEmbedding) error {
 	dimIDs := make(map[int][]uint)
 	for _, row := range rows {
 		if row.Dimension > 0 {
@@ -513,12 +565,17 @@ func (r *sqliteRepository) deleteRowsAndVecs(_ context.Context, rows []sqliteEmb
 		}
 		tbl := vecTableName(dim)
 		for _, id := range ids {
-			r.db.Exec(fmt.Sprintf("DELETE FROM %s WHERE rowid = ?", tbl), id)
+			if err := db.Exec(fmt.Sprintf("DELETE FROM %s WHERE rowid = ?", tbl), id).Error; err != nil {
+				return fmt.Errorf("sqlite-vec delete failed: %w", err)
+			}
 		}
 	}
 	for _, row := range rows {
-		r.db.Exec("DELETE FROM lite_embeddings_fts WHERE rowid = ?", row.ID)
+		if err := db.Exec("DELETE FROM lite_embeddings_fts WHERE rowid = ?", row.ID).Error; err != nil {
+			return fmt.Errorf("FTS5 delete failed: %w", err)
+		}
 	}
+	return nil
 }
 
 func (r *sqliteRepository) copyVec(_ context.Context, srcID, dstID uint, dim int) {
@@ -532,13 +589,16 @@ func (r *sqliteRepository) copyVec(_ context.Context, srcID, dstID uint, dim int
 	), dstID, srcID)
 }
 
-func (r *sqliteRepository) syncFTS5Insert(_ context.Context, row *sqliteEmbedding) {
+func (r *sqliteRepository) syncFTS5Insert(db *gorm.DB, row *sqliteEmbedding) error {
 	if row.ID == 0 {
-		return
+		return nil
 	}
 	tokenizedContent := tokenizeCJKBigram(row.Content)
 	sql := `INSERT INTO lite_embeddings_fts(rowid, content, source_id, chunk_id, knowledge_id, knowledge_base_id) VALUES(?, ?, ?, ?, ?, ?)`
-	r.db.Exec(sql, row.ID, tokenizedContent, row.SourceID, row.ChunkID, row.KnowledgeID, row.KnowledgeBaseID)
+	if err := db.Exec(sql, row.ID, tokenizedContent, row.SourceID, row.ChunkID, row.KnowledgeID, row.KnowledgeBaseID).Error; err != nil {
+		return fmt.Errorf("FTS5 insert failed: %w", err)
+	}
+	return nil
 }
 
 type whereClause struct {

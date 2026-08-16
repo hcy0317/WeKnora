@@ -113,16 +113,10 @@ func insertKnowledgeWithStatus(t *testing.T, db *gorm.DB, status string, deleted
 	return id
 }
 
-// TestFinalizeSubtask_Concurrent_ExactlyOnePromote spawns N goroutines that
-// each call FinalizeSubtask after SetFinalizing(N), and asserts:
-//   - the counter ends at zero,
-//   - parse_status is "completed",
-//   - exactly one caller observed promoted=true.
-//
-// This is the behavior the original "stuck pending_subtasks_count" bug
-// violated: clobbered counters meant some callers saw a non-zero value
-// after the true count had reached zero, and none of them promoted.
-func TestFinalizeSubtask_Concurrent_ExactlyOnePromote(t *testing.T) {
+// TestFinalizeSubtask_Concurrent_RemainsBarrierOnly verifies that the legacy
+// counter can drain concurrently but never owns the business outcome. The
+// repository span reducer is the only operation allowed to complete knowledge.
+func TestFinalizeSubtask_Concurrent_RemainsBarrierOnly(t *testing.T) {
 	db := setupKnowledgeTestDB(t)
 	repo := NewKnowledgeRepository(db).(*knowledgeRepository)
 	ctx := context.Background()
@@ -152,11 +146,10 @@ func TestFinalizeSubtask_Concurrent_ExactlyOnePromote(t *testing.T) {
 	}
 	wg.Wait()
 
-	assert.Equal(t, int32(1), promoteWins.Load(),
-		"exactly one caller must observe promoted=true even under concurrent decrements")
+	assert.Zero(t, promoteWins.Load(), "counter drains must never promote knowledge")
 
 	status, count := reloadKnowledgeRow(t, db, id)
-	assert.Equal(t, types.ParseStatusCompleted, status)
+	assert.Equal(t, types.ParseStatusFinalizing, status)
 	assert.Equal(t, 0, count)
 }
 
@@ -197,10 +190,10 @@ func TestFinalizeSubtask_DecrementClampedAtZero(t *testing.T) {
 	_, err := repo.SetFinalizing(ctx, id, 1)
 	require.NoError(t, err)
 
-	// First decrement drains the only slot and promotes.
+	// First decrement drains the only observer slot without promoting.
 	_, promoted, err := repo.FinalizeSubtask(ctx, id)
 	require.NoError(t, err)
-	assert.True(t, promoted)
+	assert.False(t, promoted)
 
 	// Subsequent decrements must be no-ops, not underflow.
 	for i := 0; i < 3; i++ {
@@ -210,16 +203,52 @@ func TestFinalizeSubtask_DecrementClampedAtZero(t *testing.T) {
 	}
 
 	status, count := reloadKnowledgeRow(t, db, id)
-	assert.Equal(t, types.ParseStatusCompleted, status)
+	assert.Equal(t, types.ParseStatusFinalizing, status)
 	assert.Equal(t, 0, count, "pending_subtasks_count must be clamped at zero")
 }
 
-// TestSetFinalizingAndFinalizeSubtask_ClearStaleErrorMessage is the
-// regression test for stale error_message: a row that failed once keeps
-// error_message set, and both entering finalizing (a new attempt) and
-// promoting to completed (a successful finish) must clear it so the UI
-// no longer shows an outdated failure.
-func TestSetFinalizingAndFinalizeSubtask_ClearStaleErrorMessage(t *testing.T) {
+func TestFinalizeSubtaskForAttemptRejectsSupersededWorkerWithoutWritesSQLite(t *testing.T) {
+	db := setupKnowledgeTestDB(t)
+	repo := NewKnowledgeRepository(db).(*knowledgeRepository)
+	require.NoError(t, db.Exec(spansTestDDL).Error)
+	spanRepo := NewKnowledgeSpanRepository(db)
+	ctx := context.Background()
+	id := insertProcessingKnowledge(t, db)
+	transitioned, err := repo.SetFinalizing(ctx, id, 2)
+	require.NoError(t, err)
+	require.True(t, transitioned)
+
+	attempt1, err := spanRepo.OpenAttempt(ctx, &types.KnowledgeProcessingSpan{
+		KnowledgeID: id, SpanID: "finalize-root-1", Name: "knowledge_processing",
+		Kind: types.SpanKindRoot, Status: types.SpanStatusRunning,
+	})
+	require.NoError(t, err)
+	_, _, err = repo.FinalizeSubtaskForAttempt(ctx, id, attempt1)
+	require.NoError(t, err)
+	_, count := reloadKnowledgeRow(t, db, id)
+	require.Equal(t, 1, count)
+
+	attempt2, err := spanRepo.OpenAttempt(ctx, &types.KnowledgeProcessingSpan{
+		KnowledgeID: id, SpanID: "finalize-root-2", Name: "knowledge_processing",
+		Kind: types.SpanKindRoot, Status: types.SpanStatusRunning,
+	})
+	require.NoError(t, err)
+	require.Equal(t, attempt1+1, attempt2)
+	_, _, err = repo.FinalizeSubtaskForAttempt(ctx, id, attempt1)
+	require.NoError(t, err)
+	_, count = reloadKnowledgeRow(t, db, id)
+	require.Equal(t, 1, count, "superseded worker must not drain the new attempt counter")
+
+	_, _, err = repo.FinalizeSubtaskForAttempt(ctx, id, attempt2)
+	require.NoError(t, err)
+	_, count = reloadKnowledgeRow(t, db, id)
+	require.Zero(t, count)
+}
+
+// TestSetFinalizingClearsStaleErrorButCounterDrainDoesNotClaimSuccess keeps
+// clearing stale state at the processing->finalizing handoff while ensuring a
+// later observer-counter drain cannot erase a real failure before reduction.
+func TestSetFinalizingClearsStaleErrorButCounterDrainDoesNotClaimSuccess(t *testing.T) {
 	db := setupKnowledgeTestDB(t)
 	repo := NewKnowledgeRepository(db).(*knowledgeRepository)
 	ctx := context.Background()
@@ -244,9 +273,9 @@ func TestSetFinalizingAndFinalizeSubtask_ClearStaleErrorMessage(t *testing.T) {
 	).Error)
 	_, promoted, err := repo.FinalizeSubtask(ctx, id)
 	require.NoError(t, err)
-	require.True(t, promoted)
-	assert.Empty(t, reloadKnowledgeErrorMessage(t, db, id),
-		"promotion to completed must clear error_message")
+	require.False(t, promoted)
+	assert.Equal(t, "stale finalizing failure", reloadKnowledgeErrorMessage(t, db, id),
+		"counter drain must not erase outcome evidence")
 }
 
 // TestUpdateKnowledge_DoesNotClobberPendingCounter is the regression test

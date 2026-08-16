@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -718,15 +719,36 @@ func (h *KnowledgeHandler) GetKnowledgeSpans(c *gin.Context) {
 	// otherwise legacy completed documents would forever look like
 	// they're still waiting in the queue.
 	tree, currentStageName, lastErr := buildSpanTree(knowledge.ID, currentAttempt, rows, knowledge.ParseStatus)
+	mutationEligible := knowledgeSpanRetryMutationEligible(c)
+	var plannedRetryAction *types.KnowledgeSpanAggregateRetryAction
+	if mutationEligible && currentAttempt > 0 && currentAttempt == latestAttempt {
+		if planner, ok := h.kgService.(knowledgeSpanAggregateRetryAuthorizer); ok {
+			planned, planErr := planner.EvaluateKnowledgeSpanAggregateRetry(ctx,
+				types.KnowledgeSpanAggregateRetryRequest{KnowledgeID: knowledge.ID, Attempt: currentAttempt})
+			if planErr != nil {
+				plannedRetryAction = &types.KnowledgeSpanAggregateRetryAction{Reason: "liveness_read_failed"}
+			} else {
+				plannedRetryAction = planned
+			}
+		}
+	}
+	annotateKnowledgeSpanRetryActions(ctx, h.kgService, tree, currentAttempt, latestAttempt, rows,
+		mutationEligible, plannedRetryAction)
+	retryFailedAction := aggregateKnowledgeSpanRetryAction(tree, currentAttempt, latestAttempt)
+	if plannedRetryAction != nil {
+		retryFailedAction = plannedRetryAction
+	}
 
 	resp := gin.H{
-		"knowledge_id":    knowledge.ID,
-		"attempt":         currentAttempt,
-		"latest_attempt":  latestAttempt,
-		"parse_status":    knowledge.ParseStatus,
-		"current_attempt": currentAttempt,
-		"current_stage":   currentStageName,
-		"trace":           tree,
+		"knowledge_id":        knowledge.ID,
+		"attempt":             currentAttempt,
+		"latest_attempt":      latestAttempt,
+		"parse_status":        knowledge.ParseStatus,
+		"current_attempt":     currentAttempt,
+		"current_stage":       currentStageName,
+		"trace":               tree,
+		"token_usage":         summarizeKnowledgeTokenUsage(rows),
+		"retry_failed_action": retryFailedAction,
 	}
 	if lastError := knowledgeSpansLastError(
 		currentAttempt,
@@ -742,6 +764,311 @@ func (h *KnowledgeHandler) GetKnowledgeSpans(c *gin.Context) {
 		"success": true,
 		"data":    resp,
 	})
+}
+
+var graphRetryActionNamePattern = regexp.MustCompile(`^postprocess\.graph\.chunk\[[0-9]+\]$`)
+var questionRetryActionNamePattern = regexp.MustCompile(`^postprocess\.question\.batch\[[0-9]+\]$`)
+
+func isSupportedKnowledgeSpanRetryOwner(node *types.SpanTreeNode) bool {
+	if node == nil || node.Kind != types.SpanKindSubSpan {
+		return false
+	}
+	return node.Name == "postprocess.summary" || node.Name == "postprocess.wiki" ||
+		graphRetryActionNamePattern.MatchString(node.Name) || questionRetryActionNamePattern.MatchString(node.Name)
+}
+
+func aggregateKnowledgeSpanRetryAction(
+	tree *types.SpanTreeNode, currentAttempt, latestAttempt int,
+) *types.KnowledgeSpanAggregateRetryAction {
+	action := &types.KnowledgeSpanAggregateRetryAction{}
+	if tree == nil || currentAttempt <= 0 || currentAttempt != latestAttempt {
+		action.Reason = "historical_attempt"
+		return action
+	}
+	unknown := false
+	permissionDenied := false
+	var visit func(*types.SpanTreeNode)
+	visit = func(node *types.SpanTreeNode) {
+		if node == nil {
+			return
+		}
+		if isSupportedKnowledgeSpanRetryOwner(node) && node.RetryAction != nil {
+			if node.RetryAction.Allowed {
+				target := types.KnowledgeSpanAggregateRetryTarget{
+					SourceSpanID: node.SpanID, Name: node.Name, State: node.RetryAction.State,
+				}
+				action.Targets = append(action.Targets, target)
+				switch {
+				case node.Name == "postprocess.summary":
+					action.Counts.Summary++
+				case node.Name == "postprocess.wiki":
+					action.Counts.Wiki++
+				case graphRetryActionNamePattern.MatchString(node.Name):
+					action.Counts.Graph++
+				case questionRetryActionNamePattern.MatchString(node.Name):
+					action.Counts.Question++
+				}
+			} else if node.RetryAction.Reason == "insufficient_permission" {
+				permissionDenied = true
+			} else if node.RetryAction.State == types.KnowledgeSpanRetryStateUnknown {
+				unknown = true
+			}
+		}
+		for _, child := range node.Children {
+			visit(child)
+		}
+	}
+	visit(tree)
+	action.Allowed = len(action.Targets) > 0
+	if !action.Allowed {
+		if permissionDenied {
+			action.Reason = "insufficient_permission"
+		} else if unknown {
+			action.Reason = "liveness_unavailable"
+		} else {
+			action.Reason = "no_retryable_targets"
+		}
+	}
+	return action
+}
+
+type knowledgeSpanRetryAuthorizer interface {
+	EvaluateKnowledgeSpanRetry(
+		context.Context,
+		types.KnowledgeSpanRetryRequest,
+	) (*types.KnowledgeSpanRetryAction, *types.KnowledgeSpanRetryStallFence, error)
+}
+
+type knowledgeSpanAggregateRetryAuthorizer interface {
+	EvaluateKnowledgeSpanAggregateRetry(
+		context.Context,
+		types.KnowledgeSpanAggregateRetryRequest,
+	) (*types.KnowledgeSpanAggregateRetryAction, error)
+}
+
+func annotateKnowledgeSpanRetryActions(
+	ctx context.Context,
+	service interfaces.KnowledgeService,
+	tree *types.SpanTreeNode,
+	currentAttempt, latestAttempt int,
+	rows []types.KnowledgeProcessingSpan,
+	canRetry bool,
+	aggregateProjection *types.KnowledgeSpanAggregateRetryAction,
+) {
+	if tree == nil {
+		return
+	}
+	latestOwnerSpanIDs := make(map[string]string)
+	parentNames := make(map[string]string, len(rows))
+	latestQuestionParentID := ""
+	var latestQuestionParentRowID int64
+	for i := range rows {
+		parentNames[rows[i].SpanID] = rows[i].Name
+	}
+	for i := range rows {
+		row := &rows[i]
+		if row.Name == "postprocess.question" && parentNames[row.ParentSpanID] == types.StagePostProcess &&
+			row.ID > latestQuestionParentRowID {
+			latestQuestionParentID, latestQuestionParentRowID = row.SpanID, row.ID
+		}
+	}
+	for i := range rows {
+		row := &rows[i]
+		candidate := &types.SpanTreeNode{KnowledgeProcessingSpan: *row}
+		directPostOwner := parentNames[row.ParentSpanID] == types.StagePostProcess
+		questionBatchOwner := questionRetryActionNamePattern.MatchString(row.Name) &&
+			latestQuestionParentID != "" && row.ParentSpanID == latestQuestionParentID
+		if (directPostOwner || questionBatchOwner) && isSupportedKnowledgeSpanRetryOwner(candidate) {
+			latestOwnerSpanIDs[row.Name] = row.SpanID
+		}
+	}
+	attemptLatest := currentAttempt > 0 && currentAttempt == latestAttempt
+	attemptTerminal := tree.Status == types.SpanStatusDone || tree.Status == types.SpanStatusFailed ||
+		tree.Status == types.SpanStatusCancelled
+	authorizer, hasAuthorizer := service.(knowledgeSpanRetryAuthorizer)
+	projectedTargets := make(map[string]types.KnowledgeSpanAggregateRetryTarget)
+	if aggregateProjection != nil {
+		for _, target := range aggregateProjection.Targets {
+			projectedTargets[target.SourceSpanID] = target
+		}
+	}
+	var visit func(*types.SpanTreeNode)
+	visit = func(node *types.SpanTreeNode) {
+		if node.Status == types.SpanStatusFailed || node.Status == types.SpanStatusPending ||
+			node.Status == types.SpanStatusRunning {
+			action := &types.KnowledgeSpanRetryAction{Allowed: false, State: types.KnowledgeSpanRetryStateUnknown}
+			switch {
+			case !canRetry:
+				action.Reason = "insufficient_permission"
+			case !attemptLatest:
+				action.Reason = "historical_attempt"
+			case !isSupportedKnowledgeSpanRetryOwner(node):
+				if node.Status == types.SpanStatusFailed {
+					action.State = types.KnowledgeSpanRetryStateFailed
+					action.Reason = "unsupported_target"
+				} else {
+					action = nil
+				}
+			case latestOwnerSpanIDs[node.Name] != node.SpanID:
+				action.Reason = "superseded_retry"
+			case aggregateProjection != nil:
+				if target, selected := projectedTargets[node.SpanID]; selected && aggregateProjection.Allowed {
+					action.Allowed = true
+					action.State = target.State
+					action.Target = target.Name
+				} else {
+					action.Reason = aggregateProjection.Reason
+					if action.Reason == "active_sibling" {
+						action.State = types.KnowledgeSpanRetryStateActive
+					}
+				}
+			case hasAuthorizer:
+				evaluated, _, err := authorizer.EvaluateKnowledgeSpanRetry(ctx, types.KnowledgeSpanRetryRequest{
+					KnowledgeID: node.KnowledgeID,
+					Attempt:     currentAttempt,
+					SpanID:      node.SpanID,
+				})
+				if err != nil {
+					action.Reason = "liveness_read_failed"
+				} else if evaluated != nil {
+					action = evaluated
+				}
+			case node.Status != types.SpanStatusFailed:
+				action.Reason = "liveness_unavailable"
+			case !attemptTerminal:
+				action.State = types.KnowledgeSpanRetryStateFailed
+				action.Reason = "attempt_not_terminal"
+			default:
+				action.Allowed = true
+				action.State = types.KnowledgeSpanRetryStateFailed
+				action.Target = node.Name
+			}
+			if action != nil {
+				node.RetryAction = action
+			}
+		}
+		for _, child := range node.Children {
+			visit(child)
+		}
+	}
+	visit(tree)
+}
+
+func knowledgeSpanRetryMutationEligible(c *gin.Context) bool {
+	if c == nil || c.Request == nil {
+		return false
+	}
+	access, ok := middleware.KBAccessFromContext(c)
+	if !ok || access == nil || !access.Permission.HasPermission(types.OrgRoleEditor) {
+		return false
+	}
+	ctx := c.Request.Context()
+	if scope, machinePrincipal := types.TenantAPIKeyScopeFromContext(ctx); machinePrincipal {
+		return scope.FullAccess || scope.HasCapability(types.APIKeyCapabilityIngest)
+	}
+	return types.TenantRoleFromContext(ctx).HasPermission(types.TenantRoleContributor)
+}
+
+// RetryKnowledgeSpan godoc
+// @Summary      单独重试失败的知识后处理项
+// @Description  为最新终态 attempt 中受支持的失败 owner 新建 partial_repair attempt；旧流水线历史保持不变。
+// @Tags         知识管理
+// @Accept       json
+// @Produce      json
+// @Param        id       path string true "知识ID"
+// @Param        attempt  path int    true "来源尝试号"
+// @Param        span_id  path string true "失败 owner span ID"
+// @Param        body body object true "{\"client_request_id\":\"uuid\"}"
+// @Success      202 {object} map[string]interface{}
+// @Router       /api/v1/knowledge/{id}/attempts/{attempt}/spans/{span_id}/retry [post]
+func (h *KnowledgeHandler) RetryKnowledgeSpan(c *gin.Context) {
+	id := secutils.SanitizeForLog(c.Param("id"))
+	spanID := secutils.SanitizeForLog(c.Param("span_id"))
+	attempt, err := strconv.Atoi(strings.TrimSpace(c.Param("attempt")))
+	if id == "" || spanID == "" || attempt <= 0 || err != nil {
+		c.Error(errors.NewBadRequestError("Knowledge ID, attempt and span ID are required"))
+		return
+	}
+	var body struct {
+		ClientRequestID string `json:"client_request_id"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.Error(errors.NewBadRequestError("Invalid retry request body").WithDetails(err.Error()))
+		return
+	}
+	body.ClientRequestID = strings.TrimSpace(body.ClientRequestID)
+	if body.ClientRequestID == "" || len(body.ClientRequestID) > 128 {
+		c.Error(errors.NewBadRequestError("client_request_id is required and must not exceed 128 characters"))
+		return
+	}
+	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+	result, err := h.kgService.RetryFailedKnowledgeSpan(effCtx, types.KnowledgeSpanRetryRequest{
+		KnowledgeID: id, Attempt: attempt, SpanID: spanID,
+		ClientRequestID: body.ClientRequestID,
+		Language:        types.LanguageFromContextOrDefault(effCtx),
+	})
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+			return
+		}
+		logger.ErrorWithFields(effCtx, err, map[string]interface{}{
+			"knowledge_id": id, "attempt": attempt, "span_id": spanID,
+		})
+		c.Error(errors.NewInternalServerError("Failed to retry processing item"))
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"success": true,
+		"message": "Processing item retry accepted",
+		"data":    result,
+	})
+}
+
+// RetryKnowledgeSpans creates one partial-repair attempt for every server-
+// authorized failed/stalled owner in the selected latest attempt.
+func (h *KnowledgeHandler) RetryKnowledgeSpans(c *gin.Context) {
+	id := secutils.SanitizeForLog(c.Param("id"))
+	attempt, err := strconv.Atoi(strings.TrimSpace(c.Param("attempt")))
+	if id == "" || attempt <= 0 || err != nil {
+		c.Error(errors.NewBadRequestError("Knowledge ID and attempt are required"))
+		return
+	}
+	var body struct {
+		ClientRequestID string `json:"client_request_id"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.Error(errors.NewBadRequestError("Invalid retry request body").WithDetails(err.Error()))
+		return
+	}
+	body.ClientRequestID = strings.TrimSpace(body.ClientRequestID)
+	if body.ClientRequestID == "" || len(body.ClientRequestID) > 128 {
+		c.Error(errors.NewBadRequestError("client_request_id is required and must not exceed 128 characters"))
+		return
+	}
+	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+	result, err := h.kgService.RetryFailedKnowledgeSpans(effCtx, types.KnowledgeSpanAggregateRetryRequest{
+		KnowledgeID: id, Attempt: attempt, ClientRequestID: body.ClientRequestID,
+		Language: types.LanguageFromContextOrDefault(effCtx),
+	})
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+			return
+		}
+		logger.ErrorWithFields(effCtx, err, map[string]interface{}{"knowledge_id": id, "attempt": attempt})
+		c.Error(errors.NewInternalServerError("Failed to retry processing items"))
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"success": true, "message": "Processing item retries accepted", "data": result})
 }
 
 // knowledgeSpansLastError builds the last_error payload for GetKnowledgeSpans.

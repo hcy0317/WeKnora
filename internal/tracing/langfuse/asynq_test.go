@@ -15,6 +15,16 @@ import (
 type dummyPayload struct {
 	types.TracingContext
 	KnowledgeID string `json:"knowledge_id"`
+	Attempt     int    `json:"attempt,omitempty"`
+	BatchIndex  int    `json:"batch_index,omitempty"`
+}
+
+func TestPeekKnowledgeTraceContext_AttributesQuestionBatch(t *testing.T) {
+	raw, _ := json.Marshal(dummyPayload{KnowledgeID: "kid-7", Attempt: 2, BatchIndex: 4})
+	got := peekKnowledgeTraceContext(raw, types.TypeQuestionGeneration)
+	if got.KnowledgeID != "kid-7" || got.Attempt != 2 || got.Stage != "postprocess.question.batch[4]" {
+		t.Fatalf("unexpected knowledge trace context: %+v", got)
+	}
 }
 
 // TestInjectTracing_DisabledIsZero verifies InjectTracing is a no-op when
@@ -33,7 +43,7 @@ func TestInjectTracing_DisabledIsZero(t *testing.T) {
 // on the context, a W3C traceparent is stamped onto the payload (so the
 // asynq worker can resume the same trace).
 func TestInjectTracing_PopulatesTraceparent(t *testing.T) {
-	m, _ := newTestManager(t)
+	m, exp := newTestManager(t)
 
 	ctx, trace := m.StartTrace(context.Background(), TraceOptions{Name: "parent"})
 	p := &dummyPayload{KnowledgeID: "k1"}
@@ -49,6 +59,18 @@ func TestInjectTracing_PopulatesTraceparent(t *testing.T) {
 	if p.LangfuseTraceID != trace.ID {
 		t.Errorf("LangfuseTraceID = %q, want %q", p.LangfuseTraceID, trace.ID)
 	}
+	trace.Finish(nil, nil)
+	for _, span := range exp.GetSpans() {
+		if spanType(span) != obsTypeTrace {
+			continue
+		}
+		metadata := spanAttr(span.Attributes, attrTraceMetadata)
+		if !strings.Contains(metadata, `"knowledge_id":"k1"`) {
+			t.Fatalf("trace metadata %q missing knowledge_id", metadata)
+		}
+		return
+	}
+	t.Fatal("trace span not exported")
 }
 
 // TestAsynqMiddleware_TraceparentPropagation is the cross-process correlation

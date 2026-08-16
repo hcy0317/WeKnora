@@ -1,31 +1,27 @@
 package vlm
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/logger"
-	"github.com/Tencent/WeKnora/internal/models/utils"
-	"github.com/google/uuid"
+	"github.com/Tencent/WeKnora/internal/models/openaiapi"
 )
-
-const weKnoraCloudVLMPath = "/api/v1/chat/completions"
 
 // WeKnoraCloudVLM implements VLM via the WeKnoraCloud API.
 type WeKnoraCloudVLM struct {
-	modelName       string
-	remoteModelName string
-	modelID         string
-	appID           string
-	apiKey          string
-	baseURL         string
-	client          *http.Client
+	modelName                string
+	remoteModelName          string
+	modelID                  string
+	appID                    string
+	apiKey                   string
+	baseURL                  string
+	client                   *http.Client
+	reasoningEffort          string
+	configurationFingerprint string
 }
 
 // NewWeKnoraCloudVLM creates a WeKnoraCloud-backed VLM instance.
@@ -41,11 +37,15 @@ func NewWeKnoraCloudVLM(config *Config) (*WeKnoraCloudVLM, error) {
 		return nil, err
 	}
 	remoteModelName := ""
+	reasoningEffort := ""
 	if config.Extra != nil {
 		if v, ok := config.Extra["remote_model_name"]; ok {
 			if vs, ok := v.(string); ok {
 				remoteModelName = strings.TrimSpace(vs)
 			}
+		}
+		if v, ok := config.Extra["reasoning_effort"].(string); ok {
+			reasoningEffort = strings.TrimSpace(v)
 		}
 	}
 	return &WeKnoraCloudVLM{
@@ -56,6 +56,12 @@ func NewWeKnoraCloudVLM(config *Config) (*WeKnoraCloudVLM, error) {
 		apiKey:          config.AppSecret,
 		baseURL:         baseURL,
 		client:          newVLMHTTPClient(vlmHTTPTimeout()),
+		reasoningEffort: reasoningEffort,
+		configurationFingerprint: openaiapi.SavedModelConfigFingerprint(openaiapi.SavedModelConfig{
+			Provider: config.Provider, InterfaceType: normalizedVLMInterface(config.InterfaceType),
+			ExtraConfig: config.Extra, Headers: config.CustomHeaders,
+			Auth: map[string]string{"app_id": config.AppID, "app_secret": config.AppSecret},
+		}),
 	}, nil
 }
 
@@ -75,19 +81,13 @@ type weKnoraCloudVLMMessage struct {
 }
 
 type weKnoraCloudVLMRequest struct {
-	Model       string                   `json:"model"`
-	Messages    []weKnoraCloudVLMMessage `json:"messages"`
-	MaxTokens   int                      `json:"max_tokens,omitempty"`
-	Temperature float64                  `json:"temperature,omitempty"`
-	Stream      bool                     `json:"stream"`
-}
-
-type weKnoraCloudVLMResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
+	Model               string                   `json:"model"`
+	Messages            []weKnoraCloudVLMMessage `json:"messages"`
+	MaxTokens           int                      `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int                      `json:"max_completion_tokens,omitempty"`
+	Temperature         float64                  `json:"temperature,omitempty"`
+	ReasoningEffort     string                   `json:"reasoning_effort,omitempty"`
+	Stream              bool                     `json:"stream"`
 }
 
 // Predict sends images with a text prompt to the WeKnoraCloud API.
@@ -99,9 +99,12 @@ func (v *WeKnoraCloudVLM) Predict(ctx context.Context, imgBytesList [][]byte, pr
 		Text: prompt,
 	})
 
-	for _, imgBytes := range imgBytesList {
+	for i, imgBytes := range imgBytesList {
 		if len(imgBytes) > 0 {
-			mimeType := detectImageMIME(imgBytes)
+			mimeType, err := detectImageMIME(imgBytes)
+			if err != nil {
+				return "", fmt.Errorf("WeKnoraCloud VLM image %d: %w", i, err)
+			}
 			b64 := base64.StdEncoding.EncodeToString(imgBytes)
 			dataURI := fmt.Sprintf("data:%s;base64,%s", mimeType, b64)
 			parts = append(parts, weKnoraCloudVLMContentPart{
@@ -113,66 +116,32 @@ func (v *WeKnoraCloudVLM) Predict(ctx context.Context, imgBytesList [][]byte, pr
 		}
 	}
 
+	effectiveModelName := v.effectiveModelName()
 	reqBody := weKnoraCloudVLMRequest{
-		Model: v.effectiveModelName(),
+		Model: effectiveModelName,
 		Messages: []weKnoraCloudVLMMessage{
 			{
 				Role:    "user",
 				Content: parts,
 			},
 		},
-		MaxTokens:   defaultMaxToks,
-		Temperature: float64(defaultTemp),
-		Stream:      false,
+		ReasoningEffort: v.reasoningEffort,
+		Stream:          false,
 	}
-
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("weknoracloud VLM: marshal: %w", err)
-	}
-
-	requestID := uuid.New().String()
-	headers := utils.Sign(v.appID, v.apiKey, requestID, string(bodyBytes))
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.baseURL+weKnoraCloudVLMPath, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", fmt.Errorf("weknoracloud VLM: create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	for k, hv := range headers {
-		req.Header.Set(k, hv)
-	}
+	reqBody.MaxTokens = defaultMaxToks
+	reqBody.Temperature = float64(defaultTemp)
 
 	totalImageSize := 0
 	for _, img := range imgBytesList {
 		totalImageSize += len(img)
 	}
 	logger.Infof(ctx, "[VLM] Calling WeKnoraCloud API, model=%s, baseURL=%s, numImages=%d, totalImageSize=%d",
-		v.effectiveModelName(), v.baseURL, len(imgBytesList), totalImageSize)
+		effectiveModelName, v.baseURL, len(imgBytesList), totalImageSize)
 
-	resp, err := v.client.Do(req)
+	content, err := v.predictWithNegotiatedProtocol(ctx, reqBody)
 	if err != nil {
-		return "", fmt.Errorf("weknoracloud VLM: do request: %w", err)
+		return "", err
 	}
-	defer resp.Body.Close()
-
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("weknoracloud VLM: read response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("weknoracloud VLM: status %d: %s", resp.StatusCode, string(respBytes))
-	}
-
-	var vlmResp weKnoraCloudVLMResponse
-	if err := json.Unmarshal(respBytes, &vlmResp); err != nil {
-		return "", fmt.Errorf("weknoracloud VLM: unmarshal: %w", err)
-	}
-	if len(vlmResp.Choices) == 0 {
-		return "", fmt.Errorf("weknoracloud VLM: no choices in response")
-	}
-
-	content := vlmResp.Choices[0].Message.Content
 	logger.Infof(ctx, "[VLM] WeKnoraCloud response received, len=%d", len(content))
 	return content, nil
 }

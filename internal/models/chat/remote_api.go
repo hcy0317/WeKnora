@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/models/openaiapi"
 	"github.com/Tencent/WeKnora/internal/models/provider"
 	"github.com/Tencent/WeKnora/internal/types"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -36,7 +38,21 @@ type RemoteAPIChat struct {
 	adapter providerAdapter
 	// thinkingOverride 来自 extra_config.thinking_control，非 nil 时覆盖 adapter.Thinking()。
 	thinkingOverride ThinkingStrategy
+	// reasoningEffort 来自 extra_config.reasoning_effort。OpenAI 兼容网关通常
+	// 通过顶层 reasoning_effort 字段区分同一模型的推理预算（例如 medium/xhigh/max）。
+	// go-openai 当前版本没有稳定暴露该字段，因此启用后统一走 raw HTTP 路径。
+	reasoningEffort string
+	// autoProtocol enables endpoint-based negotiation for every OpenAI-compatible
+	// route whose actual outbound endpoint is /chat/completions. Azure keeps its
+	// deployment-specific SDK URL layout.
+	autoProtocol bool
+	// sdkChatShape keeps deployment-specific transports (notably Azure) on the
+	// SDK endpoint while still allowing a bounded request-field retry.
+	sdkChatShape             bool
+	configurationFingerprint string
 }
+
+const extraConfigReasoningEffort = "reasoning_effort"
 
 // NewRemoteAPIChat 创建远程 API 聊天实例
 func NewRemoteAPIChat(chatConfig *ChatConfig) (*RemoteAPIChat, error) {
@@ -110,7 +126,43 @@ func NewRemoteAPIChat(chatConfig *ChatConfig) (*RemoteAPIChat, error) {
 		customHeaders:    chatConfig.CustomHeaders,
 		adapter:          resolveProvider(providerName, modelName),
 		thinkingOverride: parseThinkingOverride(chatConfig.ExtraConfig),
+		reasoningEffort:  parseReasoningEffort(chatConfig.ExtraConfig),
+		autoProtocol:     config.APIType == openai.APITypeOpenAI,
+		sdkChatShape:     providerName == provider.ProviderAzureOpenAI,
+		configurationFingerprint: openaiapi.SavedModelConfigFingerprint(openaiapi.SavedModelConfig{
+			Provider: string(providerName), InterfaceType: "openai", APIVersion: config.APIVersion,
+			ExtraConfig: chatConfig.ExtraConfig, Headers: chatConfig.CustomHeaders,
+			Auth: map[string]string{"api_key": apiKey, "app_id": chatConfig.AppID, "app_secret": chatConfig.AppSecret},
+		}),
 	}, nil
+}
+
+func parseReasoningEffort(extraConfig map[string]string) string {
+	if extraConfig == nil {
+		return ""
+	}
+	return strings.TrimSpace(extraConfig[extraConfigReasoningEffort])
+}
+
+// injectReasoningEffort adds the OpenAI-compatible top-level reasoning_effort
+// field without coupling WeKnora to a particular go-openai SDK version.
+// JSON round-tripping also works for provider-specific wrapper structs and
+// maps produced by the thinking adapters.
+func injectReasoningEffort(body any, effort string) (any, error) {
+	effort = strings.TrimSpace(effort)
+	if effort == "" {
+		return body, nil
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request for reasoning effort: %w", err)
+	}
+	request := make(map[string]any)
+	if err := json.Unmarshal(encoded, &request); err != nil {
+		return nil, fmt.Errorf("decode request for reasoning effort: %w", err)
+	}
+	request[extraConfigReasoningEffort] = effort
+	return request, nil
 }
 
 // authCreds bundles the credentials passed to the adapter's Auth method.
@@ -135,6 +187,9 @@ func (c *RemoteAPIChat) buildOutbound(
 	messages []Message, opts *ChatOptions, isStream bool,
 ) (body any, endpoint string, useRawHTTP bool, err error) {
 	req := c.shapedRequest(messages, opts, isStream)
+	if c.sdkChatShape {
+		req.ReasoningEffort = c.reasoningEffort
+	}
 
 	thinking := c.thinkingOverride
 	if thinking == nil {
@@ -149,6 +204,13 @@ func (c *RemoteAPIChat) buildOutbound(
 	body, err = c.shapeProviderRequest(body, req, messages)
 	if err != nil {
 		return nil, "", false, err
+	}
+	if c.reasoningEffort != "" && !c.sdkChatShape {
+		body, err = injectReasoningEffort(body, c.reasoningEffort)
+		if err != nil {
+			return nil, "", false, err
+		}
+		useRaw = true
 	}
 	endpoint = c.adapter.Endpoint(c.baseURL, c.modelID, isStream)
 	useRawHTTP = useRaw || c.adapter.ForceRawHTTP() || endpoint != ""
@@ -173,6 +235,16 @@ func (c *RemoteAPIChat) Chat(ctx context.Context, messages []Message, opts *Chat
 	body, endpoint, useRawHTTP, err := c.buildOutbound(messages, opts, false)
 	if err != nil {
 		return nil, err
+	}
+	if protocolBaseURL, ok := c.negotiatedProtocolBase(endpoint); ok {
+		return c.chatWithNegotiatedProtocol(timeoutCtx, protocolBaseURL, body)
+	}
+	if c.sdkChatShape {
+		req, ok := body.(*openai.ChatCompletionRequest)
+		if !ok {
+			return nil, fmt.Errorf("Azure Chat request requires SDK-compatible body, got %T", body)
+		}
+		return c.chatWithSDKRequestShape(timeoutCtx, *req)
 	}
 	if useRawHTTP {
 		return c.chatWithRawHTTP(timeoutCtx, endpoint, body)
@@ -199,6 +271,71 @@ func (c *RemoteAPIChat) Chat(ctx context.Context, messages []Message, opts *Chat
 	}
 	logUsage(timeoutCtx, c.modelName, &result.Usage)
 	return result, nil
+}
+
+func (c *RemoteAPIChat) chatWithSDKRequestShape(
+	ctx context.Context,
+	request openai.ChatCompletionRequest,
+) (*types.ChatResponse, error) {
+	cacheKey := c.protocolCacheKey(c.baseURL)
+	shape := openaiapi.PreferredChatRequestShape(cacheKey)
+	response, status, err := c.chatWithSDKShape(ctx, request, shape)
+	if err == nil {
+		if shape == openaiapi.ChatRequestShapeMaxCompletionNeutral {
+			openaiapi.MarkChatRequestShapeSuccess(cacheKey, shape)
+		}
+		return response, nil
+	}
+	if shape != openaiapi.ChatRequestShapeDefault ||
+		!openaiapi.ShouldRetryChatWithMaxCompletionNeutral(status, err) {
+		return response, err
+	}
+	response, _, err = c.chatWithSDKShape(ctx, request, openaiapi.ChatRequestShapeMaxCompletionNeutral)
+	if err == nil {
+		openaiapi.MarkChatRequestShapeSuccess(cacheKey, openaiapi.ChatRequestShapeMaxCompletionNeutral)
+	}
+	return response, err
+}
+
+func (c *RemoteAPIChat) chatWithSDKShape(
+	ctx context.Context,
+	request openai.ChatCompletionRequest,
+	shape openaiapi.ChatRequestShape,
+) (*types.ChatResponse, int, error) {
+	body, err := openaiapi.BuildChatRequestWithShape(request, shape)
+	if err != nil {
+		return nil, 0, err
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return nil, 0, fmt.Errorf("marshal shaped Azure Chat request: %w", err)
+	}
+	var shaped openai.ChatCompletionRequest
+	if err := json.Unmarshal(encoded, &shaped); err != nil {
+		return nil, 0, fmt.Errorf("decode shaped Azure Chat request: %w", err)
+	}
+	completion, err := c.client.CreateChatCompletion(ctx, shaped)
+	if err != nil {
+		return nil, openAIChatRequestStatus(err), err
+	}
+	result, err := c.parseCompletionResponse(&completion)
+	if err != nil {
+		return nil, http.StatusOK, err
+	}
+	logUsage(ctx, c.modelName, &result.Usage)
+	return result, http.StatusOK, nil
+}
+
+func openAIChatRequestStatus(err error) int {
+	var apiErr *openai.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.HTTPStatusCode
+	}
+	var requestErr *openai.RequestError
+	if errors.As(err, &requestErr) {
+		return requestErr.HTTPStatusCode
+	}
+	return 0
 }
 
 // chatWithRawHTTP 使用原始 HTTP 请求进行聊天（供自定义请求使用）
@@ -273,9 +410,22 @@ func (c *RemoteAPIChat) ChatStream(ctx context.Context, messages []Message, opts
 		cancel()
 		return nil, err
 	}
+	if protocolBaseURL, ok := c.negotiatedProtocolBase(endpoint); ok {
+		ch, err := c.chatStreamWithNegotiatedProtocol(timeoutCtx, protocolBaseURL, body)
+		return wrapStreamCancel(timeoutCtx, ch, err, cancel)
+	}
+	if c.sdkChatShape {
+		req, ok := body.(*openai.ChatCompletionRequest)
+		if !ok {
+			cancel()
+			return nil, fmt.Errorf("Azure Chat stream request requires SDK-compatible body, got %T", body)
+		}
+		ch, err := c.chatStreamWithSDKRequestShape(timeoutCtx, *req)
+		return wrapStreamCancel(timeoutCtx, ch, err, cancel)
+	}
 	if useRawHTTP {
 		ch, err := c.chatStreamWithRawHTTP(timeoutCtx, endpoint, body)
-		return wrapStreamCancel(ch, err, cancel)
+		return wrapStreamCancel(timeoutCtx, ch, err, cancel)
 	}
 
 	req := *(body.(*openai.ChatCompletionRequest))
@@ -314,9 +464,65 @@ func (c *RemoteAPIChat) ChatStream(ctx context.Context, messages []Message, opts
 	return streamChan, nil
 }
 
+func (c *RemoteAPIChat) chatStreamWithSDKRequestShape(
+	ctx context.Context,
+	request openai.ChatCompletionRequest,
+) (<-chan types.StreamResponse, error) {
+	cacheKey := c.protocolCacheKey(c.baseURL)
+	shape := openaiapi.PreferredChatRequestShape(cacheKey)
+	stream, status, err := c.openSDKChatStream(ctx, request, shape)
+	cacheAlternateOnSuccess := shape == openaiapi.ChatRequestShapeMaxCompletionNeutral
+	if err != nil && shape == openaiapi.ChatRequestShapeDefault &&
+		openaiapi.ShouldRetryChatWithMaxCompletionNeutral(status, err) {
+		stream, _, err = c.openSDKChatStream(ctx, request, openaiapi.ChatRequestShapeMaxCompletionNeutral)
+		cacheAlternateOnSuccess = err == nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	providerChan := make(chan types.StreamResponse)
+	go c.processStream(ctx, stream, providerChan, nil)
+	out := make(chan types.StreamResponse)
+	go forwardNegotiatedStream(ctx, providerChan, out, func() {
+		if cacheAlternateOnSuccess {
+			openaiapi.MarkChatRequestShapeSuccess(cacheKey, openaiapi.ChatRequestShapeMaxCompletionNeutral)
+		}
+	}, func() {})
+	return out, nil
+}
+
+func (c *RemoteAPIChat) openSDKChatStream(
+	ctx context.Context,
+	request openai.ChatCompletionRequest,
+	shape openaiapi.ChatRequestShape,
+) (*openai.ChatCompletionStream, int, error) {
+	body, err := openaiapi.BuildChatRequestWithShape(request, shape)
+	if err != nil {
+		return nil, 0, err
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return nil, 0, fmt.Errorf("marshal shaped Azure Chat stream request: %w", err)
+	}
+	var shaped openai.ChatCompletionRequest
+	if err := json.Unmarshal(encoded, &shaped); err != nil {
+		return nil, 0, fmt.Errorf("decode shaped Azure Chat stream request: %w", err)
+	}
+	stream, err := c.client.CreateChatCompletionStream(ctx, shaped)
+	if err != nil {
+		return nil, openAIChatRequestStatus(err), err
+	}
+	return stream, http.StatusOK, nil
+}
+
 // wrapStreamCancel 在子 channel 关闭后执行 cancel，避免 timeout context 泄漏。
 // 当底层调用直接返回 error 时，立即调用 cancel 并将 error 透出。
-func wrapStreamCancel(in <-chan types.StreamResponse, err error, cancel context.CancelFunc) (<-chan types.StreamResponse, error) {
+func wrapStreamCancel(
+	ctx context.Context,
+	in <-chan types.StreamResponse,
+	err error,
+	cancel context.CancelFunc,
+) (<-chan types.StreamResponse, error) {
 	if err != nil {
 		cancel()
 		return nil, err
@@ -325,8 +531,18 @@ func wrapStreamCancel(in <-chan types.StreamResponse, err error, cancel context.
 	go func() {
 		defer cancel()
 		defer close(out)
-		for v := range in {
-			out <- v
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case v, ok := <-in:
+				if !ok {
+					return
+				}
+				if !sendStreamResponse(ctx, out, v) {
+					return
+				}
+			}
 		}
 	}()
 	return out, nil

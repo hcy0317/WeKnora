@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io/fs"
 	"strings"
 	"time"
 
@@ -237,7 +239,7 @@ func (s *knowledgeService) cleanupWikiOnKnowledgeDelete(ctx context.Context, kno
 	// wiki_ingest task that wakes up between here and the retract enqueue
 	// below sees "knowledge gone" and bails out.
 	s.markKnowledgeDeletedForWiki(ctx, kbID, knowledgeID)
-	s.scrubWikiPendingIngest(ctx, kbID, knowledgeID, "cleanup")
+	_ = s.scrubWikiPendingIngest(ctx, kbID, knowledgeID, "cleanup")
 
 	// Pull title/summary from the knowledge itself — do NOT read them from
 	// existing wiki pages. In the race window wiki pages may not exist yet,
@@ -374,15 +376,16 @@ func (s *knowledgeService) markKnowledgeDeletedForWiki(ctx context.Context, kbID
 // pages, and reparse never enqueues retracts for the doc being reparsed.
 // We pass op=WikiOpIngest so DeleteByDedupKey filters to the ingest rows
 // only.
-func (s *knowledgeService) scrubWikiPendingIngest(ctx context.Context, kbID, knowledgeID, reason string) {
+func (s *knowledgeService) scrubWikiPendingIngest(ctx context.Context, kbID, knowledgeID, reason string) error {
 	if s.taskPendingRepo == nil || kbID == "" || knowledgeID == "" {
-		return
+		return nil
 	}
 	if err := s.taskPendingRepo.DeleteByDedupKey(ctx, wikiTaskType, wikiTaskScope, kbID, knowledgeID, WikiOpIngest); err != nil {
 		logger.Warnf(ctx, "wiki %s: failed to scrub pending ingest ops for knowledge %s: %v", reason, knowledgeID, err)
-		return
+		return err
 	}
 	logger.Infof(ctx, "wiki %s: scrubbed pending ingest ops for knowledge %s", reason, knowledgeID)
+	return nil
 }
 
 // prepareWikiForReparse is the reparse counterpart to
@@ -401,16 +404,16 @@ func (s *knowledgeService) scrubWikiPendingIngest(ctx context.Context, kbID, kno
 // the Redis pending list clean so the re-ingest enqueued by
 // KnowledgePostProcess doesn't race with a stale ingest op that would
 // fire mid-flight against zero chunks.
-func (s *knowledgeService) prepareWikiForReparse(ctx context.Context, knowledge *types.Knowledge) {
+func (s *knowledgeService) prepareWikiForReparse(ctx context.Context, knowledge *types.Knowledge) error {
 	if knowledge == nil {
-		return
+		return nil
 	}
 	kbID := knowledge.KnowledgeBaseID
 	knowledgeID := knowledge.ID
 	if kbID == "" || knowledgeID == "" {
-		return
+		return nil
 	}
-	s.scrubWikiPendingIngest(ctx, kbID, knowledgeID, "reparse")
+	return s.scrubWikiPendingIngest(ctx, kbID, knowledgeID, "reparse")
 }
 
 // removeSourceRef removes entries from source_refs that match a knowledge ID.
@@ -692,6 +695,87 @@ func (s *knowledgeService) DeleteKnowledgeList(ctx context.Context, ids []string
 }
 
 func (s *knowledgeService) cleanupKnowledgeResources(ctx context.Context, knowledge *types.Knowledge) error {
+	return s.cleanupKnowledgeResourcesWithOptions(ctx, knowledge, knowledge.EmbeddingModelID, true)
+}
+
+func (s *knowledgeService) collectReparseCleanupImageURLs(
+	ctx context.Context, knowledge *types.Knowledge,
+) ([]string, error) {
+	if knowledge == nil {
+		return nil, errors.New("collect reparse cleanup images: knowledge is required")
+	}
+	tenantInfo, _ := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	if tenantInfo == nil {
+		return nil, errors.New("collect reparse cleanup images: tenant context is required")
+	}
+	chunkImageInfos, err := s.chunkService.GetRepository().ListImageInfoByKnowledgeIDs(
+		ctx, tenantInfo.ID, []string{knowledge.ID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("collect reparse cleanup images: %w", err)
+	}
+	imageInfoStrs := make([]string, 0, len(chunkImageInfos))
+	for _, info := range chunkImageInfos {
+		imageInfoStrs = append(imageInfoStrs, info.ImageInfo)
+	}
+	return collectImageURLs(ctx, imageInfoStrs), nil
+}
+
+func (s *knowledgeService) deleteReparseVectors(
+	ctx context.Context, knowledge *types.Knowledge, checkpoint *types.ReparseCleanupCheckpoint,
+) error {
+	if knowledge == nil || checkpoint == nil || strings.TrimSpace(checkpoint.SourceEmbeddingModelID) == "" {
+		return nil
+	}
+	tenantInfo, _ := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	if tenantInfo == nil {
+		return errors.New("delete reparse vectors: tenant context is required")
+	}
+	if checkpoint.EmbeddingDimensions <= 0 {
+		return errors.New("delete reparse vectors: embedding dimensions are required")
+	}
+	if checkpoint.SourceVectorStoreID == nil && len(checkpoint.SourceEffectiveEngines) == 0 {
+		return errors.New("delete reparse vectors: source effective engines are required for an unbound knowledge base")
+	}
+	retrieveEngine, err := retriever.CreateRetrieveEngineFromPayload(
+		ctx,
+		s.retrieveEngine,
+		s.ownership,
+		tenantInfo.ID,
+		checkpoint.SourceEffectiveEngines,
+		checkpoint.SourceVectorStoreID,
+	)
+	if err != nil {
+		return fmt.Errorf("delete reparse vectors: %w", err)
+	}
+	if err := retrieveEngine.DeleteByKnowledgeIDList(
+		ctx, []string{knowledge.ID}, checkpoint.EmbeddingDimensions, checkpoint.KnowledgeType,
+	); err != nil {
+		return fmt.Errorf("delete reparse vectors: %w", err)
+	}
+	return nil
+}
+
+func (s *knowledgeService) deleteReparseImages(
+	ctx context.Context, kb *types.KnowledgeBase, imageURLs []string,
+) error {
+	var deleteErr error
+	for _, imageURL := range imageURLs {
+		fileSvc := s.resolveFileServiceForPath(ctx, kb, imageURL)
+		if fileSvc == nil {
+			deleteErr = errors.Join(deleteErr, fmt.Errorf("delete reparse image %s: file service unavailable", imageURL))
+			continue
+		}
+		if err := fileSvc.DeleteFile(ctx, imageURL); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			deleteErr = errors.Join(deleteErr, fmt.Errorf("delete reparse image %s: %w", imageURL, err))
+		}
+	}
+	return deleteErr
+}
+
+func (s *knowledgeService) cleanupKnowledgeResourcesWithOptions(
+	ctx context.Context, knowledge *types.Knowledge, cleanupEmbeddingModelID string, adjustStorage bool,
+) error {
 	logger.GetLogger(ctx).Infof("Cleaning knowledge resources before manual update, knowledge ID: %s", knowledge.ID)
 
 	var cleanupErr error
@@ -702,7 +786,7 @@ func (s *knowledgeService) cleanupKnowledgeResources(ctx context.Context, knowle
 	}
 
 	tenantInfo := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
-	if knowledge.EmbeddingModelID != "" {
+	if cleanupEmbeddingModelID != "" {
 		// Load KB to discover its VectorStoreID binding. Falls back to tenant
 		// effective engines if the KB has no binding or the load fails.
 		//
@@ -722,7 +806,7 @@ func (s *knowledgeService) cleanupKnowledgeResources(ctx context.Context, knowle
 			logger.GetLogger(ctx).WithField("error", err).Error("Failed to init retrieve engine during cleanup")
 			cleanupErr = errors.Join(cleanupErr, err)
 		} else {
-			embeddingModel, modelErr := s.modelService.GetEmbeddingModel(ctx, knowledge.EmbeddingModelID)
+			embeddingModel, modelErr := s.modelService.GetEmbeddingModel(ctx, cleanupEmbeddingModelID)
 			if modelErr != nil {
 				logger.GetLogger(ctx).WithField("error", modelErr).Error("Failed to get embedding model during cleanup")
 				cleanupErr = errors.Join(cleanupErr, modelErr)
@@ -763,7 +847,7 @@ func (s *knowledgeService) cleanupKnowledgeResources(ctx context.Context, knowle
 		cleanupErr = errors.Join(cleanupErr, err)
 	}
 
-	if knowledge.StorageSize > 0 {
+	if adjustStorage && knowledge.StorageSize > 0 {
 		tenantInfo.StorageUsed -= knowledge.StorageSize
 		if tenantInfo.StorageUsed < 0 {
 			tenantInfo.StorageUsed = 0

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/Tencent/WeKnora/internal/agent"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -17,6 +16,13 @@ import (
 )
 
 const (
+	// maxRunesPerWikiExtractionBatch keeps each entity/concept extraction
+	// response bounded. A single 32k-rune request can produce tens of thousands
+	// of output tokens and be cut off after otherwise-valid JSON has begun;
+	// bounded batches retain the existing per-call retry contract, share a
+	// rolling canonical candidate inventory, and merge before any page is written.
+	maxRunesPerWikiExtractionBatch = 6000
+
 	// maxRunesPerCitationBatch bounds the size of a single chunk-citation
 	// batch by rune count (a fast approximation of token count). Small enough
 	// that batches stay comfortably inside the LLM's context and output
@@ -28,6 +34,108 @@ const (
 	// batches so a single long document can't saturate the synthesis model.
 	maxCitationBatchConcurrency = 4
 )
+
+func runWikiExtractionBatches(
+	content string,
+	extract func(string, combinedExtraction) (combinedExtraction, error),
+) (combinedExtraction, int, error) {
+	runes := []rune(content)
+	if len(runes) == 0 {
+		return combinedExtraction{}, 0, nil
+	}
+	total := (len(runes) + maxRunesPerWikiExtractionBatch - 1) / maxRunesPerWikiExtractionBatch
+	merged := combinedExtraction{}
+	for start, index := 0, 0; start < len(runes); start, index = start+maxRunesPerWikiExtractionBatch, index+1 {
+		end := min(start+maxRunesPerWikiExtractionBatch, len(runes))
+		accumulated := combinedExtraction{
+			Entities: append([]extractedItem(nil), merged.Entities...),
+			Concepts: append([]extractedItem(nil), merged.Concepts...),
+		}
+		result, err := extract(string(runes[start:end]), accumulated)
+		if err != nil {
+			return combinedExtraction{}, index, fmt.Errorf("wiki extraction batch %d/%d: %w", index+1, total, err)
+		}
+		merged.Entities = append(merged.Entities, result.Entities...)
+		merged.Concepts = append(merged.Concepts, result.Concepts...)
+		merged.Entities, merged.Concepts = compactExtractedItems(merged.Entities, merged.Concepts)
+	}
+	return merged, total, nil
+}
+
+// renderExtractionPreviousSlugs combines persisted slugs from this source
+// document with the canonical candidates accumulated from earlier shards.
+// Passing this rolling inventory into every extraction call gives the model a
+// chance to reuse the same slug before deterministic compaction is needed.
+func renderExtractionPreviousSlugs(oldPageSlugs map[string]bool, accumulated combinedExtraction) string {
+	items := make(map[string]string, len(oldPageSlugs)+len(accumulated.Entities)+len(accumulated.Concepts))
+	for slug := range oldPageSlugs {
+		if strings.HasPrefix(slug, "entity/") || strings.HasPrefix(slug, "concept/") {
+			items[slug] = ""
+		}
+	}
+	for _, item := range append(append([]extractedItem(nil), accumulated.Entities...), accumulated.Concepts...) {
+		if item.Slug != "" {
+			items[item.Slug] = item.Name
+		}
+	}
+	if len(items) == 0 {
+		return "(none — this is a new document)"
+	}
+	slugs := make([]string, 0, len(items))
+	for slug := range items {
+		slugs = append(slugs, slug)
+	}
+	sort.Strings(slugs)
+	var sb strings.Builder
+	for _, slug := range slugs {
+		if name := strings.TrimSpace(items[slug]); name != "" {
+			fmt.Fprintf(&sb, "- %s = %s\n", slug, name)
+		} else {
+			fmt.Fprintf(&sb, "- %s\n", slug)
+		}
+	}
+	return sb.String()
+}
+
+func mergeIndependentFactText(existing, incoming string) string {
+	existing = strings.TrimSpace(existing)
+	incoming = strings.TrimSpace(incoming)
+	switch {
+	case existing == "":
+		return incoming
+	case incoming == "", incoming == existing, strings.Contains(existing, incoming):
+		return existing
+	case strings.Contains(incoming, existing):
+		return incoming
+	default:
+		return existing + "\n\n" + incoming
+	}
+}
+
+func runCitationBatchWorkers(
+	ctx context.Context,
+	batches []chunkBatch,
+	worker func(context.Context, int, chunkBatch) (citationBatchResult, error),
+) ([]citationBatchResult, error) {
+	results := make([]citationBatchResult, len(batches))
+	eg, ectx := errgroup.WithContext(ctx)
+	eg.SetLimit(maxCitationBatchConcurrency)
+	for index := range batches {
+		index := index
+		eg.Go(func() error {
+			result, err := worker(ectx, index, batches[index])
+			if err != nil {
+				return fmt.Errorf("citation batch %d/%d: %w", index+1, len(batches), err)
+			}
+			results[index] = result
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
 
 // citationBatchResult is the JSON shape we expect back from one invocation of
 // WikiChunkCitationPrompt.
@@ -77,42 +185,32 @@ func (s *wikiIngestService) extractCandidateSlugs(
 	oldPageSlugs map[string]bool,
 	batchCtx *WikiBatchContext,
 ) ([]extractedItem, []extractedItem, map[string]extractedItem, error) {
-	var prevSlugsText string
-	if len(oldPageSlugs) > 0 {
-		var sb strings.Builder
-		for slug := range oldPageSlugs {
-			if !strings.HasPrefix(slug, "entity/") && !strings.HasPrefix(slug, "concept/") {
-				continue
-			}
-			fmt.Fprintf(&sb, "- %s\n", slug)
-		}
-		prevSlugsText = sb.String()
-	}
-	if prevSlugsText == "" {
-		prevSlugsText = "(none — this is a new document)"
-	}
-
 	granularity := batchCtx.ExtractionGranularity.Normalize()
-	raw, err := s.generateWithTemplate(ctx, chatModel, agent.WikiCandidateSlugPrompt, map[string]string{
-		"Content":             content,
-		"Language":            lang,
-		"PreviousSlugs":       prevSlugsText,
-		"Granularity":         string(granularity),
-		"GranularityGuidance": agent.WikiGranularityGuidance(string(granularity)),
-		"CustomInstructions":  batchCtx.ExtractionInstructions,
-		"InstructionScope":    "wiki_extraction",
+	result, batchCount, err := runWikiExtractionBatches(content, func(batch string, accumulated combinedExtraction) (combinedExtraction, error) {
+		raw, generateErr := s.generateWithTemplate(ctx, chatModel, agent.WikiCandidateSlugPrompt, map[string]string{
+			"Content":             batch,
+			"Language":            lang,
+			"PreviousSlugs":       renderExtractionPreviousSlugs(oldPageSlugs, accumulated),
+			"Granularity":         string(granularity),
+			"GranularityGuidance": agent.WikiGranularityGuidance(string(granularity)),
+			"CustomInstructions":  batchCtx.ExtractionInstructions,
+			"InstructionScope":    "wiki_extraction",
+		})
+		if generateErr != nil {
+			return combinedExtraction{}, generateErr
+		}
+		raw = cleanLLMJSON(raw)
+		var batchResult combinedExtraction
+		if unmarshalErr := json.Unmarshal([]byte(raw), &batchResult); unmarshalErr != nil {
+			logger.Warnf(ctx, "wiki ingest: failed to parse candidate slug JSON: %v\nRaw: %s", unmarshalErr, raw)
+			return combinedExtraction{}, fmt.Errorf("parse candidate slug JSON: %w", unmarshalErr)
+		}
+		return batchResult, nil
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("candidate slug extraction failed: %w", err)
 	}
-
-	raw = cleanLLMJSON(raw)
-
-	var result combinedExtraction
-	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		logger.Warnf(ctx, "wiki ingest: failed to parse candidate slug JSON: %v\nRaw: %s", err, raw)
-		return nil, nil, nil, fmt.Errorf("parse candidate slug JSON: %w", err)
-	}
+	logger.Infof(ctx, "wiki ingest: candidate extraction completed in %d bounded batch(es)", batchCount)
 
 	result.Entities, result.Concepts = s.deduplicateExtractedBatch(
 		ctx, chatModel, kbID, result.Entities, result.Concepts,
@@ -250,7 +348,7 @@ func renderChunksXML(batch chunkBatch) string {
 // batches are merged into a single slug → union(chunk_id) map, and any
 // "new_slugs" that Pass 0 missed are collected separately.
 //
-// Returns (citations, newSlugs, batchCount). citations is keyed by slug and
+// Returns (citations, newSlugs, batchCount, error). citations is keyed by slug and
 // contains real chunk UUIDs (already translated from batch handles). newSlugs
 // likewise carry real chunk UUIDs in SourceChunks.
 func (s *wikiIngestService) classifyChunkCitations(
@@ -260,83 +358,74 @@ func (s *wikiIngestService) classifyChunkCitations(
 	chunks []*types.Chunk,
 	lang string,
 	batchCtx *WikiBatchContext,
-) (map[string][]string, []newSlugFromCitation, int) {
+) (map[string][]string, []newSlugFromCitation, int, error) {
 	batches := splitChunksIntoCitationBatches(chunks)
 	if len(batches) == 0 || strings.TrimSpace(candidatesXML) == "" {
-		return map[string][]string{}, nil, 0
+		return map[string][]string{}, nil, 0, nil
 	}
 
-	// Merge state. Using sets keyed by (slug, chunkID) to dedup across
-	// batches; order is re-imposed from chunk ChunkIndex at the end.
-	var mu sync.Mutex
-	citationSet := make(map[string]map[string]bool) // slug → set of real chunk IDs
-	var newSlugsAll []newSlugFromCitation
-
-	eg, ectx := errgroup.WithContext(ctx)
-	eg.SetLimit(maxCitationBatchConcurrency)
-
-	for bi := range batches {
-		batch := batches[bi]
-		batchIdx := bi
-		eg.Go(func() error {
-			chunksXML := renderChunksXML(batch)
-			raw, err := s.generateWithTemplate(ectx, chatModel, agent.WikiChunkCitationPrompt, map[string]string{
+	parsedBatches, err := runCitationBatchWorkers(ctx, batches,
+		func(batchCtx context.Context, batchIdx int, batch chunkBatch) (citationBatchResult, error) {
+			raw, generateErr := s.generateWithTemplate(batchCtx, chatModel, agent.WikiChunkCitationPrompt, map[string]string{
 				"CandidateSlugs": candidatesXML,
-				"ChunksXML":      chunksXML,
+				"ChunksXML":      renderChunksXML(batch),
 				"Language":       lang,
 			})
-			if err != nil {
-				logger.Warnf(ectx, "wiki ingest: citation batch %d failed: %v", batchIdx, err)
-				return nil // don't abort peer batches
+			if generateErr != nil {
+				return citationBatchResult{}, generateErr
 			}
 			raw = cleanLLMJSON(raw)
-
 			var parsed citationBatchResult
-			if jerr := json.Unmarshal([]byte(raw), &parsed); jerr != nil {
-				logger.Warnf(ectx, "wiki ingest: citation batch %d parse failed: %v\nRaw: %s", batchIdx, jerr, raw)
-				return nil
+			if unmarshalErr := json.Unmarshal([]byte(raw), &parsed); unmarshalErr != nil {
+				logger.Warnf(batchCtx, "wiki ingest: citation batch %d parse failed: %v\nRaw: %s", batchIdx, unmarshalErr, raw)
+				return citationBatchResult{}, fmt.Errorf("parse citation JSON: %w", unmarshalErr)
 			}
-
-			// Translate handles → real chunk UUIDs; drop unknown handles.
-			mu.Lock()
-			defer mu.Unlock()
-
-			for slug, handleList := range parsed.Citations {
-				if slug == "" {
-					continue
-				}
-				set, ok := citationSet[slug]
-				if !ok {
-					set = make(map[string]bool)
-					citationSet[slug] = set
-				}
-				for _, handle := range handleList {
-					realID, known := batch.handles.Resolve(handle)
-					if !known {
-						logger.Warnf(ectx, "wiki ingest: citation batch %d referenced unknown chunk handle %q for slug %s", batchIdx, handle, slug)
-						continue
-					}
-					set[realID] = true
-				}
-			}
-
-			for _, ns := range parsed.NewSlugs {
-				if ns.Slug == "" || ns.Name == "" {
-					continue
-				}
-				real := make([]string, 0, len(ns.SourceChunks))
-				for _, handle := range ns.SourceChunks {
-					if id, ok := batch.handles.Resolve(handle); ok {
-						real = append(real, id)
-					}
-				}
-				ns.SourceChunks = real
-				newSlugsAll = append(newSlugsAll, ns)
-			}
-			return nil
+			return parsed, nil
 		})
+	if err != nil {
+		return nil, nil, len(batches), err
 	}
-	_ = eg.Wait()
+
+	// Merge only after every batch has generated and parsed successfully.
+	// Using sets keyed by (slug, chunkID) deduplicates across batches; order
+	// is re-imposed from chunk ChunkIndex at the end.
+	citationSet := make(map[string]map[string]bool) // slug → set of real chunk IDs
+	var newSlugsAll []newSlugFromCitation
+	for batchIdx, parsed := range parsedBatches {
+		batch := batches[batchIdx]
+		for slug, handleList := range parsed.Citations {
+			if slug == "" {
+				continue
+			}
+			set, ok := citationSet[slug]
+			if !ok {
+				set = make(map[string]bool)
+				citationSet[slug] = set
+			}
+			for _, handle := range handleList {
+				realID, known := batch.handles.Resolve(handle)
+				if !known {
+					logger.Warnf(ctx, "wiki ingest: citation batch %d referenced unknown chunk handle %q for slug %s", batchIdx, handle, slug)
+					continue
+				}
+				set[realID] = true
+			}
+		}
+
+		for _, ns := range parsed.NewSlugs {
+			if ns.Slug == "" || ns.Name == "" {
+				continue
+			}
+			real := make([]string, 0, len(ns.SourceChunks))
+			for _, handle := range ns.SourceChunks {
+				if id, ok := batch.handles.Resolve(handle); ok {
+					real = append(real, id)
+				}
+			}
+			ns.SourceChunks = real
+			newSlugsAll = append(newSlugsAll, ns)
+		}
+	}
 
 	// Build a stable chunk-order so the final citations come out in document order.
 	chunkOrder := make(map[string]int, len(chunks))
@@ -356,7 +445,7 @@ func (s *wikiIngestService) classifyChunkCitations(
 		out[slug] = ids
 	}
 
-	return out, newSlugsAll, len(batches)
+	return out, newSlugsAll, len(batches), nil
 }
 
 // resolveCitedChunks loads the content of every chunk referenced by the
@@ -541,5 +630,6 @@ func mergeCitationsIntoItems(
 		}
 	}
 
+	entities, concepts = compactExtractedItems(entities, concepts)
 	return entities, concepts, uncited
 }

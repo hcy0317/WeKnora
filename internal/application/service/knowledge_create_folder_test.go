@@ -15,10 +15,11 @@ func createKnowledgeInFolder(t *testing.T, uploadName, customFileName string) *t
 
 	repo := &createKnowledgeFileRepoStub{}
 	svc := &knowledgeService{
-		repo:      repo,
-		kbService: &createKnowledgeFileKBServiceStub{kb: &types.KnowledgeBase{ID: "kb-1"}},
-		fileSvc:   &createKnowledgeFileServiceStub{},
-		task:      &createKnowledgeTaskEnqueuerStub{},
+		repo:        repo,
+		kbService:   &createKnowledgeFileKBServiceStub{kb: &types.KnowledgeBase{ID: "kb-1"}},
+		fileSvc:     &createKnowledgeFileServiceStub{},
+		task:        &createKnowledgeTaskEnqueuerStub{},
+		spanTracker: &attemptTestTracker{},
 	}
 
 	_, err := svc.CreateKnowledgeFromFile(

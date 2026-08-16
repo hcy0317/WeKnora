@@ -38,6 +38,7 @@ const canDeleteGeneratedQuestion = computed(() => {
   return authStore.hasRole('admin');
 });
 const canEditContent = canDeleteGeneratedQuestion;
+const processingMutationAllowed = computed(() => props.processingMutationAllowed === true);
 
 type MetadataValueType = 'text' | 'number' | 'boolean' | 'null';
 interface MetadataDraftRow {
@@ -212,7 +213,7 @@ mermaid.initialize({
     topPadding: 50
   }
 });
-const props = defineProps(["visible", "details", "knowledgeType", "sourceInfo", "canEditKB", "canDownloadKB", "parse_status", "kbId"]);
+const props = defineProps(["visible", "details", "knowledgeType", "sourceInfo", "canEditKB", "processingMutationAllowed", "canDownloadKB", "parse_status", "kbId"]);
 const emit = defineEmits(["closeDoc", "getDoc", "questionDeleted", "summaryStateChange"]);
 
 const applySummaryState = (summaryStatus?: string, description?: string) => {
@@ -1599,7 +1600,8 @@ const handleChunkPageChange = (pageInfo: { current: number }) => {
         @close="closeTimeline">
         <div class="kp-drawer-shell" :class="{ 'kp-drawer-shell--resizing': timelineDrawerResizing }">
           <KnowledgeProcessingTimeline v-if="details.id && timelineDrawerVisible" :knowledge-id="details.id"
-            :parse-status="details.parse_status" :doc-title="details.title" show-close @close="closeTimeline" />
+            :parse-status="details.parse_status" :doc-title="details.title" :can-edit="processingMutationAllowed"
+            show-close @close="closeTimeline" />
         </div>
       </t-drawer>
 

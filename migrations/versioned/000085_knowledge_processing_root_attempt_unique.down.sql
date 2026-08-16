@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_knowledge_processing_spans_root_attempt_unique;

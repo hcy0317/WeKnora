@@ -3,12 +3,15 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var ErrKnowledgeNotFound = errors.New("knowledge not found")
@@ -312,8 +315,345 @@ func (r *knowledgeRepository) UpdateKnowledge(ctx context.Context, knowledge *ty
 	if knowledge.CustomMetadata == nil {
 		omit = append(append([]string{}, omitFieldsOnUpdate...), "custom_metadata")
 	}
-	err := r.db.WithContext(ctx).Omit(omit...).Save(knowledge).Error
+	err := dbWithContext(ctx, r.db).Omit(omit...).Save(knowledge).Error
 	return err
+}
+
+func currentOpenKnowledgeAttempt(tx *gorm.DB, knowledgeID string, attempt int) (bool, error) {
+	if knowledgeID == "" || attempt <= 0 {
+		return false, errors.New("knowledge attempt update: knowledge_id and positive attempt are required")
+	}
+	if tx.Dialector.Name() == "postgres" {
+		if err := tx.Exec(
+			"SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", knowledgeID,
+		).Error; err != nil {
+			return false, fmt.Errorf("serialize knowledge attempt update: %w", err)
+		}
+	}
+	var root types.KnowledgeProcessingSpan
+	err := tx.Where("knowledge_id = ? AND kind = ?", knowledgeID, types.SpanKindRoot).
+		Order("attempt DESC").First(&root).Error
+	if err != nil {
+		return false, fmt.Errorf("load latest knowledge attempt: %w", err)
+	}
+	if root.Attempt != attempt {
+		return false, nil
+	}
+	return root.Status == types.SpanStatusPending || root.Status == types.SpanStatusRunning, nil
+}
+
+// UpdateKnowledgeForAttempt serializes with OpenAttempt and only persists the
+// shared knowledge row while attempt is still the latest open root. It closes
+// the submission race where an older HTTP request could overwrite a newer
+// reparse's metadata or failed status after both had allocated roots.
+func (r *knowledgeRepository) UpdateKnowledgeForAttempt(
+	ctx context.Context, knowledge *types.Knowledge, attempt int, resetPendingSubtasks bool,
+) (bool, error) {
+	if knowledge == nil {
+		return false, errors.New("knowledge attempt update: knowledge is required")
+	}
+	current := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		current, err = currentOpenKnowledgeAttempt(tx, knowledge.ID, attempt)
+		if err != nil || !current {
+			return err
+		}
+		omit := omitFieldsOnUpdate
+		if knowledge.CustomMetadata == nil {
+			omit = append(append([]string{}, omitFieldsOnUpdate...), "custom_metadata")
+		}
+		if err := tx.Omit(omit...).Save(knowledge).Error; err != nil {
+			return err
+		}
+		if resetPendingSubtasks {
+			return tx.Model(&types.Knowledge{}).Where("id = ?", knowledge.ID).
+				Update("pending_subtasks_count", 0).Error
+		}
+		return nil
+	})
+	return current, err
+}
+
+// FinalizeIndexedKnowledgeForAttempt publishes the indexed knowledge state and
+// adjusts tenant storage in the same transaction. Replaying the same attempt
+// replaces the previously accounted storage instead of charging it again; a
+// superseded worker cannot publish or bill its output.
+func (r *knowledgeRepository) FinalizeIndexedKnowledgeForAttempt(
+	ctx context.Context, knowledge *types.Knowledge, attempt int,
+) (bool, error) {
+	if knowledge == nil {
+		return false, errors.New("finalize indexed knowledge: knowledge is required")
+	}
+	current := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		current, err = currentOpenKnowledgeAttempt(tx, knowledge.ID, attempt)
+		if err != nil || !current {
+			return err
+		}
+		var stored types.Knowledge
+		query := tx.Where("id = ?", knowledge.ID)
+		if tx.Dialector.Name() == "postgres" {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := query.First(&stored).Error; err != nil {
+			return err
+		}
+		delta := knowledge.StorageSize - stored.StorageSize
+		omit := omitFieldsOnUpdate
+		if knowledge.CustomMetadata == nil {
+			omit = append(append([]string{}, omitFieldsOnUpdate...), "custom_metadata")
+		}
+		if err := tx.Omit(omit...).Save(knowledge).Error; err != nil {
+			return err
+		}
+		if delta != 0 {
+			return tx.Model(&types.Tenant{}).Where("id = ?", stored.TenantID).
+				Update("storage_used", gorm.Expr(
+					"CASE WHEN storage_used + ? > 0 THEN storage_used + ? ELSE 0 END", delta, delta,
+				)).Error
+		}
+		return nil
+	})
+	return current, err
+}
+
+func lockedReparseAttemptRoot(
+	tx *gorm.DB, knowledgeID string, attempt int,
+) (*types.KnowledgeProcessingSpan, error) {
+	var root types.KnowledgeProcessingSpan
+	query := tx.Where(
+		"knowledge_id = ? AND attempt = ? AND kind = ?",
+		knowledgeID, attempt, types.SpanKindRoot,
+	)
+	if tx.Dialector.Name() == "postgres" {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	if err := query.Take(&root).Error; err != nil {
+		return nil, fmt.Errorf("load reparse attempt root: %w", err)
+	}
+	return &root, nil
+}
+
+func mergeReparseCleanupCheckpoint(
+	existing, next types.ReparseCleanupCheckpoint,
+) (types.ReparseCleanupCheckpoint, error) {
+	if existing.Version != next.Version || existing.Attempt != next.Attempt ||
+		existing.SourceEmbeddingModelID != next.SourceEmbeddingModelID ||
+		existing.TargetEmbeddingModelID != next.TargetEmbeddingModelID ||
+		existing.KnowledgeType != next.KnowledgeType ||
+		existing.WikiCleanupRequired != next.WikiCleanupRequired ||
+		!reflect.DeepEqual(existing.SourceVectorStoreID, next.SourceVectorStoreID) ||
+		!reflect.DeepEqual(existing.SourceEffectiveEngines, next.SourceEffectiveEngines) ||
+		!reflect.DeepEqual(existing.TargetVectorStoreID, next.TargetVectorStoreID) ||
+		!reflect.DeepEqual(existing.TargetEffectiveEngines, next.TargetEffectiveEngines) {
+		return types.ReparseCleanupCheckpoint{}, errors.New("merge reparse cleanup checkpoint: immutable plan changed")
+	}
+	merged := existing
+	if merged.EmbeddingDimensions == 0 {
+		merged.EmbeddingDimensions = next.EmbeddingDimensions
+	} else if next.EmbeddingDimensions > 0 && merged.EmbeddingDimensions != next.EmbeddingDimensions {
+		return types.ReparseCleanupCheckpoint{}, errors.New("merge reparse cleanup checkpoint: dimensions changed")
+	}
+	if len(merged.ImageURLs) == 0 {
+		merged.ImageURLs = append([]string(nil), next.ImageURLs...)
+	} else if len(next.ImageURLs) > 0 && !reflect.DeepEqual(merged.ImageURLs, next.ImageURLs) {
+		return types.ReparseCleanupCheckpoint{}, errors.New("merge reparse cleanup checkpoint: image manifest changed")
+	}
+	merged.WikiPendingIngestScrubbed = merged.WikiPendingIngestScrubbed || next.WikiPendingIngestScrubbed
+	merged.VectorsDeleted = merged.VectorsDeleted || next.VectorsDeleted
+	merged.ChunksDeleted = merged.ChunksDeleted || next.ChunksDeleted
+	merged.ImagesDeleted = merged.ImagesDeleted || next.ImagesDeleted
+	merged.GraphDeleted = merged.GraphDeleted || next.GraphDeleted
+	phaseRank := map[string]int{
+		types.ReparseCleanupPending: 0, types.ReparseCleanupPrepared: 1, types.ReparseCleanupCompleted: 2,
+	}
+	if phaseRank[next.Phase] > phaseRank[merged.Phase] {
+		merged.Phase = next.Phase
+	}
+	return merged, nil
+}
+
+// SaveReparseCleanupCheckpoint persists the cleanup plan in the exact root
+// span for this attempt. The latest-open guard shares OpenAttempt's advisory
+// lock, so an older request cannot prepare or advance cleanup after a newer
+// attempt has superseded it.
+func (r *knowledgeRepository) SaveReparseCleanupCheckpoint(
+	ctx context.Context, knowledgeID string, attempt int, checkpoint types.ReparseCleanupCheckpoint,
+) (bool, error) {
+	if checkpoint.Attempt != attempt {
+		return false, errors.New("save reparse cleanup checkpoint: attempt mismatch")
+	}
+	if _, err := types.PutReparseCleanupCheckpoint(nil, checkpoint); err != nil {
+		return false, err
+	}
+	current := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		current, err = currentOpenKnowledgeAttempt(tx, knowledgeID, attempt)
+		if err != nil || !current {
+			return err
+		}
+		root, err := lockedReparseAttemptRoot(tx, knowledgeID, attempt)
+		if err != nil {
+			return err
+		}
+		if existing, decodeErr := types.DecodeReparseCleanupCheckpoint(root.Input); decodeErr != nil {
+			return decodeErr
+		} else if existing != nil {
+			checkpoint, err = mergeReparseCleanupCheckpoint(*existing, checkpoint)
+			if err != nil {
+				return err
+			}
+		}
+		input, err := types.PutReparseCleanupCheckpoint(root.Input, checkpoint)
+		if err != nil {
+			return err
+		}
+		return tx.Model(&types.KnowledgeProcessingSpan{}).
+			Where("id = ?", root.ID).
+			Updates(map[string]any{"input": input, "updated_at": time.Now()}).Error
+	})
+	return current, err
+}
+
+func (r *knowledgeRepository) GetReparseCleanupCheckpoint(
+	ctx context.Context, knowledgeID string, attempt int,
+) (*types.ReparseCleanupCheckpoint, error) {
+	var root types.KnowledgeProcessingSpan
+	if err := r.db.WithContext(ctx).Where(
+		"knowledge_id = ? AND attempt = ? AND kind = ?",
+		knowledgeID, attempt, types.SpanKindRoot,
+	).Take(&root).Error; err != nil {
+		return nil, fmt.Errorf("load reparse cleanup checkpoint root: %w", err)
+	}
+	checkpoint, err := types.DecodeReparseCleanupCheckpoint(root.Input)
+	if err != nil {
+		return nil, err
+	}
+	if checkpoint == nil || checkpoint.Attempt != attempt {
+		return nil, errors.New("matching reparse cleanup checkpoint is required")
+	}
+	return checkpoint, nil
+}
+
+// SaveKnowledgeIndexRouteSnapshot freezes the model and concrete vector route
+// before an attempt can write external index data. The latest-open guard shares
+// OpenAttempt's advisory lock, so a superseded worker cannot publish a route
+// that a newer cleanup plan has already passed over.
+func (r *knowledgeRepository) SaveKnowledgeIndexRouteSnapshot(
+	ctx context.Context, knowledgeID string, attempt int, snapshot types.KnowledgeIndexRouteSnapshot,
+) (bool, error) {
+	if _, err := types.PutKnowledgeIndexRouteSnapshot(nil, snapshot); err != nil {
+		return false, err
+	}
+	current := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		current, err = currentOpenKnowledgeAttempt(tx, knowledgeID, attempt)
+		if err != nil || !current {
+			return err
+		}
+		root, err := lockedReparseAttemptRoot(tx, knowledgeID, attempt)
+		if err != nil {
+			return err
+		}
+		if existing, decodeErr := types.DecodeKnowledgeIndexRouteSnapshot(root.Input); decodeErr != nil {
+			return decodeErr
+		} else if existing != nil {
+			if !reflect.DeepEqual(existing.VectorStoreID, snapshot.VectorStoreID) ||
+				!reflect.DeepEqual(existing.EffectiveEngines, snapshot.EffectiveEngines) {
+				return errors.New("save knowledge index route: immutable route changed")
+			}
+			if existing.EmbeddingModelID != "" && snapshot.EmbeddingModelID != "" &&
+				existing.EmbeddingModelID != snapshot.EmbeddingModelID {
+				return errors.New("save knowledge index route: immutable embedding model changed")
+			}
+			if existing.EmbeddingModelID != "" {
+				snapshot.EmbeddingModelID = existing.EmbeddingModelID
+			}
+		}
+		input, err := types.PutKnowledgeIndexRouteSnapshot(root.Input, snapshot)
+		if err != nil {
+			return err
+		}
+		return tx.Model(&types.KnowledgeProcessingSpan{}).
+			Where("id = ?", root.ID).
+			Updates(map[string]any{"input": input, "updated_at": time.Now()}).Error
+	})
+	return current, err
+}
+
+// CompleteReparseCleanup commits the only non-idempotent part of reparse
+// cleanup: storage accounting. External vector/chunk/graph deletes are
+// repeatable; once they succeed, this transaction marks the attempt checkpoint
+// completed, switches to the target embedding model, clears
+// knowledge.storage_size and decrements tenant.storage_used exactly once.
+func (r *knowledgeRepository) CompleteReparseCleanup(
+	ctx context.Context, knowledgeID string, attempt int,
+) (bool, error) {
+	current := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		current, err = currentOpenKnowledgeAttempt(tx, knowledgeID, attempt)
+		if err != nil || !current {
+			return err
+		}
+		root, err := lockedReparseAttemptRoot(tx, knowledgeID, attempt)
+		if err != nil {
+			return err
+		}
+		checkpoint, err := types.DecodeReparseCleanupCheckpoint(root.Input)
+		if err != nil {
+			return fmt.Errorf("decode reparse cleanup checkpoint: %w", err)
+		}
+		if checkpoint == nil || checkpoint.Attempt != attempt {
+			return errors.New("complete reparse cleanup: matching checkpoint is required")
+		}
+		if checkpoint.Phase == types.ReparseCleanupCompleted {
+			return nil
+		}
+		if checkpoint.Phase != types.ReparseCleanupPrepared ||
+			!checkpoint.WikiPendingIngestScrubbed || !checkpoint.VectorsDeleted ||
+			!checkpoint.ChunksDeleted || !checkpoint.ImagesDeleted || !checkpoint.GraphDeleted {
+			return errors.New("complete reparse cleanup: prepared cleanup steps are incomplete")
+		}
+
+		var knowledge types.Knowledge
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", knowledgeID).First(&knowledge).Error; err != nil {
+			return err
+		}
+		storageSize := knowledge.StorageSize
+		checkpoint.Phase = types.ReparseCleanupCompleted
+		rootInput, err := types.PutReparseCleanupCheckpoint(root.Input, *checkpoint)
+		if err != nil {
+			return err
+		}
+		if err := tx.Model(&types.KnowledgeProcessingSpan{}).Where("id = ?", root.ID).
+			Updates(map[string]any{"input": rootInput, "updated_at": time.Now()}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&types.Knowledge{}).Where("id = ?", knowledge.ID).
+			Updates(map[string]any{
+				"embedding_model_id": checkpoint.TargetEmbeddingModelID,
+				"storage_size":       0,
+				"updated_at":         time.Now(),
+			}).Error; err != nil {
+			return err
+		}
+		if storageSize > 0 {
+			if err := tx.Model(&types.Tenant{}).Where("id = ?", knowledge.TenantID).
+				Update("storage_used", gorm.Expr(
+					"CASE WHEN storage_used > ? THEN storage_used - ? ELSE 0 END", storageSize, storageSize,
+				)).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return current, err
 }
 
 // UpdateKnowledgeBatch updates knowledge items in batch
@@ -332,6 +672,40 @@ func (r *knowledgeRepository) DeleteKnowledge(ctx context.Context, tenantID uint
 // DeleteKnowledge deletes knowledge
 func (r *knowledgeRepository) DeleteKnowledgeList(ctx context.Context, tenantID uint64, ids []string) error {
 	return r.db.WithContext(ctx).Where("tenant_id = ? AND id in ?", tenantID, ids).Delete(&types.Knowledge{}).Error
+}
+
+func (r *knowledgeRepository) DeleteKnowledgeListAndAdjustStorage(
+	ctx context.Context, tenantID uint64, ids []string,
+) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	return dbWithContext(ctx, r.db).Transaction(func(tx *gorm.DB) error {
+		var storage int64
+		if err := tx.Model(&types.Knowledge{}).
+			Where("tenant_id = ? AND id IN ?", tenantID, ids).
+			Select("COALESCE(SUM(storage_size), 0)").Scan(&storage).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("tenant_id = ? AND id IN ?", tenantID, ids).
+			Delete(&types.Knowledge{}).Error; err != nil {
+			return err
+		}
+		if storage == 0 {
+			return nil
+		}
+		result := tx.Model(&types.Tenant{}).Where("id = ?", tenantID).
+			UpdateColumn("storage_used", gorm.Expr(
+				"CASE WHEN storage_used >= ? THEN storage_used - ? ELSE 0 END", storage, storage,
+			))
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("adjust storage after knowledge deletion: tenant %d not found", tenantID)
+		}
+		return nil
+	})
 }
 
 // GetKnowledgeBatch gets knowledge in batch
@@ -513,7 +887,7 @@ func (r *knowledgeRepository) UpdateKnowledgeColumn(
 	column string,
 	value interface{},
 ) error {
-	err := r.db.WithContext(ctx).Model(&types.Knowledge{}).Where("id = ?", id).Update(column, value).Error
+	err := dbWithContext(ctx, r.db).Model(&types.Knowledge{}).Where("id = ?", id).Update(column, value).Error
 	return err
 }
 
@@ -529,7 +903,7 @@ func (r *knowledgeRepository) UpdateKnowledgeColumns(
 	if len(values) == 0 {
 		return nil
 	}
-	return r.db.WithContext(ctx).Model(&types.Knowledge{}).Where("id = ?", id).Updates(values).Error
+	return dbWithContext(ctx, r.db).Model(&types.Knowledge{}).Where("id = ?", id).Updates(values).Error
 }
 
 // UpdateActiveDeletingKnowledgeColumns only touches rows that are still visible
@@ -552,22 +926,13 @@ func (r *knowledgeRepository) UpdateActiveDeletingKnowledgeColumns(
 	return result.RowsAffected > 0, nil
 }
 
-// FinalizeSubtask atomically decrements pending_subtasks_count and, when
-// the counter reaches zero while parse_status is still 'finalizing',
-// flips the row to 'completed' in the same statement so concurrent
-// subtask completions can't race the promotion. Both this promotion and
-// SetFinalizing clear error_message: a row that re-enters processing or
-// finishes successfully must not keep displaying a failure from a
-// previous attempt.
+// FinalizeSubtask atomically decrements pending_subtasks_count. The counter is
+// observer/barrier state only: business completion is exclusively owned by
+// KnowledgeSpanRepository.SettleProcessingOutcome, which reduces the durable
+// logical children in one transaction.
 //
-// Returns (newCount, promoted, error). promoted is true iff this caller
-// was the one whose UPDATE flipped 'finalizing'→'completed'.
-//
-// The implementation is two statements (atomic decrement, then a guarded
-// promote UPDATE) because GORM does not expose a portable RETURNING
-// across PostgreSQL and SQLite. The promote UPDATE's WHERE clause
-// (parse_status='finalizing' AND pending_subtasks_count=0) makes it
-// safe to run from any number of concurrent callers — at most one wins.
+// Returns (newCount, promoted, error). promoted is retained for interface
+// compatibility and is always false.
 func (r *knowledgeRepository) FinalizeSubtask(
 	ctx context.Context, id string,
 ) (int, bool, error) {
@@ -586,33 +951,7 @@ func (r *knowledgeRepository) FinalizeSubtask(
 		return 0, false, res.Error
 	}
 
-	// 2) Guarded promote. EVERY caller unconditionally attempts this after
-	//    decrementing — we must NOT gate it on a separate SELECT of the
-	//    counter. That read can be served by a lagging read-replica (or a
-	//    stale connection snapshot) and return a non-zero value even after
-	//    the counter has truly reached zero on the primary; if every caller
-	//    trusts that stale read, NONE of them runs the promote and the row
-	//    is stranded in `finalizing` forever (the observed "stuck
-	//    pending_subtasks_count" bug). The promote is a WRITE, so it executes
-	//    on the primary and its `pending_subtasks_count = 0` WHERE clause is
-	//    the single authoritative, atomic check on the live row: only the
-	//    caller whose decrement actually brought the counter to zero matches,
-	//    and cancel/delete cannot be clobbered by a late promote.
-	promoteRes := r.db.WithContext(ctx).Model(&types.Knowledge{}).
-		Where("id = ? AND parse_status = ? AND pending_subtasks_count = 0",
-			id, types.ParseStatusFinalizing).
-		Updates(map[string]interface{}{
-			"parse_status":  types.ParseStatusCompleted,
-			"error_message": "",
-			"processed_at":  now,
-			"updated_at":    now,
-		})
-	if promoteRes.Error != nil {
-		return 0, false, promoteRes.Error
-	}
-	promoted := promoteRes.RowsAffected > 0
-
-	// 3) Best-effort re-read of the new count for diagnostics/return value
+	// 2) Best-effort re-read of the new count for diagnostics/return value
 	//    only. This read may be replica-stale and is intentionally NOT used
 	//    to decide whether to promote (see above). A read failure here does
 	//    not affect correctness, so we don't propagate it as an error.
@@ -622,9 +961,61 @@ func (r *knowledgeRepository) FinalizeSubtask(
 	if err := r.db.WithContext(ctx).Model(&types.Knowledge{}).
 		Select("pending_subtasks_count").
 		Where("id = ?", id).Take(&snap).Error; err != nil {
-		return 0, promoted, nil
+		return 0, false, nil
 	}
-	return snap.PendingSubtasksCount, promoted, nil
+	return snap.PendingSubtasksCount, false, nil
+}
+
+// FinalizeSubtaskForAttempt drains one observer slot only while attempt is the
+// latest open root. PostgreSQL takes the same advisory transaction lock as
+// OpenAttempt. SQLite evaluates the latest-attempt predicate in the guarded
+// UPDATE itself, which is the equivalent atomic CAS under its writer lock.
+func (r *knowledgeRepository) FinalizeSubtaskForAttempt(
+	ctx context.Context, id string, attempt int,
+) (int, bool, error) {
+	if strings.TrimSpace(id) == "" || attempt <= 0 {
+		return 0, false, errors.New("finalize subtask for attempt: knowledge id and positive attempt are required")
+	}
+	newCount := 0
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if tx.Dialector.Name() == "postgres" {
+			if err := tx.Exec(
+				"SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", id,
+			).Error; err != nil {
+				return fmt.Errorf("serialize attempt subtask finalization: %w", err)
+			}
+		}
+		now := time.Now()
+		result := tx.Model(&types.Knowledge{}).
+			Where(`id = ? AND pending_subtasks_count > 0 AND EXISTS (
+				SELECT 1 FROM knowledge_processing_spans AS current_root
+				WHERE current_root.knowledge_id = ? AND current_root.kind = ?
+				  AND current_root.attempt = ? AND current_root.status IN ?
+				  AND NOT EXISTS (
+					SELECT 1 FROM knowledge_processing_spans AS newer_root
+					WHERE newer_root.knowledge_id = current_root.knowledge_id
+					  AND newer_root.kind = ? AND newer_root.attempt > current_root.attempt
+				  )
+			)`, id, id, types.SpanKindRoot, attempt,
+				[]string{types.SpanStatusPending, types.SpanStatusRunning}, types.SpanKindRoot).
+			Updates(map[string]interface{}{
+				"pending_subtasks_count": gorm.Expr("pending_subtasks_count - 1"),
+				"updated_at":             now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		var snap struct {
+			PendingSubtasksCount int `gorm:"column:pending_subtasks_count"`
+		}
+		if err := tx.Model(&types.Knowledge{}).Select("pending_subtasks_count").
+			Where("id = ?", id).Take(&snap).Error; err != nil {
+			return err
+		}
+		newCount = snap.PendingSubtasksCount
+		return nil
+	})
+	return newCount, false, err
 }
 
 // SetFinalizing atomically transitions a row from 'processing' to

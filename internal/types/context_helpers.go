@@ -3,8 +3,65 @@ package types
 import (
 	"context"
 	"os"
+	"sort"
 	"strings"
 )
+
+// WikiSourceAttemptGuard identifies one document attempt whose generated Wiki
+// contribution is allowed to reach durable page storage. Repository writes use
+// these guards inside the same transaction as the page/revision/link mutation,
+// closing the check-then-write window between a reparse and an old worker.
+type WikiSourceAttemptGuard struct {
+	KnowledgeID string
+	Attempt     int
+}
+
+type wikiSourceAttemptGuardsContextValue struct {
+	guards []WikiSourceAttemptGuard
+}
+
+type wikiSourceAttemptGuardsContextKey struct{}
+
+// WithWikiSourceAttemptGuards marks a Wiki page write as pipeline-generated
+// and attaches its exact contributing attempts. An explicitly empty slice is
+// still meaningful: it asks the repository to validate the KB boundary for an
+// untracked deletion/retraction write.
+func WithWikiSourceAttemptGuards(ctx context.Context, guards []WikiSourceAttemptGuard) context.Context {
+	normalized := make([]WikiSourceAttemptGuard, 0, len(guards))
+	seen := make(map[string]int, len(guards))
+	for _, guard := range guards {
+		guard.KnowledgeID = strings.TrimSpace(guard.KnowledgeID)
+		if guard.KnowledgeID == "" || guard.Attempt < 0 {
+			continue
+		}
+		if attempt, ok := seen[guard.KnowledgeID]; ok {
+			if guard.Attempt > attempt {
+				seen[guard.KnowledgeID] = guard.Attempt
+			}
+			continue
+		}
+		seen[guard.KnowledgeID] = guard.Attempt
+	}
+	for knowledgeID, attempt := range seen {
+		normalized = append(normalized, WikiSourceAttemptGuard{KnowledgeID: knowledgeID, Attempt: attempt})
+	}
+	sort.Slice(normalized, func(i, j int) bool { return normalized[i].KnowledgeID < normalized[j].KnowledgeID })
+	return context.WithValue(ctx, wikiSourceAttemptGuardsContextKey{}, wikiSourceAttemptGuardsContextValue{guards: normalized})
+}
+
+// WikiSourceAttemptGuardsFromContext returns the normalized guards plus a
+// presence flag. The flag distinguishes ordinary user edits from guarded
+// pipeline writes that happen to have no tracked contributor.
+func WikiSourceAttemptGuardsFromContext(ctx context.Context) ([]WikiSourceAttemptGuard, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	value, ok := ctx.Value(wikiSourceAttemptGuardsContextKey{}).(wikiSourceAttemptGuardsContextValue)
+	if !ok {
+		return nil, false
+	}
+	return append([]WikiSourceAttemptGuard(nil), value.guards...), true
+}
 
 // EnvLanguage returns the WEKNORA_LANGUAGE environment variable value, or empty string if unset.
 func EnvLanguage() string {

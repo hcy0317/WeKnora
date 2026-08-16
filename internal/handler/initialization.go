@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
@@ -27,6 +28,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/provider"
 	"github.com/Tencent/WeKnora/internal/models/rerank"
 	"github.com/Tencent/WeKnora/internal/models/utils/ollama"
+	"github.com/Tencent/WeKnora/internal/models/vlm"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
@@ -1623,6 +1625,7 @@ func (h *InitializationHandler) buildConfigResponse(ctx context.Context, models 
 // 所有 provider/model 通用字段都在这里集中声明；若未来新增字段（比如现在的
 // custom_headers），只需改一处，生产路径和测试路径会同时生效。
 type ModelTestRequest struct {
+	ModelType                 string            `json:"modelType,omitempty"`
 	Source                    string            `json:"source"` // 为空时按需默认为 "remote"
 	ModelName                 string            `json:"modelName" binding:"required"`
 	BaseURL                   string            `json:"baseUrl"`
@@ -1703,6 +1706,7 @@ func (h *InitializationHandler) buildTestModel(
 		source = defaultSource
 	}
 	return &types.Model{
+		ID:     req.ModelID,
 		Name:   req.ModelName,
 		Type:   modelType,
 		Source: source,
@@ -1782,8 +1786,18 @@ func (h *InitializationHandler) CheckRemoteModel(c *gin.Context) {
 		return
 	}
 
-	model := h.buildTestModel(&req, types.ModelTypeKnowledgeQA, types.ModelSourceRemote)
-	available, message := h.checkChatModelConnection(ctx, model, appID, appSecret)
+	modelType := types.ModelTypeKnowledgeQA
+	if strings.EqualFold(req.ModelType, "vllm") || strings.EqualFold(req.ModelType, string(types.ModelTypeVLLM)) {
+		modelType = types.ModelTypeVLLM
+	}
+	model := h.buildTestModel(&req, modelType, types.ModelSourceRemote)
+	var available bool
+	var message string
+	if modelType == types.ModelTypeVLLM {
+		available, message = h.checkVLMModelConnection(ctx, model, appID, appSecret)
+	} else {
+		available, message = h.checkChatModelConnection(ctx, model, appID, appSecret)
+	}
 
 	logger.Infof(ctx, "Remote model check completed, available: %v, message: %s", available, message)
 
@@ -1942,6 +1956,34 @@ func (h *InitializationHandler) checkChatModelConnection(
 
 	// 连接成功，模型可用
 	return true, "连接正常，模型可用"
+}
+
+const vlmConnectivityPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+
+// checkVLMModelConnection sends a real image request through the same VLM
+// construction path used by document processing. A text-only chat probe cannot
+// validate Responses image parts, VLM token fields, reasoning.effort, or the
+// VLM-specific protocol cache key.
+func (h *InitializationHandler) checkVLMModelConnection(
+	ctx context.Context, model *types.Model, appID, appSecret string,
+) (bool, string) {
+	instance, err := vlm.NewVLM(vlm.ConfigFromModel(model, appID, appSecret), h.ollamaService)
+	if err != nil {
+		return false, fmt.Sprintf("创建VLM实例失败: %v", err)
+	}
+
+	image, err := base64.StdEncoding.DecodeString(vlmConnectivityPNGBase64)
+	if err != nil {
+		return false, fmt.Sprintf("构造VLM测试图片失败: %v", err)
+	}
+	result, err := instance.Predict(ctx, [][]byte{image}, "Reply with OK only.")
+	if err != nil {
+		return false, fmt.Sprintf("VLM图片请求失败: %v", err)
+	}
+	if strings.TrimSpace(result) == "" {
+		return false, "VLM接口连接成功，但未返回图片理解结果"
+	}
+	return true, "连接正常，VLM图片请求可用"
 }
 
 // checkRerankModelConnection 使用 rerank 模块做一次最小化调用来测试连通性与鉴权。

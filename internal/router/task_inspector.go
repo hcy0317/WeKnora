@@ -32,6 +32,15 @@ type asynqTaskInspector struct {
 	redis     redis.UniversalClient
 }
 
+const processingOwnerRecoveryLeaseKeyPrefix = "weknora:processing-owner:"
+
+const releaseProcessingOwnerRecoveryLeaseScript = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`
+
 // NewAsynqTaskInspector returns a TaskInspector wrapping the given
 // *asynq.Inspector. nil-safe: a nil inspector degrades to a no-op so
 // the cancel path remains usable when the inspector failed to init.
@@ -175,7 +184,11 @@ func (a *asynqTaskInspector) HasQueuedTasksForKnowledge(
 	}
 	for _, queue := range queuesScanned {
 		for _, state := range a.cancellableTaskStates() {
-			if a.queueStateHasMatch(ctx, queue, state.name, state.list, matcher) {
+			matched, err := a.queueStateHasMatch(ctx, queue, state.name, state.list, matcher)
+			if err != nil {
+				return false, err
+			}
+			if matched {
 				return true, nil
 			}
 		}
@@ -632,6 +645,9 @@ func (a *asynqTaskInspector) GetRuntimeTask(
 	}
 	task, err := a.inspector.GetTaskInfo(queue, taskID)
 	if err != nil {
+		if errors.Is(err, asynq.ErrTaskNotFound) || errors.Is(err, asynq.ErrQueueNotFound) {
+			return nil, true, nil
+		}
 		return nil, true, err
 	}
 	workers := map[string]runtimeWorkerMetadata{}
@@ -643,6 +659,54 @@ func (a *asynqTaskInspector) GetRuntimeTask(
 		return nil, true, err
 	}
 	return &info, true, nil
+}
+
+// WithProcessingOwnerRecoveryLease serializes startup orphan recovery with
+// Wiki workers using the same logical processing-owner Redis key contract.
+// The callback is intentionally short-lived: it performs one exact task read
+// and one owner-fenced database CAS, so renewal is unnecessary.
+func (a *asynqTaskInspector) WithProcessingOwnerRecoveryLease(
+	ctx context.Context,
+	ref types.ProcessingOwnerRef,
+	owner types.TaskClaimOwner,
+	ttl time.Duration,
+	fn func() error,
+) (supported bool, acquired bool, err error) {
+	if a == nil || a.redis == nil {
+		return false, false, nil
+	}
+	if !ref.Valid() || !owner.Valid() || ttl <= 0 || fn == nil {
+		return true, false, errors.New("processing owner recovery lease: valid ref, owner, ttl and callback are required")
+	}
+	value, err := json.Marshal(owner)
+	if err != nil {
+		return true, false, fmt.Errorf("marshal processing owner recovery lease: %w", err)
+	}
+	key := fmt.Sprintf("%s%d:%s:%d:%s", processingOwnerRecoveryLeaseKeyPrefix,
+		ref.TenantID, ref.KnowledgeID, ref.Attempt, ref.Name)
+	acquired, err = a.redis.SetNX(ctx, key, string(value), ttl).Result()
+	if err != nil {
+		return true, false, fmt.Errorf("acquire processing owner recovery lease: %w", err)
+	}
+	if !acquired {
+		return true, false, nil
+	}
+	defer func() {
+		result, releaseErr := a.redis.Eval(
+			context.WithoutCancel(ctx), releaseProcessingOwnerRecoveryLeaseScript,
+			[]string{key}, string(value),
+		).Int64()
+		if releaseErr != nil {
+			releaseErr = fmt.Errorf("release processing owner recovery lease: %w", releaseErr)
+		} else if result != 1 {
+			releaseErr = errors.New("release processing owner recovery lease: ownership changed")
+		}
+		if err == nil {
+			err = releaseErr
+		}
+	}()
+	err = fn()
+	return true, true, err
 }
 
 // RunRuntimeTask moves a scheduled, retry, or archived task to pending. Asynq
@@ -960,34 +1024,34 @@ func (a *asynqTaskInspector) processQueueStateMatches(
 }
 
 // queueStateHasMatch pages through one (queue, state) list looking for a
-// matching task. It is strictly read-only and returns on the first hit. A
-// backend error is logged and treated as "no match" (false).
+// matching task. It is strictly read-only and returns on the first hit.
+// Backend errors propagate because callers use absence as orphan evidence.
 func (a *asynqTaskInspector) queueStateHasMatch(
 	ctx context.Context,
 	queue string,
 	state string,
 	list func(string, ...asynq.ListOption) ([]*asynq.TaskInfo, error),
 	matcher taskMatcher,
-) bool {
+) (bool, error) {
 	page := 1
 	for {
 		tasks, err := list(queue, asynq.PageSize(listPageSize), asynq.Page(page))
 		if err != nil {
-			if !errors.Is(err, asynq.ErrQueueNotFound) {
-				logger.Warnf(ctx, "[TaskInspector] probe %s queue=%s page=%d: %v", state, queue, page, err)
+			if errors.Is(err, asynq.ErrQueueNotFound) {
+				return false, nil
 			}
-			return false
+			return false, fmt.Errorf("probe %s queue=%s page=%d: %w", state, queue, page, err)
 		}
 		if len(tasks) == 0 {
-			return false
+			return false, nil
 		}
 		for _, task := range tasks {
 			if matcher(task.Type, task.Payload) {
-				return true
+				return true, nil
 			}
 		}
 		if len(tasks) < listPageSize {
-			return false
+			return false, nil
 		}
 		page++
 	}

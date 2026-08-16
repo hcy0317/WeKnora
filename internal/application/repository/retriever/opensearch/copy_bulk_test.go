@@ -73,7 +73,7 @@ func TestCopyIndices_ScanThenBatchSave(t *testing.T) {
 			mu.Lock()
 			bulkBody = string(b)
 			mu.Unlock()
-			_, _ = w.Write([]byte(`{"errors":false,"items":[]}`))
+			_, _ = w.Write([]byte(`{"errors":false,"items":[{"index":{"_id":"tgtChunk","status":201}}]}`))
 		default:
 			_, _ = w.Write([]byte(`{}`))
 		}
@@ -128,7 +128,7 @@ func TestBatchUpdateChunkEnabledStatus_GroupedUpdateByQuery(t *testing.T) {
 			mu.Lock()
 			bodies = append(bodies, string(b))
 			mu.Unlock()
-			_, _ = w.Write([]byte(`{"updated":1,"version_conflicts":0,"failures":[]}`))
+			_, _ = w.Write([]byte(`{"updated":1,"timed_out":false,"version_conflicts":0,"failures":[]}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{}`))
@@ -170,13 +170,13 @@ func TestBatchUpdateChunkEnabledStatus_Empty_NoOp(t *testing.T) {
 // asserting cluster-side reason text is NOT surfaced in the returned error.
 func TestInspectByQueryResponse(t *testing.T) {
 	t.Run("clean response", func(t *testing.T) {
-		body := strings.NewReader(`{"updated":5,"version_conflicts":0,"failures":[]}`)
+		body := strings.NewReader(`{"updated":5,"timed_out":false,"version_conflicts":0,"failures":[]}`)
 		if err := inspectByQueryResponse(body); err != nil {
 			t.Fatalf("want nil, got %v", err)
 		}
 	})
 	t.Run("failures do not leak reason", func(t *testing.T) {
-		body := strings.NewReader(`{"updated":1,"version_conflicts":0,"failures":[
+		body := strings.NewReader(`{"updated":1,"timed_out":false,"version_conflicts":0,"failures":[
 			{"id":"c9","cause":{"type":"version_conflict_engine_exception","reason":"SECRET document body leaked here"}}
 		]}`)
 		err := inspectByQueryResponse(body)
@@ -188,6 +188,24 @@ func TestInspectByQueryResponse(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "version_conflict_engine_exception") {
 			t.Errorf("error should surface bounded type: %v", err)
+		}
+	})
+	t.Run("timed out", func(t *testing.T) {
+		body := strings.NewReader(`{"updated":1,"timed_out":true,"version_conflicts":0,"failures":[]}`)
+		if err := inspectByQueryResponse(body); err == nil {
+			t.Fatal("want error for timed_out response")
+		}
+	})
+	t.Run("version conflicts", func(t *testing.T) {
+		body := strings.NewReader(`{"updated":1,"timed_out":false,"version_conflicts":1,"failures":[]}`)
+		if err := inspectByQueryResponse(body); err == nil {
+			t.Fatal("want error for version conflicts")
+		}
+	})
+	t.Run("unknown shape", func(t *testing.T) {
+		body := strings.NewReader(`{}`)
+		if err := inspectByQueryResponse(body); err == nil {
+			t.Fatal("want error for unknown by-query response shape")
 		}
 	})
 }

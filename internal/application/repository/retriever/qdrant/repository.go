@@ -27,6 +27,21 @@ const (
 	fieldIsEnabled        = "is_enabled"
 )
 
+func waitForQdrantCompletion() *bool {
+	wait := true
+	return &wait
+}
+
+func validateUpdateResult(result *qdrant.UpdateResult) error {
+	if result == nil {
+		return fmt.Errorf("qdrant write returned no result")
+	}
+	if result.Status != qdrant.UpdateStatus_Completed {
+		return fmt.Errorf("qdrant write did not complete (status=%s)", result.Status.String())
+	}
+	return nil
+}
+
 // NewQdrantRetrieveEngineRepository creates and initializes a new Qdrant repository.
 // indexCfg is optional — pass nil to use env var / default values (env path).
 func NewQdrantRetrieveEngineRepository(client *qdrant.Client, indexCfg *types.IndexConfig) interfaces.RetrieveEngineRepository {
@@ -188,12 +203,16 @@ func (q *qdrantRepository) Save(ctx context.Context,
 		Payload: createPayload(embeddingDB),
 	}
 
-	_, err := q.client.Upsert(ctx, &qdrant.UpsertPoints{
+	result, err := q.client.Upsert(ctx, &qdrant.UpsertPoints{
 		CollectionName: collectionName,
+		Wait:           waitForQdrantCompletion(),
 		Points:         []*qdrant.PointStruct{point},
 	})
 	if err != nil {
 		log.Errorf("[Qdrant] Failed to save index: %v", err)
+		return fmt.Errorf("failed to save index for chunk ID %s: %w", embedding.ChunkID, err)
+	}
+	if err := validateUpdateResult(result); err != nil {
 		return fmt.Errorf("failed to save index for chunk ID %s: %w", embedding.ChunkID, err)
 	}
 
@@ -255,11 +274,15 @@ func (q *qdrantRepository) BatchSave(ctx context.Context,
 			}
 			batch := points[i:end]
 
-			_, err := q.client.Upsert(ctx, &qdrant.UpsertPoints{
+			result, err := q.client.Upsert(ctx, &qdrant.UpsertPoints{
 				CollectionName: collectionName,
+				Wait:           waitForQdrantCompletion(),
 				Points:         batch,
 			})
 			if err != nil {
+				return fmt.Errorf("failed to upsert batch: %w", err)
+			}
+			if err := validateUpdateResult(result); err != nil {
 				return fmt.Errorf("failed to upsert batch: %w", err)
 			}
 		}
@@ -282,8 +305,9 @@ func (q *qdrantRepository) DeleteByChunkIDList(ctx context.Context, chunkIDList 
 	collectionName := q.getCollectionName(dimension)
 	log.Infof("[Qdrant] Deleting indices by chunk IDs from %s, count: %d", collectionName, len(chunkIDList))
 
-	_, err := q.client.Delete(ctx, &qdrant.DeletePoints{
+	result, err := q.client.Delete(ctx, &qdrant.DeletePoints{
 		CollectionName: collectionName,
+		Wait:           waitForQdrantCompletion(),
 		Points: qdrant.NewPointsSelectorFilter(&qdrant.Filter{
 			Must: []*qdrant.Condition{
 				qdrant.NewMatchKeywords(fieldChunkID, chunkIDList...),
@@ -292,6 +316,9 @@ func (q *qdrantRepository) DeleteByChunkIDList(ctx context.Context, chunkIDList 
 	})
 	if err != nil {
 		log.Errorf("[Qdrant] Failed to delete by chunk IDs: %v", err)
+		return fmt.Errorf("failed to delete by chunk IDs: %w", err)
+	}
+	if err := validateUpdateResult(result); err != nil {
 		return fmt.Errorf("failed to delete by chunk IDs: %w", err)
 	}
 
@@ -312,8 +339,9 @@ func (q *qdrantRepository) DeleteByKnowledgeIDList(ctx context.Context,
 	collectionName := q.getCollectionName(dimension)
 	log.Infof("[Qdrant] Deleting indices by knowledge IDs from %s, count: %d", collectionName, len(knowledgeIDList))
 
-	_, err := q.client.Delete(ctx, &qdrant.DeletePoints{
+	result, err := q.client.Delete(ctx, &qdrant.DeletePoints{
 		CollectionName: collectionName,
+		Wait:           waitForQdrantCompletion(),
 		Points: qdrant.NewPointsSelectorFilter(&qdrant.Filter{
 			Must: []*qdrant.Condition{
 				qdrant.NewMatchKeywords(fieldKnowledgeID, knowledgeIDList...),
@@ -322,6 +350,9 @@ func (q *qdrantRepository) DeleteByKnowledgeIDList(ctx context.Context,
 	})
 	if err != nil {
 		log.Errorf("[Qdrant] Failed to delete by knowledge IDs: %v", err)
+		return fmt.Errorf("failed to delete by knowledge IDs: %w", err)
+	}
+	if err := validateUpdateResult(result); err != nil {
 		return fmt.Errorf("failed to delete by knowledge IDs: %w", err)
 	}
 
@@ -342,8 +373,9 @@ func (q *qdrantRepository) DeleteBySourceIDList(ctx context.Context,
 	collectionName := q.getCollectionName(dimension)
 	log.Infof("[Qdrant] Deleting indices by source IDs from %s, count: %d", collectionName, len(sourceIDList))
 
-	_, err := q.client.Delete(ctx, &qdrant.DeletePoints{
+	result, err := q.client.Delete(ctx, &qdrant.DeletePoints{
 		CollectionName: collectionName,
+		Wait:           waitForQdrantCompletion(),
 		Points: qdrant.NewPointsSelectorFilter(&qdrant.Filter{
 			Must: []*qdrant.Condition{
 				qdrant.NewMatchKeywords(fieldSourceID, sourceIDList...),
@@ -352,6 +384,9 @@ func (q *qdrantRepository) DeleteBySourceIDList(ctx context.Context,
 	})
 	if err != nil {
 		log.Errorf("[Qdrant] Failed to delete by source IDs: %v", err)
+		return fmt.Errorf("failed to delete by source IDs: %w", err)
+	}
+	if err := validateUpdateResult(result); err != nil {
 		return fmt.Errorf("failed to delete by source IDs: %w", err)
 	}
 

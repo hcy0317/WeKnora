@@ -1,0 +1,4 @@
+interface:
+  display_name: "绵阳农科科研助手"
+  short_description: "面向绵阳农业科研知识库的严谨检索、证据核验、图谱关联与专业表达工作流"
+  default_prompt: "Use $mianyang-agri-research to answer this agricultural research question with traceable evidence."
