@@ -15,6 +15,7 @@ from docreader.auth import AuthInterceptor, TLSConfigError, load_tls_credentials
 from docreader import config
 from docreader.config import CONFIG
 from docreader.parser import Parser
+from docreader.parser.pptx_media import rasterize_media_bytes
 from docreader.proto import docreader_pb2_grpc
 from docreader.parser.registry import registry
 from docreader.proto.docreader_pb2 import (
@@ -29,6 +30,12 @@ from docreader.proto.docreader_pb2 import (
 from docreader.utils.request import init_logging_request_id, request_id_context
 
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+_VLM_SUPPORTED_IMAGE_MIMES = {
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+}
 
 
 def to_valid_utf8_text(s: Optional[str]) -> str:
@@ -92,6 +99,11 @@ def _resolve_images(
         fname = os.path.basename(ref_path) or f"{uuid.uuid4().hex}.png"
         ext = os.path.splitext(fname)[1].lower()
         mime = mime_map.get(ext, "application/octet-stream")
+        normalized = _normalize_image_for_vlm(fname, mime, img_bytes)
+        if normalized is None:
+            logger.warning("Skipping unsupported image that could not be rasterized: %s", ref_path)
+            continue
+        fname, mime, img_bytes = normalized
 
         refs.append(
             ImageRef(
@@ -121,6 +133,19 @@ def _mime_for_ref(ref_path: str) -> tuple[str, str]:
     return fname, mime_map.get(ext, "application/octet-stream")
 
 
+def _normalize_image_for_vlm(
+    filename: str, mime_type: str, image_data: bytes
+) -> tuple[str, str, bytes] | None:
+    """Return OpenAI-compatible image bytes, rasterizing vector media to PNG."""
+    if mime_type in _VLM_SUPPORTED_IMAGE_MIMES:
+        return filename, mime_type, image_data
+    png = rasterize_media_bytes(filename, image_data)
+    if not png:
+        return None
+    stem = os.path.splitext(filename)[0] or uuid.uuid4().hex
+    return f"{stem}.png", "image/png", png
+
+
 def _iter_image_refs(images: dict):
     """Yield ImageRef one at a time, freeing each source entry as we go.
 
@@ -138,6 +163,11 @@ def _iter_image_refs(images: dict):
             img_bytes = b64data.encode("utf-8") if isinstance(b64data, str) else b64data
         del b64data
         fname, mime = _mime_for_ref(ref_path)
+        normalized = _normalize_image_for_vlm(fname, mime, img_bytes)
+        if normalized is None:
+            logger.warning("Skipping unsupported image that could not be rasterized: %s", ref_path)
+            continue
+        fname, mime, img_bytes = normalized
         yield ImageRef(
             filename=fname,
             original_ref=ref_path,

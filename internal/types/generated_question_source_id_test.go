@@ -24,3 +24,29 @@ func TestGeneratedQuestionSourceID(t *testing.T) {
 		t.Fatal("source ID hashing is not deterministic")
 	}
 }
+
+func TestStableGeneratedQuestionIDUsesWholeLogicalIdentity(t *testing.T) {
+	base := StableGeneratedQuestionID("knowledge", "chunk", 4, 3, 2)
+	if base == "" {
+		t.Fatal("stable question ID must not be empty")
+	}
+	if got := StableGeneratedQuestionID("knowledge", "chunk", 4, 3, 2); got != base {
+		t.Fatalf("same logical identity changed: got %q want %q", got, base)
+	}
+	cases := []string{
+		StableGeneratedQuestionID("knowledge-2", "chunk", 4, 3, 2),
+		StableGeneratedQuestionID("knowledge", "chunk-2", 4, 3, 2),
+		StableGeneratedQuestionID("knowledge", "chunk", 5, 3, 2),
+		StableGeneratedQuestionID("knowledge", "chunk", 4, 4, 2),
+		StableGeneratedQuestionID("knowledge", "chunk", 4, 3, 3),
+	}
+	for _, candidate := range cases {
+		if candidate == base {
+			t.Fatalf("distinct logical identity collided with %q", base)
+		}
+	}
+	chunkID := "135bf11d-c20e-419a-9f3c-5288d6a0516b"
+	if got := GeneratedQuestionSourceID(chunkID, base); len(got) > maxGeneratedQuestionSourceIDLength {
+		t.Fatalf("source ID is too long: %d %q", len(got), got)
+	}
+}

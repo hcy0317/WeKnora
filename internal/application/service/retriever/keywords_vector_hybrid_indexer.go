@@ -2,6 +2,7 @@ package retriever
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"slices"
 	"strings"
@@ -99,6 +100,27 @@ func (v *KeywordsVectorHybridRetrieveEngineService) BatchIndex(ctx context.Conte
 		embeddings, err := batchEmbedWithBackoff(ctx, embedder, contentList)
 		if err != nil {
 			return err
+		}
+		if len(embeddings) != len(indexInfoList) {
+			failedIndex := len(embeddings)
+			if failedIndex >= len(indexInfoList) {
+				failedIndex = len(indexInfoList) - 1
+			}
+			failed := indexInfoList[failedIndex]
+			return fmt.Errorf(
+				"embedding count mismatch for source %s chunk %s: got %d, want %d",
+				failed.SourceID, failed.ChunkID, len(embeddings), len(indexInfoList),
+			)
+		}
+		expectedDimensions := embedder.GetDimensions()
+		for i, vector := range embeddings {
+			if len(vector) == 0 || len(vector) != expectedDimensions {
+				failed := indexInfoList[i]
+				return fmt.Errorf(
+					"embedding dimension mismatch for source %s chunk %s: got %d, want %d",
+					failed.SourceID, failed.ChunkID, len(vector), expectedDimensions,
+				)
+			}
 		}
 
 		batchSize := 40

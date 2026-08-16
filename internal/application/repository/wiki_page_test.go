@@ -2,8 +2,11 @@ package repository
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -106,6 +110,93 @@ func setupWikiPagesTestDB(t *testing.T) *gorm.DB {
 		require.NoError(t, db.Exec(stmt).Error)
 	}
 	return db
+}
+
+func TestWikiPageWriteGuardRejectsSupersededAttempt(t *testing.T) {
+	db := setupWikiPagesTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&types.KnowledgeBase{}, &types.Knowledge{}, &types.KnowledgeProcessingSpan{},
+	))
+	ctx := context.Background()
+	kbID := "kb-guard"
+	knowledgeID := "knowledge-guard"
+	require.NoError(t, db.Create(&types.KnowledgeBase{
+		ID: kbID, TenantID: 7, Name: "Guard",
+		IndexingStrategy: types.IndexingStrategy{WikiEnabled: true},
+	}).Error)
+	require.NoError(t, db.Create(&types.Knowledge{
+		ID: knowledgeID, TenantID: 7, KnowledgeBaseID: kbID,
+		ParseStatus: types.ParseStatusCompleted,
+	}).Error)
+	spanRepo := NewKnowledgeSpanRepository(db)
+	root := &types.KnowledgeProcessingSpan{
+		KnowledgeID: knowledgeID, SpanID: "root-1", Kind: types.SpanKindRoot,
+		Name: "knowledge_processing", Status: types.SpanStatusRunning,
+	}
+	attempt, err := spanRepo.OpenAttempt(ctx, root)
+	require.NoError(t, err)
+	_, err = spanRepo.OpenAttempt(ctx, &types.KnowledgeProcessingSpan{
+		KnowledgeID: knowledgeID, SpanID: "root-2", Kind: types.SpanKindRoot,
+		Name: "knowledge_processing", Status: types.SpanStatusRunning,
+	})
+	require.NoError(t, err)
+
+	repo := NewWikiPageRepository(db).(*wikiPageRepository)
+	page := makeWikiPage(kbID, "summary/knowledge-guard", types.WikiPageTypeSummary, types.WikiPageStatusDraft)
+	guardedCtx := types.WithWikiSourceAttemptGuards(ctx, []types.WikiSourceAttemptGuard{{
+		KnowledgeID: knowledgeID, Attempt: attempt,
+	}})
+
+	err = repo.CreateWithLinks(guardedCtx, page)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "superseded")
+	_, getErr := repo.GetBySlug(ctx, kbID, page.Slug)
+	require.ErrorIs(t, getErr, ErrWikiPageNotFound)
+}
+
+func TestWikiPageMaintenanceGuardRequiresCompletedKnowledgeInTargetBase(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		knowledgeKB string
+		status      string
+		wantErr     string
+	}{
+		{name: "completed member can publish", knowledgeKB: "kb-maintenance", status: types.ParseStatusCompleted},
+		{name: "moved member is rejected", knowledgeKB: "kb-moved-away", status: types.ParseStatusCompleted, wantErr: "record not found"},
+		{name: "processing member is rejected", knowledgeKB: "kb-maintenance", status: types.ParseStatusProcessing, wantErr: "knowledge is processing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupWikiPagesTestDB(t)
+			require.NoError(t, db.AutoMigrate(&types.KnowledgeBase{}, &types.Knowledge{}))
+			for _, kbID := range []string{"kb-maintenance", "kb-moved-away"} {
+				require.NoError(t, db.Create(&types.KnowledgeBase{
+					ID: kbID, TenantID: 7, Name: kbID,
+					IndexingStrategy: types.IndexingStrategy{WikiEnabled: true},
+				}).Error)
+			}
+			const knowledgeID = "knowledge-maintenance"
+			require.NoError(t, db.Create(&types.Knowledge{
+				ID: knowledgeID, TenantID: 7, KnowledgeBaseID: tc.knowledgeKB, ParseStatus: tc.status,
+			}).Error)
+
+			repo := NewWikiPageRepository(db).(*wikiPageRepository)
+			page := makeWikiPage("kb-maintenance", "summary/knowledge-maintenance", types.WikiPageTypeSummary, types.WikiPageStatusDraft)
+			guardedCtx := types.WithWikiSourceAttemptGuards(context.Background(), []types.WikiSourceAttemptGuard{{
+				KnowledgeID: knowledgeID, Attempt: 0,
+			}})
+
+			err := repo.CreateWithLinks(guardedCtx, page)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			_, getErr := repo.GetBySlug(context.Background(), "kb-maintenance", page.Slug)
+			require.ErrorIs(t, getErr, ErrWikiPageNotFound)
+		})
+	}
 }
 
 // makeWikiPage builds a minimal WikiPage suitable for insert. Title is
@@ -531,6 +622,239 @@ func TestUpdateWithRevisionIgnoresDuplicateSnapshot(t *testing.T) {
 	again.Version = 2
 	require.NoError(t, repo.UpdateWithRevision(ctx, &again, makeWikiRevision(page, 1, types.WikiEditSourceUser)))
 	assert.Equal(t, int64(1), countWikiRevisions(t, db, page.ID))
+}
+
+func TestUpdateMetaWithLinksUsesLockedSourceOutLinksAsDiffBaseline(t *testing.T) {
+	db := setupWikiPagesTestDB(t)
+	repo := NewWikiPageRepository(db).(*wikiPageRepository)
+	ctx := context.Background()
+	const kbID = "kb-stale-link-baseline"
+
+	targetA := makeWikiPage(kbID, "entity/a", types.WikiPageTypeEntity, types.WikiPageStatusPublished)
+	targetB := makeWikiPage(kbID, "entity/b", types.WikiPageTypeEntity, types.WikiPageStatusPublished)
+	targetC := makeWikiPage(kbID, "entity/c", types.WikiPageTypeEntity, types.WikiPageStatusPublished)
+	source := makeWikiPage(kbID, "entity/source", types.WikiPageTypeEntity, types.WikiPageStatusPublished)
+	source.OutLinks = types.StringArray{targetB.Slug}
+	targetB.InLinks = types.StringArray{source.Slug}
+	for _, page := range []*types.WikiPage{targetA, targetB, targetC, source} {
+		require.NoError(t, repo.Create(ctx, page))
+	}
+
+	// The caller read A before another committed writer changed source to B.
+	// The transaction must ignore this stale baseline and diff locked B -> C.
+	update := *source
+	update.OutLinks = types.StringArray{targetC.Slug}
+	require.NoError(t, repo.UpdateMetaWithLinks(ctx, &update, types.StringArray{targetA.Slug}))
+
+	storedB, err := repo.GetBySlug(ctx, kbID, targetB.Slug)
+	require.NoError(t, err)
+	storedC, err := repo.GetBySlug(ctx, kbID, targetC.Slug)
+	require.NoError(t, err)
+	require.Empty(t, storedB.InLinks)
+	require.Equal(t, types.StringArray{source.Slug}, storedC.InLinks)
+}
+
+func TestWikiLinkConcurrentSourceWritesDoNotLeaveGhostInboundLinksPostgres(t *testing.T) {
+	repo, db := setupPostgresWikiPageTestRepo(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	const kbID = "kb-pg-concurrent-links"
+
+	targetA := makeWikiPage(kbID, "entity/a", types.WikiPageTypeEntity, types.WikiPageStatusPublished)
+	targetB := makeWikiPage(kbID, "entity/b", types.WikiPageTypeEntity, types.WikiPageStatusPublished)
+	targetC := makeWikiPage(kbID, "entity/c", types.WikiPageTypeEntity, types.WikiPageStatusPublished)
+	source := makeWikiPage(kbID, "entity/source", types.WikiPageTypeEntity, types.WikiPageStatusPublished)
+	source.OutLinks = types.StringArray{targetA.Slug}
+	targetA.InLinks = types.StringArray{source.Slug}
+	for _, page := range []*types.WikiPage{targetA, targetB, targetC, source} {
+		require.NoError(t, repo.Create(ctx, page))
+	}
+
+	blocker := db.Begin()
+	require.NoError(t, blocker.Error)
+	require.NoError(t, blocker.Exec("SELECT id FROM wiki_pages WHERE id = ? FOR UPDATE", source.ID).Error)
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var entered sync.WaitGroup
+	entered.Add(2)
+	write := func(target string) {
+		defer entered.Done()
+		candidate := *source
+		candidate.OutLinks = types.StringArray{target}
+		<-start
+		results <- repo.UpdateMetaWithLinks(ctx, &candidate, types.StringArray{targetA.Slug})
+	}
+	go write(targetB.Slug)
+	go write(targetC.Slug)
+	close(start)
+	// Both goroutines have entered the repository call and are blocked on the
+	// same source row before the blocker is released.
+	time.Sleep(250 * time.Millisecond)
+	require.NoError(t, blocker.Commit().Error)
+	entered.Wait()
+	close(results)
+	for err := range results {
+		require.NoError(t, err)
+	}
+
+	storedSource, err := repo.GetBySlug(ctx, kbID, source.Slug)
+	require.NoError(t, err)
+	require.Len(t, storedSource.OutLinks, 1)
+	finalTarget := storedSource.OutLinks[0]
+	for _, target := range []*types.WikiPage{targetA, targetB, targetC} {
+		stored, getErr := repo.GetBySlug(ctx, kbID, target.Slug)
+		require.NoError(t, getErr)
+		if target.Slug == finalTarget {
+			require.Equal(t, types.StringArray{source.Slug}, stored.InLinks)
+		} else {
+			require.Empty(t, stored.InLinks, "non-final target %s retained a ghost edge", target.Slug)
+		}
+	}
+}
+
+func TestWikiLinkReciprocalConcurrentWritesUseOnePostgresLockOrder(t *testing.T) {
+	repo, _ := setupPostgresWikiPageTestRepo(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	const kbID = "kb-pg-reciprocal-links"
+
+	pageA := makeWikiPage(kbID, "entity/a", types.WikiPageTypeEntity, types.WikiPageStatusPublished)
+	pageB := makeWikiPage(kbID, "entity/b", types.WikiPageTypeEntity, types.WikiPageStatusPublished)
+	require.NoError(t, repo.Create(ctx, pageA))
+	require.NoError(t, repo.Create(ctx, pageB))
+
+	arrived := make(chan struct{}, 2)
+	release := make(chan struct{})
+	repo.testAfterWikiLinkSourceSerialized = func() {
+		arrived <- struct{}{}
+		<-release
+	}
+	t.Cleanup(func() { repo.testAfterWikiLinkSourceSerialized = nil })
+
+	results := make(chan error, 2)
+	write := func(source *types.WikiPage, target string) {
+		candidate := *source
+		candidate.OutLinks = types.StringArray{target}
+		results <- repo.UpdateMetaWithLinks(ctx, &candidate, nil)
+	}
+	go write(pageA, pageB.Slug)
+	go write(pageB, pageA.Slug)
+	<-arrived
+	<-arrived
+	close(release)
+
+	for i := 0; i < 2; i++ {
+		require.NoError(t, <-results, "reciprocal writes must not fail with PostgreSQL 40P01")
+	}
+	repo.testAfterWikiLinkSourceSerialized = nil
+
+	storedA, err := repo.GetBySlug(ctx, kbID, pageA.Slug)
+	require.NoError(t, err)
+	storedB, err := repo.GetBySlug(ctx, kbID, pageB.Slug)
+	require.NoError(t, err)
+	require.Equal(t, types.StringArray{pageB.Slug}, storedA.OutLinks)
+	require.Equal(t, types.StringArray{pageA.Slug}, storedB.OutLinks)
+	require.Equal(t, types.StringArray{pageB.Slug}, storedA.InLinks)
+	require.Equal(t, types.StringArray{pageA.Slug}, storedB.InLinks)
+}
+
+func TestWikiPageAttemptGuardSerializesWithOpenAttemptPostgres(t *testing.T) {
+	repo, db := setupPostgresWikiPageTestRepo(t)
+	require.NoError(t, db.AutoMigrate(
+		&types.KnowledgeBase{}, &types.Knowledge{}, &types.KnowledgeProcessingSpan{},
+	))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const (
+		kbID        = "kb-pg-attempt-guard"
+		knowledgeID = "knowledge-pg-attempt-guard"
+	)
+	require.NoError(t, db.Create(&types.KnowledgeBase{
+		ID: kbID, TenantID: 7, Name: "Attempt guard",
+		IndexingStrategy: types.IndexingStrategy{WikiEnabled: true},
+	}).Error)
+	require.NoError(t, db.Create(&types.Knowledge{
+		ID: knowledgeID, TenantID: 7, KnowledgeBaseID: kbID,
+		ParseStatus: types.ParseStatusCompleted,
+	}).Error)
+
+	spanRepo := NewKnowledgeSpanRepository(db)
+	attempt, err := spanRepo.OpenAttempt(ctx, &types.KnowledgeProcessingSpan{
+		KnowledgeID: knowledgeID, SpanID: "root-guard-1", Kind: types.SpanKindRoot,
+		Name: "knowledge_processing", Status: types.SpanStatusRunning,
+	})
+	require.NoError(t, err)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	repo.testAfterWikiLinkSourceSerialized = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() { repo.testAfterWikiLinkSourceSerialized = nil })
+
+	page := makeWikiPage(kbID, "summary/knowledge-pg-attempt-guard", types.WikiPageTypeSummary, types.WikiPageStatusDraft)
+	guardedCtx := types.WithWikiSourceAttemptGuards(ctx, []types.WikiSourceAttemptGuard{{
+		KnowledgeID: knowledgeID, Attempt: attempt,
+	}})
+	writeResult := make(chan error, 1)
+	go func() { writeResult <- repo.CreateWithLinks(guardedCtx, page) }()
+	<-entered
+
+	openResult := make(chan error, 1)
+	go func() {
+		_, openErr := spanRepo.OpenAttempt(ctx, &types.KnowledgeProcessingSpan{
+			KnowledgeID: knowledgeID, SpanID: "root-guard-2", Kind: types.SpanKindRoot,
+			Name: "knowledge_processing", Status: types.SpanStatusRunning,
+		})
+		openResult <- openErr
+	}()
+
+	select {
+	case openErr := <-openResult:
+		t.Fatalf("OpenAttempt crossed an in-flight guarded Wiki commit: %v", openErr)
+	case <-time.After(250 * time.Millisecond):
+		// The shared knowledge advisory lock is still held by the page transaction.
+	}
+	close(release)
+	require.NoError(t, <-writeResult)
+	require.NoError(t, <-openResult)
+	repo.testAfterWikiLinkSourceSerialized = nil
+
+	stored, err := repo.GetBySlug(ctx, kbID, page.Slug)
+	require.NoError(t, err)
+	require.Equal(t, page.ID, stored.ID)
+}
+
+func setupPostgresWikiPageTestRepo(t *testing.T) (*wikiPageRepository, *gorm.DB) {
+	t.Helper()
+	dsn := os.Getenv("WEKNORA_TEST_POSTGRES_DSN")
+	if dsn == "" || os.Getenv("WEKNORA_TEST_POSTGRES_EPHEMERAL") != "1" {
+		t.Skip("WEKNORA_TEST_POSTGRES_DSN is required for PostgreSQL integration tests")
+	}
+	base, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	baseSQL, err := base.DB()
+	require.NoError(t, err)
+	schema := fmt.Sprintf("g005_wiki_%d", time.Now().UnixNano())
+	require.NoError(t, base.Exec("CREATE SCHEMA "+schema).Error)
+	t.Cleanup(func() {
+		_ = base.Exec("DROP SCHEMA " + schema + " CASCADE").Error
+		_ = baseSQL.Close()
+	})
+	separator := "?"
+	if strings.Contains(dsn, "?") {
+		separator = "&"
+	}
+	db, err := gorm.Open(postgres.Open(dsn+separator+"search_path="+schema), &gorm.Config{})
+	require.NoError(t, err)
+	testSQL, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = testSQL.Close() })
+	require.NoError(t, db.AutoMigrate(&types.WikiPage{}, &types.WikiPageRevision{}))
+	return NewWikiPageRepository(db).(*wikiPageRepository), db
 }
 
 func TestPruneRevisionsKeepsHumanEditsUntilHardCap(t *testing.T) {

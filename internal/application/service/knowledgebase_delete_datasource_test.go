@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ type kbDeleteDSRepo struct {
 	byKB      map[string][]*types.DataSource
 	deleted   map[string]bool
 	deleteIDs []string
+	findErr   error
 }
 
 func newKBDeleteDSRepo(kbID string, ds ...*types.DataSource) *kbDeleteDSRepo {
@@ -48,6 +50,9 @@ func (r *kbDeleteDSRepo) FindByID(_ context.Context, id string) (*types.DataSour
 func (r *kbDeleteDSRepo) FindByKnowledgeBase(_ context.Context, kbID string) ([]*types.DataSource, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.findErr != nil {
+		return nil, r.findErr
+	}
 	var active []*types.DataSource
 	for _, ds := range r.byKB[kbID] {
 		if !r.deleted[ds.ID] {
@@ -107,7 +112,9 @@ var _ interfaces.SyncLogRepository = (*kbDeleteSyncLogRepo)(nil)
 
 type kbDeleteKBRepo struct {
 	fakeKBRepo
-	deletedID string
+	deletedID  string
+	prepared   *types.TaskPendingOp
+	prepareErr error
 }
 
 func (r *kbDeleteKBRepo) DeleteKnowledgeBase(_ context.Context, id string) error {
@@ -116,10 +123,33 @@ func (r *kbDeleteKBRepo) DeleteKnowledgeBase(_ context.Context, id string) error
 	return nil
 }
 
+func (r *kbDeleteKBRepo) PrepareKnowledgeBaseDeletion(
+	ctx context.Context, _ uint64, id string, op *types.TaskPendingOp,
+) error {
+	if r.prepareErr != nil {
+		return r.prepareErr
+	}
+	copy := *op
+	copy.Payload = append([]byte(nil), op.Payload...)
+	r.prepared = &copy
+	return r.DeleteKnowledgeBase(ctx, id)
+}
+
 type kbDeleteTaskEnqueuer struct{}
 
 func (kbDeleteTaskEnqueuer) Enqueue(_ *asynq.Task, _ ...asynq.Option) (*asynq.TaskInfo, error) {
 	return &asynq.TaskInfo{ID: "kb-delete-task"}, nil
+}
+
+type kbDeleteShareRepo struct {
+	interfaces.KBShareRepository
+	calls int
+	err   error
+}
+
+func (r *kbDeleteShareRepo) DeleteByKnowledgeBaseID(context.Context, string) error {
+	r.calls++
+	return r.err
 }
 
 func TestDeleteDataSourcesForKnowledgeBase(t *testing.T) {
@@ -215,6 +245,90 @@ func TestDeleteKnowledgeBaseContinuesWhenDataSourceCleanupFails(t *testing.T) {
 	err := svc.DeleteKnowledgeBase(ctxWithTenantStorage(1, "local"), kbID)
 	require.NoError(t, err)
 	assert.Equal(t, kbID, kbRepo.deletedID)
+}
+
+func TestProcessKBDeleteFailsClosedOnDataSourceRepositoryErrors(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		repo interfaces.DataSourceRepository
+		want string
+	}{
+		{
+			name: "find",
+			repo: &kbDeleteDSRepo{byKB: map[string][]*types.DataSource{}, deleted: map[string]bool{}, findErr: errors.New("find failed")},
+			want: "find failed",
+		},
+		{
+			name: "delete",
+			repo: &deleteErrDSRepo{
+				kbDeleteDSRepo: *newKBDeleteDSRepo("kb-worker", &types.DataSource{ID: "ds-1", KnowledgeBaseID: "kb-worker"}),
+				deleteErr:      errors.New("delete failed"),
+			},
+			want: "delete failed",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			svc := &knowledgeBaseService{dsRepo: test.repo, kgRepo: emptyKBKnowledgeRepo{}}
+			payload, err := json.Marshal(types.KBDeletePayload{TenantID: 7, KnowledgeBaseID: "kb-worker"})
+			require.NoError(t, err)
+
+			err = svc.ProcessKBDelete(context.Background(), asynq.NewTask(types.TypeKBDelete, payload))
+			require.ErrorContains(t, err, test.want)
+		})
+	}
+}
+
+func TestProcessKBDeleteReplaysRequestSideShareAndDataSourceCleanup(t *testing.T) {
+	const kbID = "kb-crash-after-prepare"
+	dsRepo := newKBDeleteDSRepo(kbID, &types.DataSource{ID: "ds-residue", KnowledgeBaseID: kbID})
+	shareRepo := &kbDeleteShareRepo{}
+	finalizer := &kbDeleteFinalizerRepo{}
+	acker := &kbDeleteOutboxAcker{}
+	svc := &knowledgeBaseService{
+		repo: finalizer, kgRepo: emptyKBKnowledgeRepo{}, taskPendingRepo: acker,
+		shareRepo: shareRepo, dsRepo: dsRepo,
+	}
+	payload, err := json.Marshal(types.KBDeletePayload{TenantID: 7, KnowledgeBaseID: kbID})
+	require.NoError(t, err)
+
+	require.NoError(t, svc.ProcessKBDelete(context.Background(), asynq.NewTask(types.TypeKBDelete, payload)))
+
+	assert.Equal(t, 1, shareRepo.calls)
+	assert.Equal(t, []string{"ds-residue"}, dsRepo.deleteIDs)
+	assert.Equal(t, 1, finalizer.finalizeCalls)
+	assert.Equal(t, 1, acker.calls)
+}
+
+func TestProcessKBDeleteAuthorizationFailureHasNoDestructiveSideEffects(t *testing.T) {
+	const kbID = "kb-active-or-forged"
+	canonical := types.KBDeletePayload{TenantID: 7, KnowledgeBaseID: kbID}
+	storeID := "forged-store"
+	for _, altered := range []types.KBDeletePayload{
+		{TenantID: 7, KnowledgeBaseID: kbID, VectorStoreID: &storeID},
+		{TenantID: 7, KnowledgeBaseID: kbID, DataSourceIDs: []string{"forged-ds"}},
+		{TenantID: 7, KnowledgeBaseID: kbID, EffectiveEngines: []types.RetrieverEngineParams{{RetrieverEngineType: "forged", RetrieverType: types.VectorRetrieverType}}},
+	} {
+		dsRepo := newKBDeleteDSRepo(kbID, &types.DataSource{ID: "ds-protected", KnowledgeBaseID: kbID})
+		shareRepo := &kbDeleteShareRepo{}
+		finalizer := &kbDeleteFinalizerRepo{expectedPayload: &canonical}
+		knowledgeRepo := &kbDeleteTrackingKnowledgeRepo{populatedKBKnowledgeRepo: populatedKBKnowledgeRepo{items: []*types.Knowledge{
+			{ID: "knowledge-protected", KnowledgeBaseID: kbID, EmbeddingModelID: "model"},
+		}}}
+		svc := &knowledgeBaseService{
+			repo: finalizer, kgRepo: knowledgeRepo, shareRepo: shareRepo, dsRepo: dsRepo,
+		}
+		payload, err := json.Marshal(altered)
+		require.NoError(t, err)
+
+		err = svc.ProcessKBDelete(context.Background(), asynq.NewTask(types.TypeKBDelete, payload))
+
+		require.ErrorContains(t, err, "authorize durable KB deletion")
+		assert.Equal(t, 1, finalizer.authorizeCalls)
+		assert.Zero(t, shareRepo.calls)
+		assert.Empty(t, dsRepo.deleteIDs)
+		assert.Zero(t, knowledgeRepo.deleteCalls)
+		assert.Zero(t, finalizer.finalizeCalls)
+	}
 }
 
 // deleteErrDSRepo injects a delete failure for testing best-effort cleanup.

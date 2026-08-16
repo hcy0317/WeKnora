@@ -3,6 +3,7 @@ package retriever
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/models/embedding"
@@ -14,6 +15,15 @@ type capturingEmbedder struct {
 	embedding.Embedder
 	text       string
 	batchTexts []string
+	batch      [][]float32
+	dimensions int
+}
+
+func (e *capturingEmbedder) GetDimensions() int {
+	if e.dimensions == 0 {
+		return 1
+	}
+	return e.dimensions
 }
 
 func (e *capturingEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
@@ -27,6 +37,9 @@ func (e *capturingEmbedder) BatchEmbedWithPool(
 	texts []string,
 ) ([][]float32, error) {
 	e.batchTexts = append([]string(nil), texts...)
+	if e.batch != nil {
+		return e.batch, nil
+	}
 	embeddings := make([][]float32, len(texts))
 	for i := range texts {
 		embeddings[i] = []float32{1}
@@ -36,6 +49,7 @@ func (e *capturingEmbedder) BatchEmbedWithPool(
 
 type saveOnlyRepository struct {
 	interfaces.RetrieveEngineRepository
+	batchSaveCalls atomic.Int32
 }
 
 func (r *saveOnlyRepository) Save(ctx context.Context, indexInfo *types.IndexInfo, params map[string]any) error {
@@ -47,7 +61,77 @@ func (r *saveOnlyRepository) BatchSave(
 	indexInfoList []*types.IndexInfo,
 	params map[string]any,
 ) error {
+	r.batchSaveCalls.Add(1)
 	return nil
+}
+
+func TestBatchIndexRejectsInvalidVectorBatchBeforeRepositorySave(t *testing.T) {
+	testCases := []struct {
+		name       string
+		embeddings [][]float32
+	}{
+		{name: "empty vector", embeddings: [][]float32{{1, 2}, {}}},
+		{name: "count mismatch", embeddings: [][]float32{{1, 2}}},
+		{name: "short vector", embeddings: [][]float32{{1, 2}, {3}}},
+		{name: "long vector", embeddings: [][]float32{{1, 2}, {3, 4, 5}}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			repository := &saveOnlyRepository{}
+			service := &KeywordsVectorHybridRetrieveEngineService{indexRepository: repository}
+			err := service.BatchIndex(context.Background(), &capturingEmbedder{
+				batch: testCase.embeddings, dimensions: 2,
+			}, []*types.IndexInfo{
+				{Content: "valid", SourceID: "source-1", ChunkID: "chunk-1"},
+				{Content: "sensitive content", SourceID: "source-2", ChunkID: "chunk-2"},
+			}, []types.RetrieverType{types.VectorRetrieverType})
+
+			if err == nil {
+				t.Fatal("BatchIndex returned nil error")
+			}
+			if !strings.Contains(err.Error(), "source-2") || !strings.Contains(err.Error(), "chunk-2") {
+				t.Fatalf("error lacks safe failing identity: %v", err)
+			}
+			if strings.Contains(err.Error(), "sensitive content") {
+				t.Fatalf("error leaks content: %v", err)
+			}
+			if got := repository.batchSaveCalls.Load(); got != 0 {
+				t.Fatalf("BatchSave calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestBatchIndexValidVectorsContinueToRepository(t *testing.T) {
+	repository := &saveOnlyRepository{}
+	service := &KeywordsVectorHybridRetrieveEngineService{indexRepository: repository}
+	err := service.BatchIndex(context.Background(), &capturingEmbedder{batch: [][]float32{{1}, {2}}}, []*types.IndexInfo{
+		{SourceID: "source-1", ChunkID: "chunk-1"},
+		{SourceID: "source-2", ChunkID: "chunk-2"},
+	}, []types.RetrieverType{types.VectorRetrieverType})
+
+	if err != nil {
+		t.Fatalf("BatchIndex returned error: %v", err)
+	}
+	if got := repository.batchSaveCalls.Load(); got != 1 {
+		t.Fatalf("BatchSave calls = %d, want 1", got)
+	}
+}
+
+func TestBatchIndexKeywordOnlyAllowsNoEmbeddings(t *testing.T) {
+	repository := &saveOnlyRepository{}
+	service := &KeywordsVectorHybridRetrieveEngineService{indexRepository: repository}
+	err := service.BatchIndex(context.Background(), &capturingEmbedder{batch: [][]float32{}}, []*types.IndexInfo{
+		{SourceID: "source-1", ChunkID: "chunk-1"},
+	}, []types.RetrieverType{types.KeywordsRetrieverType})
+
+	if err != nil {
+		t.Fatalf("BatchIndex returned error: %v", err)
+	}
+	if got := repository.batchSaveCalls.Load(); got != 1 {
+		t.Fatalf("BatchSave calls = %d, want 1", got)
+	}
 }
 
 func TestIndexRemovesInlineImagePayloadBeforeEmbedding(t *testing.T) {

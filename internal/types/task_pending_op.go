@@ -49,12 +49,59 @@ type TaskPendingOp struct {
 	// but useful for ops queries like "rows older than 1h that never
 	// drained".
 	EnqueuedAt time.Time `json:"enqueued_at"`
-	// Optional claim timestamp for future locking workflows. Not used
-	// in the current revision: consumers rely on external mutual
-	// exclusion (e.g. wiki:active:<kbID> Redis SetNX). Reserved column
-	// so future no-lock parallel workers can flip it inside a row-level
-	// lock without another migration.
+	// Claim start timestamp. It remains stable for an ownership term;
+	// renewable liveness is recorded separately in ClaimHeartbeatAt.
 	ClaimedAt *time.Time `json:"claimed_at,omitempty"`
+	// ClaimToken is the stable fencing token for one claim ownership term.
+	// It never changes during renewal; a successor claim always receives a
+	// different token so delayed workers cannot release or acknowledge it.
+	ClaimToken string `json:"claim_token,omitempty" gorm:"type:varchar(64)"`
+	// ClaimedByTaskID binds the durable claim to the concrete Asynq delivery.
+	ClaimedByTaskID string `json:"claimed_by_task_id,omitempty" gorm:"type:varchar(255)"`
+	// ClaimHeartbeatAt advances while the owner is alive. Stale recovery uses
+	// this timestamp rather than mutating ClaimToken on every renewal.
+	ClaimHeartbeatAt *time.Time `json:"claim_heartbeat_at,omitempty"`
+}
+
+// TaskClaimOwner is the immutable identity of one pending-op claim term.
+type TaskClaimOwner struct {
+	Token  string `json:"token"`
+	TaskID string `json:"task_id"`
+}
+
+func (o TaskClaimOwner) Valid() bool {
+	return o.Token != "" && o.TaskID != ""
+}
+
+// TaskPendingOpClaimSnapshot is the fail-closed owner evidence for one
+// logical dedup key. Consistent is false when rows disagree on ownership.
+type TaskPendingOpClaimSnapshot struct {
+	Found           bool       `json:"found"`
+	Consistent      bool       `json:"consistent"`
+	RowIDs          []int64    `json:"row_ids"`
+	ClaimToken      string     `json:"claim_token,omitempty"`
+	ClaimedByTaskID string     `json:"claimed_by_task_id,omitempty"`
+	ClaimedAt       *time.Time `json:"claimed_at,omitempty"`
+	HeartbeatAt     *time.Time `json:"heartbeat_at,omitempty"`
+}
+
+// ProcessingOwnerRef is the stable logical worker identity used by the
+// short-lived processing lease consulted by stalled-owner evaluation.
+type ProcessingOwnerRef struct {
+	TenantID    uint64 `json:"tenant_id"`
+	KnowledgeID string `json:"knowledge_id"`
+	Attempt     int    `json:"attempt"`
+	Name        string `json:"name"`
+}
+
+func (r ProcessingOwnerRef) Valid() bool {
+	return r.KnowledgeID != "" && r.Attempt > 0 && r.Name != ""
+}
+
+type ProcessingOwnerLeaseSnapshot struct {
+	Active bool           `json:"active"`
+	Owner  TaskClaimOwner `json:"owner"`
+	TTL    time.Duration  `json:"ttl"`
 }
 
 // TableName binds TaskPendingOp to the `task_pending_ops` table.

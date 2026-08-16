@@ -159,8 +159,8 @@
 
                       <div class="form-item" data-guide="kb-create-name">
                         <label class="form-label required">{{ $t('knowledgeEditor.basic.nameLabel') }}</label>
-                        <t-input 
-                          v-model="formData.name" 
+                        <t-input
+                          v-model="formData.name"
                           :placeholder="$t('knowledgeEditor.basic.namePlaceholder')"
                           :maxlength="50"
                         />
@@ -819,14 +819,14 @@ const loadAllModels = async (force = false) => {
 const loadKBData = async (kbIdOverride?: string) => {
   const kbId = kbIdOverride ?? activeKbId.value
   if (editorMode.value !== 'edit' || !kbId) return
-  
+
   loading.value = true
   try {
     const [kbInfo, filesResult] = await Promise.all([
       getKnowledgeBaseById(kbId),
       listKnowledgeFiles(kbId, { page: 1, page_size: 1 })
     ])
-    
+
     if (!kbInfo || !kbInfo.data) {
       throw new Error(t('knowledgeEditor.messages.notFound'))
     }
@@ -1116,6 +1116,9 @@ const handleQuestionGenerationUpdate = (config: any) => {
 const handleNodeExtractUpdate = (config: any) => {
   if (formData.value) {
     formData.value.nodeExtractConfig = { ...config }
+    if (formData.value.indexingStrategy) {
+      formData.value.indexingStrategy.graphEnabled = !!config.enabled
+    }
   }
 }
 
@@ -1165,6 +1168,30 @@ const validateForm = (): boolean => {
     MessagePlugin.warning(t('knowledgeEditor.messages.indexModeRequired'))
     currentSection.value = 'faq'
     return false
+  }
+
+  // The backend requires a complete few-shot example whenever entity-relation
+  // extraction is enabled. Validate it before the first of the two update
+  // requests so a rejected graph config cannot leave a partially saved KB.
+  const graphConfig = formData.value.nodeExtractConfig
+  if (graphConfig?.enabled) {
+    const graphTextComplete = typeof graphConfig.text === 'string' && !!graphConfig.text.trim()
+    const graphTagsComplete = Array.isArray(graphConfig.tags) && graphConfig.tags.length > 0 &&
+      graphConfig.tags.every((tag: string) => typeof tag === 'string' && !!tag.trim())
+    const graphNodesComplete = Array.isArray(graphConfig.nodes) && graphConfig.nodes.length > 0 &&
+      graphConfig.nodes.every((node: any) => typeof node?.name === 'string' && !!node.name.trim())
+    const graphRelationsComplete = Array.isArray(graphConfig.relations) && graphConfig.relations.length > 0 &&
+      graphConfig.relations.every((relation: any) =>
+        typeof relation?.node1 === 'string' && !!relation.node1.trim() &&
+        typeof relation?.node2 === 'string' && !!relation.node2.trim() &&
+        typeof relation?.type === 'string' && !!relation.type.trim()
+      )
+
+    if (!graphTextComplete || !graphTagsComplete || !graphNodesComplete || !graphRelationsComplete) {
+      MessagePlugin.warning(t('graphSettings.configIncomplete'))
+      currentSection.value = 'graph'
+      return false
+    }
   }
 
   return true
@@ -1539,15 +1566,15 @@ watch(() => props.visible, async (newVal) => {
   if (newVal) {
     // 打开弹窗时，先重置状态
     resetState()
-    
+
     // 检查是否有初始 section，如果有则跳转
     if (uiStore.kbEditorInitialSection) {
       currentSection.value = uiStore.kbEditorInitialSection
     }
-    
+
     // 加载模型列表与空间默认存储引擎（创建 KB 时即使用，不依赖是否打开「存储引擎」Tab）
     await Promise.all([loadAllModels(), loadTenantDefaultStorageProvider()])
-    
+
     // 根据模式加载数据
     if (props.mode === 'edit' && props.kbId) {
       await loadKBData()

@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -53,6 +54,51 @@ func sqliteTestIndex(chunkID, knowledgeBaseID, knowledgeID, tagID string, enable
 		KnowledgeBaseID: knowledgeBaseID,
 		TagID:           tagID,
 		IsEnabled:       enabled,
+	}
+}
+
+func sqliteSurfaceCounts(t *testing.T, repository *sqliteRepository, info *types.IndexInfo, dim int) (int64, int64, int64) {
+	t.Helper()
+	var metadataCount, ftsCount, vecCount int64
+	require.NoError(t, repository.db.Model(&sqliteEmbedding{}).
+		Where("source_id = ? AND source_type = ?", info.SourceID, int(info.SourceType)).
+		Count(&metadataCount).Error)
+	require.NoError(t, repository.db.Raw("SELECT count(*) FROM lite_embeddings_fts").Scan(&ftsCount).Error)
+	require.NoError(t, repository.db.Raw(
+		fmt.Sprintf("SELECT count(*) FROM %s", vecTableName(dim)),
+	).Scan(&vecCount).Error)
+	return metadataCount, ftsCount, vecCount
+}
+
+func requireSQLiteSurfaceCounts(t *testing.T, repository *sqliteRepository, info *types.IndexInfo, dim int, want int64) {
+	t.Helper()
+	metadataCount, ftsCount, vecCount := sqliteSurfaceCounts(t, repository, info, dim)
+	assert.Equal(t, want, metadataCount, "metadata count")
+	assert.Equal(t, want, ftsCount, "FTS count")
+	assert.Equal(t, want, vecCount, "vector count")
+}
+
+func failSQLiteRawSQL(t *testing.T, repository *sqliteRepository, fragment string) func() {
+	t.Helper()
+	name := "test:fail_raw:" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
+	require.NoError(t, repository.db.Callback().Raw().Before("gorm:raw").Register(name, func(db *gorm.DB) {
+		if strings.Contains(db.Statement.SQL.String(), fragment) {
+			db.AddError(errors.New("injected raw SQL failure"))
+		}
+	}))
+	return func() {
+		require.NoError(t, repository.db.Callback().Raw().Remove(name))
+	}
+}
+
+func failSQLiteMetadataDelete(t *testing.T, repository *sqliteRepository) func() {
+	t.Helper()
+	name := "test:fail_delete:" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
+	require.NoError(t, repository.db.Callback().Delete().Before("gorm:delete").Register(name, func(db *gorm.DB) {
+		db.AddError(errors.New("injected metadata delete failure"))
+	}))
+	return func() {
+		require.NoError(t, repository.db.Callback().Delete().Remove(name))
 	}
 }
 
@@ -185,4 +231,144 @@ func TestRetrieveReturnsKeywordQueryError(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, results)
 	assert.Contains(t, err.Error(), "FTS5 query failed")
+}
+
+func TestSaveAndBatchSaveRollbackAllSurfacesAndRetry(t *testing.T) {
+	saveMethods := map[string]func(*sqliteRepository, *types.IndexInfo, map[string]any) error{
+		"Save": func(repository *sqliteRepository, info *types.IndexInfo, params map[string]any) error {
+			return repository.Save(context.Background(), info, params)
+		},
+		"BatchSave": func(repository *sqliteRepository, info *types.IndexInfo, params map[string]any) error {
+			return repository.BatchSave(context.Background(), []*types.IndexInfo{info}, params)
+		},
+	}
+	failures := map[string]string{
+		"FTS":    "INSERT INTO lite_embeddings_fts",
+		"vector": "INSERT INTO vec_embeddings_2",
+	}
+
+	for methodName, save := range saveMethods {
+		for failureName, fragment := range failures {
+			t.Run(methodName+"/"+failureName, func(t *testing.T) {
+				repository := newSQLiteRetrieverTestRepository(t)
+				repository.ensureVecTable(2)
+				require.True(t, repository.vecTables[2])
+				info := sqliteTestIndex("atomic-save", "kb", "knowledge", "tag", true)
+				params := map[string]any{"embedding": map[string][]float32{info.SourceID: {1, 0}}}
+				removeFailure := failSQLiteRawSQL(t, repository, fragment)
+
+				err := save(repository, info, params)
+
+				require.Error(t, err)
+				requireSQLiteSurfaceCounts(t, repository, info, 2, 0)
+				removeFailure()
+				require.NoError(t, save(repository, info, params))
+				requireSQLiteSurfaceCounts(t, repository, info, 2, 1)
+			})
+		}
+	}
+}
+
+func TestSaveAndBatchSaveRepairExistingMetadataIndexes(t *testing.T) {
+	saveMethods := map[string]func(*sqliteRepository, *types.IndexInfo, map[string]any) error{
+		"Save": func(repository *sqliteRepository, info *types.IndexInfo, params map[string]any) error {
+			return repository.Save(context.Background(), info, params)
+		},
+		"BatchSave": func(repository *sqliteRepository, info *types.IndexInfo, params map[string]any) error {
+			return repository.BatchSave(context.Background(), []*types.IndexInfo{info}, params)
+		},
+	}
+
+	for methodName, save := range saveMethods {
+		t.Run(methodName, func(t *testing.T) {
+			repository := newSQLiteRetrieverTestRepository(t)
+			repository.ensureVecTable(2)
+			require.True(t, repository.vecTables[2])
+			info := sqliteTestIndex("repair-existing", "kb", "knowledge", "tag", true)
+			row := toSQLiteEmbedding(info)
+			row.Dimension = 2
+			require.NoError(t, repository.db.Create(row).Error)
+			metadataCount, ftsCount, vecCount := sqliteSurfaceCounts(t, repository, info, 2)
+			assert.Equal(t, int64(1), metadataCount)
+			assert.Zero(t, ftsCount)
+			assert.Zero(t, vecCount)
+
+			require.NoError(t, save(repository, info, map[string]any{
+				"embedding": map[string][]float32{info.SourceID: {1, 0}},
+			}))
+
+			requireSQLiteSurfaceCounts(t, repository, info, 2, 1)
+		})
+	}
+}
+
+func TestDeleteMethodsRollbackAllSurfacesAndRetry(t *testing.T) {
+	deleteMethods := map[string]func(*sqliteRepository, *types.IndexInfo) error{
+		"chunk": func(repository *sqliteRepository, info *types.IndexInfo) error {
+			return repository.DeleteByChunkIDList(context.Background(), []string{info.ChunkID}, 0, "")
+		},
+		"knowledge": func(repository *sqliteRepository, info *types.IndexInfo) error {
+			return repository.DeleteByKnowledgeIDList(context.Background(), []string{info.KnowledgeID}, 0, "")
+		},
+		"source": func(repository *sqliteRepository, info *types.IndexInfo) error {
+			return repository.DeleteBySourceIDList(context.Background(), []string{info.SourceID}, 0, "")
+		},
+	}
+
+	for methodName, deleteMethod := range deleteMethods {
+		for _, failureName := range []string{"vector", "FTS", "metadata"} {
+			t.Run(methodName+"/"+failureName, func(t *testing.T) {
+				repository := newSQLiteRetrieverTestRepository(t)
+				info := sqliteTestIndex("atomic-delete", "kb", "knowledge", "tag", true)
+				saveSQLiteTestVector(t, repository, info, []float32{1, 0})
+				requireSQLiteSurfaceCounts(t, repository, info, 2, 1)
+
+				var removeFailure func()
+				switch failureName {
+				case "vector":
+					removeFailure = failSQLiteRawSQL(t, repository, "DELETE FROM vec_embeddings_2")
+				case "FTS":
+					removeFailure = failSQLiteRawSQL(t, repository, "DELETE FROM lite_embeddings_fts")
+				case "metadata":
+					removeFailure = failSQLiteMetadataDelete(t, repository)
+				}
+
+				err := deleteMethod(repository, info)
+
+				require.Error(t, err)
+				requireSQLiteSurfaceCounts(t, repository, info, 2, 1)
+				removeFailure()
+				require.NoError(t, deleteMethod(repository, info))
+				requireSQLiteSurfaceCounts(t, repository, info, 2, 0)
+			})
+		}
+	}
+}
+
+func TestBatchSavePersistsKeywordAndVectorIndices(t *testing.T) {
+	repository := newSQLiteRetrieverTestRepository(t)
+	info := sqliteTestIndex("batch-success", "kb", "knowledge", "tag", true)
+	require.NoError(t, repository.BatchSave(context.Background(), []*types.IndexInfo{info}, map[string]any{
+		"embedding": map[string][]float32{info.SourceID: {1, 0}},
+	}))
+
+	keywordResults, err := repository.Retrieve(context.Background(), types.RetrieveParams{
+		Query:         "batch-success",
+		TopK:          1,
+		RetrieverType: types.KeywordsRetrieverType,
+	})
+	require.NoError(t, err)
+	require.Len(t, keywordResults, 1)
+	require.Len(t, keywordResults[0].Results, 1)
+	assert.Equal(t, info.ChunkID, keywordResults[0].Results[0].ChunkID)
+
+	vectorResults, err := repository.Retrieve(context.Background(), types.RetrieveParams{
+		Embedding:     []float32{1, 0},
+		TopK:          1,
+		RetrieverType: types.VectorRetrieverType,
+	})
+	require.NoError(t, err)
+	require.Len(t, vectorResults, 1)
+	require.Len(t, vectorResults[0].Results, 1)
+	assert.Equal(t, info.ChunkID, vectorResults[0].Results[0].ChunkID)
 }

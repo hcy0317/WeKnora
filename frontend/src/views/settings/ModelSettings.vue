@@ -213,6 +213,7 @@ function convertToLegacyFormat(model: ModelConfig) {
     lkeapRegion: model.parameters.extra_config?.region || 'ap-guangzhou',
     // 原始存库值，编辑弹窗内再 resolve（避免打开时被推断值覆盖）
     thinkingControl: model.parameters.extra_config?.thinking_control,
+    reasoningEffort: model.parameters.extra_config?.reasoning_effort || '',
     _modelType: backendTypeToModelType[model.type] || 'chat' as ModelType,
     // Preserve the credential metadata map so the editor dialog can render
     // the "Configured" state without an extra round-trip.
@@ -440,6 +441,14 @@ const handleModelSave = async (modelData: any) => {
       && modelData.thinkingControl
     ) {
       extraConfig.thinking_control = modelData.thinkingControl
+    }
+    if (
+      (saveType === 'chat' || saveType === 'vllm')
+      && modelData.source === 'remote'
+      && typeof modelData.reasoningEffort === 'string'
+      && modelData.reasoningEffort.trim()
+    ) {
+      extraConfig.reasoning_effort = modelData.reasoningEffort.trim()
     }
     const extraConfigFields = Object.keys(extraConfig).length > 0
       ? { extra_config: extraConfig }

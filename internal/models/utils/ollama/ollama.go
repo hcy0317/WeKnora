@@ -3,6 +3,7 @@ package ollama
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -22,13 +23,18 @@ type OllamaService struct {
 	baseURL     string
 	mu          sync.Mutex
 	isAvailable bool
-	isOptional  bool // Added: marks if Ollama service is optional
+}
+
+func ollamaEndpointLabel(parsedURL *url.URL) string {
+	if parsedURL == nil {
+		return "invalid"
+	}
+	return (&url.URL{Scheme: parsedURL.Scheme, Host: parsedURL.Host}).String()
 }
 
 // GetOllamaService gets Ollama service instance (singleton pattern)
 func GetOllamaService() (*OllamaService, error) {
-	// Get Ollama base URL from environment variable, if not set use provided baseURL or default value
-	logger.GetLogger(context.Background()).Infof("Ollama base URL: %s", os.Getenv("OLLAMA_BASE_URL"))
+	// Get Ollama base URL from environment variable, if not set use the local default.
 	baseURL := "http://localhost:11434"
 	envURL := os.Getenv("OLLAMA_BASE_URL")
 	if envURL != "" {
@@ -38,8 +44,10 @@ func GetOllamaService() (*OllamaService, error) {
 	// Create URL object
 	parsedURL, err := url.Parse(baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid Ollama service URL: %w", err)
+		return nil, errors.New("invalid Ollama service URL")
 	}
+	endpoint := ollamaEndpointLabel(parsedURL)
+	logger.GetLogger(context.Background()).Infof("Ollama endpoint: %s", endpoint)
 
 	// Dedicated HTTP client for Ollama instead of http.DefaultClient.
 	// - Dial timeout prevents hanging when Ollama process is down or port unreachable
@@ -54,44 +62,39 @@ func GetOllamaService() (*OllamaService, error) {
 	}
 	client := api.NewClient(parsedURL, ollamaHTTPClient)
 
-	// Check if Ollama is set as optional
-	isOptional := false
 	if os.Getenv("OLLAMA_OPTIONAL") == "true" {
-		isOptional = true
-		logger.GetLogger(context.Background()).Info("Ollama service set to optional mode")
+		logger.GetLogger(context.Background()).Info(
+			"Ollama is optional for application bootstrap; runtime provider operations still fail closed",
+		)
 	}
 
 	service := &OllamaService{
-		client:     client,
-		baseURL:    baseURL,
-		isOptional: isOptional,
+		client:  client,
+		baseURL: baseURL,
 	}
 
 	return service, nil
 }
 
-// StartService checks if Ollama service is available
-func (s *OllamaService) StartService(ctx context.Context) error {
+func (s *OllamaService) checkAvailability(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check if service is available
 	err := s.client.Heartbeat(ctx)
 	if err != nil {
-		logger.GetLogger(ctx).Warnf("ollama service unavailable: %v", err)
 		s.isAvailable = false
-
-		// If configured as optional, don't return an error
-		if s.isOptional {
-			logger.GetLogger(ctx).Info("ollama service set as optional, will continue running the application")
-			return nil
-		}
-
 		return fmt.Errorf("ollama service unavailable: %w", err)
 	}
 
 	s.isAvailable = true
 	return nil
+}
+
+// StartService performs a real provider health check. Bootstrap code may decide
+// whether that error is fatal, but runtime handlers must never receive a false
+// success merely because OLLAMA_OPTIONAL was configured.
+func (s *OllamaService) StartService(ctx context.Context) error {
+	return s.checkAvailability(ctx)
 }
 
 // IsAvailable returns whether the service is available
@@ -103,14 +106,8 @@ func (s *OllamaService) IsAvailable() bool {
 
 // IsModelAvailable checks if a model is available
 func (s *OllamaService) IsModelAvailable(ctx context.Context, modelName string) (bool, error) {
-	// First check if the service is available
-	if err := s.StartService(ctx); err != nil {
+	if err := s.checkAvailability(ctx); err != nil {
 		return false, err
-	}
-
-	// If service is not available but set as optional, return false but no error
-	if !s.isAvailable && s.isOptional {
-		return false, nil
 	}
 
 	// Get model list
@@ -136,17 +133,6 @@ func (s *OllamaService) IsModelAvailable(ctx context.Context, modelName string) 
 
 // PullModel pulls a model
 func (s *OllamaService) PullModel(ctx context.Context, modelName string) error {
-	// First check if the service is available
-	if err := s.StartService(ctx); err != nil {
-		return err
-	}
-
-	// If service is not available but set as optional, return nil without further operations
-	if !s.isAvailable && s.isOptional {
-		logger.GetLogger(ctx).Warnf("Ollama service unavailable, unable to pull model %s", modelName)
-		return nil
-	}
-
 	// Check if model already exists
 	available, err := s.IsModelAvailable(ctx, modelName)
 	if err != nil {
@@ -188,19 +174,8 @@ func (s *OllamaService) PullModel(ctx context.Context, modelName string) error {
 
 // EnsureModelAvailable ensures the model is available, pulls it if not available
 func (s *OllamaService) EnsureModelAvailable(ctx context.Context, modelName string) error {
-	// If service is not available but set as optional, return nil directly
-	if !s.IsAvailable() && s.isOptional {
-		logger.GetLogger(ctx).Warnf("Ollama service unavailable, skipping ensuring model %s availability", modelName)
-		return nil
-	}
-
 	available, err := s.IsModelAvailable(ctx, modelName)
 	if err != nil {
-		if s.isOptional {
-			logger.GetLogger(ctx).
-				Warnf("Failed to check model %s availability, but Ollama is set as optional", modelName)
-			return nil
-		}
 		return err
 	}
 
@@ -213,9 +188,8 @@ func (s *OllamaService) EnsureModelAvailable(ctx context.Context, modelName stri
 
 // GetVersion gets Ollama version
 func (s *OllamaService) GetVersion(ctx context.Context) (string, error) {
-	// If service is not available but set as optional, return empty version info
-	if !s.IsAvailable() && s.isOptional {
-		return "unavailable", nil
+	if err := s.checkAvailability(ctx); err != nil {
+		return "", err
 	}
 
 	version, err := s.client.Version(ctx)
@@ -329,8 +303,7 @@ func IsValidModelName(name string) bool {
 
 // Chat uses Ollama chat
 func (s *OllamaService) Chat(ctx context.Context, req *api.ChatRequest, fn api.ChatResponseFunc) error {
-	// First check if service is available
-	if err := s.StartService(ctx); err != nil {
+	if err := s.checkAvailability(ctx); err != nil {
 		return err
 	}
 
@@ -340,8 +313,7 @@ func (s *OllamaService) Chat(ctx context.Context, req *api.ChatRequest, fn api.C
 
 // Embeddings gets text embedding vectors
 func (s *OllamaService) Embeddings(ctx context.Context, req *api.EmbedRequest) (*api.EmbedResponse, error) {
-	// First check if service is available
-	if err := s.StartService(ctx); err != nil {
+	if err := s.checkAvailability(ctx); err != nil {
 		return nil, err
 	}
 	// Use official client Embed method
@@ -350,8 +322,7 @@ func (s *OllamaService) Embeddings(ctx context.Context, req *api.EmbedRequest) (
 
 // Generate generates text (used for Rerank)
 func (s *OllamaService) Generate(ctx context.Context, req *api.GenerateRequest, fn api.GenerateResponseFunc) error {
-	// First check if service is available
-	if err := s.StartService(ctx); err != nil {
+	if err := s.checkAvailability(ctx); err != nil {
 		return err
 	}
 

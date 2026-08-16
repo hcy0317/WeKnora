@@ -173,6 +173,123 @@ func TestParseOutLinks(t *testing.T) {
 	}
 }
 
+func TestWikiPageLinkGraphWritesAreAtomicAndIdempotent(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s-%s?mode=memory&cache=shared", t.Name(), uuid.NewString())), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&types.WikiFolder{}, &types.WikiPage{}, &types.WikiPageRevision{}))
+
+	ctx := context.Background()
+	repo := repository.NewWikiPageRepository(db)
+	svc := NewWikiPageService(repo, nil, nil, nil, nil)
+	const kbID = "kb-link-atomic"
+
+	_, err = svc.CreatePage(ctx, &types.WikiPage{
+		TenantID: 1, KnowledgeBaseID: kbID, Slug: "entity/target",
+		Title: "Target", Content: "target", PageType: types.WikiPageTypeEntity,
+	})
+	require.NoError(t, err)
+	_, err = svc.CreatePage(ctx, &types.WikiPage{
+		TenantID: 1, KnowledgeBaseID: kbID, Slug: "entity/failing-target",
+		Title: "Failing target", Content: "target", PageType: types.WikiPageTypeEntity,
+	})
+	require.NoError(t, err)
+
+	source, err := svc.CreatePage(ctx, &types.WikiPage{
+		TenantID: 1, KnowledgeBaseID: kbID, Slug: "entity/source",
+		Title:    "Source",
+		Content:  "See [[entity/target]] and [[entity/target|Target again]].",
+		PageType: types.WikiPageTypeEntity,
+	})
+	require.NoError(t, err)
+	require.Equal(t, types.StringArray{"entity/target"}, source.OutLinks)
+
+	target, err := svc.GetPageBySlug(ctx, kbID, "entity/target")
+	require.NoError(t, err)
+	require.Equal(t, types.StringArray{"entity/source"}, target.InLinks)
+
+	graph, err := svc.GetGraph(ctx, &types.WikiGraphRequest{KnowledgeBaseID: kbID, Limit: 0})
+	require.NoError(t, err)
+	require.Contains(t, graph.Edges, types.WikiGraphEdge{Source: "entity/source", Target: "entity/target"})
+
+	// Repeating the exact same public operation is a no-op for graph identity:
+	// neither side may accumulate duplicate JSON array entries or graph edges.
+	_, err = svc.UpdatePage(ctx, source)
+	require.NoError(t, err)
+	source, err = svc.GetPageBySlug(ctx, kbID, "entity/source")
+	require.NoError(t, err)
+	target, err = svc.GetPageBySlug(ctx, kbID, "entity/target")
+	require.NoError(t, err)
+	require.Equal(t, types.StringArray{"entity/target"}, source.OutLinks)
+	require.Equal(t, types.StringArray{"entity/source"}, target.InLinks)
+	graph, err = svc.GetGraph(ctx, &types.WikiGraphRequest{KnowledgeBaseID: kbID, Limit: 0})
+	require.NoError(t, err)
+	require.Equal(t, 1, countWikiGraphEdge(graph, "entity/source", "entity/target"))
+
+	beforeSource := *source
+	beforeTarget := *target
+	var revisionsBefore int64
+	require.NoError(t, db.Model(&types.WikiPageRevision{}).Where("page_id = ?", source.ID).Count(&revisionsBefore).Error)
+	require.NoError(t, db.Exec(`
+		CREATE TRIGGER fail_target_in_links_update
+		BEFORE UPDATE OF in_links ON wiki_pages
+		WHEN OLD.slug = 'entity/failing-target'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected target update failure');
+		END;
+	`).Error)
+
+	source.Content = "Now link to [[entity/failing-target]]."
+	_, err = svc.UpdatePage(ctx, source)
+	require.ErrorContains(t, err, "injected target update failure")
+
+	storedSource, err := svc.GetPageBySlug(ctx, kbID, "entity/source")
+	require.NoError(t, err)
+	storedTarget, err := svc.GetPageBySlug(ctx, kbID, "entity/target")
+	require.NoError(t, err)
+	failingTarget, err := svc.GetPageBySlug(ctx, kbID, "entity/failing-target")
+	require.NoError(t, err)
+	require.Equal(t, beforeSource.Content, storedSource.Content)
+	require.Equal(t, beforeSource.Version, storedSource.Version)
+	require.Equal(t, beforeSource.OutLinks, storedSource.OutLinks)
+	require.Equal(t, beforeTarget.InLinks, storedTarget.InLinks)
+	require.Empty(t, failingTarget.InLinks)
+	var revisionsAfter int64
+	require.NoError(t, db.Model(&types.WikiPageRevision{}).Where("page_id = ?", source.ID).Count(&revisionsAfter).Error)
+	require.Equal(t, revisionsBefore, revisionsAfter, "revision and page/link writes must roll back together")
+
+	_, err = svc.CreatePage(ctx, &types.WikiPage{
+		TenantID: 1, KnowledgeBaseID: kbID, Slug: "entity/create-rollback",
+		Title: "Create rollback", Content: "[[entity/failing-target]]", PageType: types.WikiPageTypeEntity,
+	})
+	require.ErrorContains(t, err, "injected target update failure")
+	_, err = svc.GetPageBySlug(ctx, kbID, "entity/create-rollback")
+	require.Error(t, err, "source insert must roll back when target in_links fails")
+
+	err = svc.UpdateAutoLinkedContent(ctx, &types.WikiPage{
+		KnowledgeBaseID: kbID,
+		Slug:            "entity/source",
+		Content:         "Auto-linked [[entity/failing-target]].",
+	})
+	require.ErrorContains(t, err, "injected target update failure")
+	storedSource, err = svc.GetPageBySlug(ctx, kbID, "entity/source")
+	require.NoError(t, err)
+	require.Equal(t, beforeSource.Content, storedSource.Content)
+	require.Equal(t, beforeSource.Version, storedSource.Version)
+	require.Equal(t, beforeSource.OutLinks, storedSource.OutLinks)
+	require.NoError(t, db.Model(&types.WikiPageRevision{}).Where("page_id = ?", source.ID).Count(&revisionsAfter).Error)
+	require.Equal(t, revisionsBefore, revisionsAfter, "machine-only link decoration must not leave a revision or partial graph")
+}
+
+func countWikiGraphEdge(graph *types.WikiGraphData, source, target string) int {
+	count := 0
+	for _, edge := range graph.Edges {
+		if edge.Source == source && edge.Target == target {
+			count++
+		}
+	}
+	return count
+}
+
 func TestRepairContentLinks(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())), &gorm.Config{})
 	require.NoError(t, err)

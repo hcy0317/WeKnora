@@ -3,11 +3,28 @@ import { ref, reactive, onMounted, onBeforeUnmount, watch, computed, nextTick } 
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
 import { copyWithToast } from '@/utils/clipboard'
-import { getKnowledgeSpans, reparseKnowledge, cancelKnowledgeParse, getKnowledgeDetails } from '@/api/knowledge-base/index'
 import {
+  cancelKnowledgeParse,
+  getKnowledgeDetails,
+  getKnowledgeSpans,
+  reparseKnowledge,
+  retryFailedKnowledgeItems,
+  retryKnowledgeSpan,
+} from '@/api/knowledge-base/index'
+import {
+  canRetryKnowledgeSpan,
+  findKnowledgeRetryTargetSpanId,
+  getStreamTransportProgress,
   groupPostprocessGraphSpans,
+  isKnowledgeTraceClockLive,
+  isKnowledgeRetryFailedActionUsable,
+  isUnavailableUsageShell,
+  knowledgeRetryErrorMessageKey,
   knowledgeSpansPayloadHasTrace,
+  resolvedKnowledgeSpanDurationMs,
   summarizePostprocessTasks,
+  visibleKnowledgeSpanOutput,
+  type KnowledgeRetryFailedAction,
   type KnowledgeTraceNode,
 } from '@/utils/knowledgeTrace'
 import { resolveTimelineHeaderStatus } from '@/utils/knowledgeProcessingStatus'
@@ -22,6 +39,38 @@ interface LastError {
   finished_at?: string
 }
 
+interface TokenUsageMetrics {
+  calls: number
+  measured_calls: number
+  estimated_calls: number
+  unknown_calls: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  cache_miss_tokens: number
+}
+
+interface TokenUsageModelSummary {
+  model_type: string
+  model_id?: string
+  model_name: string
+  usage: TokenUsageMetrics
+}
+
+interface TokenUsageStageSummary {
+  stage: string
+  usage: TokenUsageMetrics
+  models: TokenUsageModelSummary[]
+}
+
+interface KnowledgeTokenUsageSummary {
+  has_data: boolean
+  usage: TokenUsageMetrics
+  stages: TokenUsageStageSummary[]
+}
+
 interface SpansResponse {
   knowledge_id: string
   attempt: number
@@ -31,6 +80,8 @@ interface SpansResponse {
   current_stage?: string
   trace: SpanNode
   last_error?: LastError | null
+  token_usage?: KnowledgeTokenUsageSummary
+  retry_failed_action?: KnowledgeRetryFailedAction
 }
 
 // IMPORTANT: Vue 3 coerces missing Boolean props to `false`, NOT
@@ -63,6 +114,8 @@ const props = withDefaults(
     docTitle?: string
     /** Show a close control (secondary trace drawer). */
     showClose?: boolean
+    /** Whether the current user may mutate this knowledge base. */
+    canEdit?: boolean
   }>(),
   {
     autoPoll: true,
@@ -70,6 +123,7 @@ const props = withDefaults(
     gracePoll: true,
     docTitle: '',
     showClose: false,
+    canEdit: false,
   },
 )
 
@@ -89,6 +143,14 @@ const processOverrides = ref<KnowledgeProcessOverrides | null>(null)
 const currentKnowledgeFileType = ref('')
 const loading = ref(false)
 const refreshing = ref(false)
+const retrying = ref(false)
+const retryingFailedItems = ref(false)
+const cancelling = ref(false)
+const retryingSpanIds = ref<Set<string>>(new Set())
+const hasRetryingSpan = computed(() => retryingSpanIds.value.size > 0)
+const mutationBusy = computed(() =>
+  retrying.value || retryingFailedItems.value || cancelling.value || hasRetryingSpan.value,
+)
 const selectedAttempt = ref<number | undefined>(undefined)
 const expandedRows = ref<Set<string>>(new Set(['__root__']))
 const selectedSpanId = ref<string | null>(null)
@@ -196,7 +258,7 @@ function formatRelativeTime(ts: number): string {
 // processing time, so do not present it as (for example) multimodal time.
 function formatSpanDuration(node: SpanNode): string {
   if (node.status === 'skipped' || node.status === 'pending') return '—'
-  return formatDuration(node.duration_ms)
+  return formatDuration(resolvedKnowledgeSpanDurationMs(node))
 }
 
 function isPolling(status?: string): boolean {
@@ -241,16 +303,20 @@ const traceActive = computed<boolean>(() => spanTreeActive(data.value?.trace))
 //      parseStatus hint so the UI shows LIVE immediately.
 const isLive = computed<boolean>(() => {
   if (data.value) {
-    // Hard-terminal parse_status wins over a stale traceActive: cancel
-    // and irrecoverable failure can leave child spans stranded as
-    // 'running' (worker process died, cancel raced FailSpan, etc.),
-    // and we must NOT keep polling forever on those.
-    if (isHardTerminal(data.value.parse_status)) return false
-    return isPolling(data.value.parse_status) || traceActive.value
+    return isKnowledgeTraceClockLive({
+      attempt: data.value.attempt,
+      latestAttempt: data.value.latest_attempt,
+      parseStatus: data.value.parse_status,
+      traceActive: traceActive.value,
+    })
   }
   if (isHardTerminal(props.parseStatus)) return false
   return isPolling(props.parseStatus)
 })
+
+function isNodeClockLive(node: SpanNode): boolean {
+  return isLive.value && (node.status === 'running' || node.status === 'pending')
+}
 
 // Walk every node in the tree and return the freshest updated_at /
 // finished_at timestamp we can see. Used by the quiescent grace
@@ -455,16 +521,160 @@ async function copySpan(node: SpanNode) {
   await copyValue(node)
 }
 
+const retryFailedAction = computed(() => data.value?.retry_failed_action || null)
+const retryFailedCounts = computed(() => ({
+  summary: Math.max(0, Number(retryFailedAction.value?.counts?.summary || 0)),
+  wiki: Math.max(0, Number(retryFailedAction.value?.counts?.wiki || 0)),
+  graph: Math.max(0, Number(retryFailedAction.value?.counts?.graph || 0)),
+  question: Math.max(0, Number(retryFailedAction.value?.counts?.question || 0)),
+}))
+const retryFailedTargetCount = computed(() => Object.values(retryFailedCounts.value)
+  .reduce((sum, count) => sum + count, 0))
+const viewingLatestAttempt = computed(() => {
+  if (!data.value) return false
+  const latest = data.value.latest_attempt || data.value.attempt
+  const active = selectedAttempt.value ?? data.value.attempt
+  return active === latest
+})
+const retryFailedAllowed = computed(() =>
+  props.canEdit && viewingLatestAttempt.value && isKnowledgeRetryFailedActionUsable(retryFailedAction.value),
+)
+const retryFailedCountsText = computed(() => t('knowledgeStages.retryFailedCounts', retryFailedCounts.value))
+const retryFailedTargetsText = computed(() => (retryFailedAction.value?.targets || [])
+  .map(target => target.target_name)
+  .join('、'))
+
+function localizedRetryReason(reason?: string): string {
+  if (!reason) return t('knowledgeStages.retryReason.unavailable')
+  const key = `knowledgeStages.retryReason.${reason}`
+  const localized = t(key)
+  return localized === key ? reason : localized
+}
+
+const retryFailedDisabledReason = computed(() => {
+  if (!props.canEdit || retryFailedAllowed.value) return ''
+  if (!viewingLatestAttempt.value) return t('knowledgeStages.retryReason.historical_attempt')
+  return localizedRetryReason(retryFailedAction.value?.reason)
+})
+
+function retryErrorMessage(error: any, fallbackKey: string): string {
+  const key = knowledgeRetryErrorMessageKey(error?.status)
+  if (key === 'knowledgeStages.retryError.generic') {
+    return error?.message || t(fallbackKey)
+  }
+  return t(key)
+}
+
+async function refreshAfterRetryError(error: any) {
+  if (error?.status !== 409 && error?.status !== 503) return
+  selectedAttempt.value = undefined
+  selectedSpanId.value = null
+  attemptStatuses.clear()
+  await fetchSpans({ manual: true })
+}
+
+async function focusAcceptedRepair(
+  newAttempt: number,
+  targets: ReadonlyArray<{ target_name: string; new_span_id?: string }>,
+) {
+  selectedAttempt.value = newAttempt
+  selectedSpanId.value = null
+  attemptStatuses.clear()
+  userToggledRows.value = new Set()
+  expandedRows.value = new Set(['__root__'])
+  await fetchSpans({ manual: true })
+  const focusSpanId = targets.find(target => target.new_span_id)?.new_span_id ||
+    findKnowledgeRetryTargetSpanId(data.value?.trace, targets)
+  if (!focusSpanId) return
+  selectedSpanId.value = focusSpanId
+  detailTab.value = 'overview'
+  scrollRowIntoView(focusSpanId)
+}
+
 async function onRetry() {
+  if (mutationBusy.value) return
   if (!props.knowledgeId) return
+  retrying.value = true
   try {
     await reparseKnowledge(props.knowledgeId)
+    MessagePlugin.success(t('knowledgeBase.rebuildSubmitted'))
     selectedAttempt.value = undefined
     attemptStatuses.clear()
     selectedSpanId.value = null
     await fetchSpans()
-  } catch {
-    // ignore
+  } catch (error: any) {
+    MessagePlugin.error(error?.message || t('knowledgeBase.rebuildFailed'))
+  } finally {
+    retrying.value = false
+  }
+}
+
+function newClientRequestID(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `span-retry-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function rowCanRetry(row: FlatRow | null | undefined): boolean {
+  return !props.compact && viewingLatestAttempt.value &&
+    !!row && canRetryKnowledgeSpan(row.node, props.canEdit)
+}
+
+const selectedSpanCanRetry = computed(() => rowCanRetry(selectedRow.value))
+
+function spanRetrying(spanId?: string): boolean {
+  return !!spanId && retryingSpanIds.value.has(spanId)
+}
+
+async function onRetrySpan(node: SpanNode) {
+  const spanId = node.span_id
+  const attempt = data.value?.attempt || 0
+  if (!spanId || attempt <= 0 || mutationBusy.value || !viewingLatestAttempt.value ||
+    !canRetryKnowledgeSpan(node, props.canEdit) || spanRetrying(spanId)) return
+
+  retryingSpanIds.value = new Set(retryingSpanIds.value).add(spanId)
+  try {
+    const res = await retryKnowledgeSpan(props.knowledgeId, attempt, spanId, {
+      client_request_id: newClientRequestID(),
+    })
+    const result = res.data
+    if (!result?.new_attempt) throw new Error(t('knowledgeStages.retryItemFailed'))
+    MessagePlugin.success(t('knowledgeStages.retryItemSubmitted'))
+    await focusAcceptedRepair(result.new_attempt, [{
+      target_name: result.target_name || node.name,
+      new_span_id: result.new_span_id,
+    }])
+  } catch (error: any) {
+    MessagePlugin.error(retryErrorMessage(error, 'knowledgeStages.retryItemFailed'))
+    await refreshAfterRetryError(error)
+  } finally {
+    const next = new Set(retryingSpanIds.value)
+    next.delete(spanId)
+    retryingSpanIds.value = next
+  }
+}
+
+async function onRetryFailedItems() {
+  const action = retryFailedAction.value
+  const attempt = data.value?.attempt || 0
+  if (!action || attempt <= 0 || mutationBusy.value || !retryFailedAllowed.value) return
+  retryingFailedItems.value = true
+  try {
+    const res = await retryFailedKnowledgeItems(props.knowledgeId, attempt, {
+      client_request_id: newClientRequestID(),
+    })
+    const result = res.data
+    if (!result?.new_attempt || !Array.isArray(result.targets) || result.targets.length === 0) {
+      throw new Error(t('knowledgeStages.retryFailedItemsFailed'))
+    }
+    MessagePlugin.success(t('knowledgeStages.retryFailedItemsSubmitted'))
+    await focusAcceptedRepair(result.new_attempt, result.targets)
+  } catch (error: any) {
+    MessagePlugin.error(retryErrorMessage(error, 'knowledgeStages.retryFailedItemsFailed'))
+    await refreshAfterRetryError(error)
+  } finally {
+    retryingFailedItems.value = false
   }
 }
 
@@ -472,8 +682,6 @@ async function onManualRefresh() {
   if (refreshing.value || loading.value) return
   await fetchSpans({ manual: true })
 }
-
-const cancelling = ref(false)
 
 // Mirrors the backend CancelKnowledgeParse gate (pending / processing /
 // finalizing). Uses the freshest status we have: live span data first,
@@ -484,7 +692,7 @@ const canCancelParse = computed<boolean>(() => {
 })
 
 async function onCancelParseConfirm() {
-  if (cancelling.value) return
+  if (mutationBusy.value) return
   const id = props.knowledgeId
   if (!id) return
   cancelling.value = true
@@ -603,8 +811,9 @@ function nodeEnd(node: SpanNode): number | null {
   const e = parseTime(node.finished_at || undefined)
   if (e !== null) return e
   const s = nodeStart(node)
-  if (s !== null && typeof node.duration_ms === 'number' && node.duration_ms > 0) {
-    return s + node.duration_ms
+  const duration = resolvedKnowledgeSpanDurationMs(node)
+  if (s !== null && duration !== undefined && duration > 0) {
+    return s + duration
   }
   return null
 }
@@ -778,6 +987,15 @@ const selectedRow = computed<FlatRow | null>(() => {
   return flatRows.value.find((r) => r.key === id) || null
 })
 
+const selectedTransportProgress = computed(() => {
+  const row = selectedRow.value
+  return row ? getStreamTransportProgress(row.node) : null
+})
+
+const selectedUnavailableUsageShell = computed(() =>
+  isUnavailableUsageShell(selectedRow.value?.node.output),
+)
+
 const detailOpen = computed(() => selectedSpanId.value !== null && selectedRow.value !== null)
 
 function barStyle(node: SpanNode): Record<string, string> {
@@ -785,12 +1003,10 @@ function barStyle(node: SpanNode): Record<string, string> {
   if (!total || t0.value === null) return { display: 'none' }
   const start = nodeStart(node)
   if (start === null) return { display: 'none' }
-  // For a span with no recorded finished_at, use "now" as the end
-  // whenever it's plausibly still running — either the trace overall
-  // is live, or this individual span's status says it's in flight.
-  // Without the second clause, postprocess subspans that survived past
-  // parse_status='completed' would collapse to zero width.
-  const liveBar = isLive.value || node.status === 'running' || node.status === 'pending'
+  // Only the latest active attempt may advance against the wall clock. A
+  // cancelled/completed historical attempt can contain legacy rows whose
+  // status still says running; those rows must remain frozen.
+  const liveBar = isNodeClockLive(node)
   const end = nodeEnd(node) ?? (liveBar ? nowTick.value : start)
   const leftPct = ((start - t0.value) / total) * 100
   const widthPct = Math.max(0.4, ((end - start) / total) * 100)
@@ -932,6 +1148,12 @@ function hasContent(v: any): boolean {
   if (Array.isArray(v)) return v.length > 0
   if (typeof v === 'object') return Object.keys(v).length > 0
   return true
+}
+
+function detailValue(tab: 'input' | 'output' | 'metadata'): unknown {
+  const node = selectedRow.value?.node
+  if (!node) return null
+  return tab === 'output' ? visibleKnowledgeSpanOutput(node.output) : node[tab]
 }
 
 function prettyJSON(v: any): string {
@@ -1127,17 +1349,6 @@ function attemptGlyph(status: string): { ch: string; cls: string } {
   }
 }
 
-// True when the panel is showing the most recent attempt (or there's
-// only one). Historical attempts must keep their own per-attempt
-// trace.status; only the latest attempt's header should defer to the
-// knowledge-level parse_status.
-const viewingLatestAttempt = computed<boolean>(() => {
-  const latest = data.value?.latest_attempt || 0
-  if (latest <= 1) return true
-  const active = selectedAttempt.value ?? data.value?.attempt ?? latest
-  return active === latest
-})
-
 // The authoritative status for the header badge. During the async
 // post-pipeline window (summary / question / graph / wiki), the latest
 // attempt's ROOT span closes — so trace.status reads 'done' — while
@@ -1261,9 +1472,7 @@ watch(
 )
 
 function tabHasContent(tab: 'input' | 'output' | 'metadata'): boolean {
-  const node = selectedRow.value?.node
-  if (!node) return false
-  return hasContent((node as any)[tab])
+  return hasContent(detailValue(tab))
 }
 
 const traceMetadata = computed(() => {
@@ -1329,6 +1538,23 @@ const stageBreakdown = computed<StageRowSummary[]>(() => {
     pct: typeof s.duration_ms === 'number' && s.duration_ms > 0 ? Math.min(100, (s.duration_ms / total) * 100) : 0,
   }))
 })
+
+const tokenUsage = computed(() => data.value?.token_usage)
+
+function formatTokenCount(value?: number): string {
+  const n = Number(value || 0)
+  return new Intl.NumberFormat().format(Number.isFinite(n) ? n : 0)
+}
+
+function tokenStageLabel(stage: string): string {
+  if (stage === 'postprocess.summary') return t('knowledgeStages.token.stage.summary')
+  if (stage.startsWith('postprocess.question')) return t('knowledgeStages.token.stage.question')
+  if (stage.startsWith('postprocess.graph')) return t('knowledgeStages.token.stage.graph')
+  if (stage.startsWith('postprocess.wiki')) return t('knowledgeStages.token.stage.wiki')
+  if (stage.startsWith('docreader.datatable')) return t('knowledgeStages.token.stage.datatable')
+  const base = STAGES.find((name) => stage === name || stage.startsWith(`${name}.`))
+  return base ? t(`knowledgeStages.stage.${base}`) : stage
+}
 
 function normalizeFileType(value: string): string {
   return String(value || '').trim().replace(/^\./, '').toLowerCase()
@@ -1460,25 +1686,51 @@ const processConfigLines = computed<string[]>(() => {
                 <t-icon name="refresh" size="14px" />
               </button>
               <t-popconfirm
-                v-if="canCancelParse"
+                v-if="props.canEdit && canCancelParse"
                 theme="warning"
                 :content="t('knowledgeBase.cancelParseConfirmBody', { title: props.docTitle || props.knowledgeId })"
                 :confirm-btn="{ content: t('knowledgeBase.cancelParse'), theme: 'danger' }"
                 :cancel-btn="{ content: t('common.cancel') }"
+                :popup-props="{ attach: 'body', zIndex: 2300 }"
                 placement="bottom"
                 @confirm="onCancelParseConfirm"
               >
                 <button type="button" class="kp-icon-btn kp-icon-btn-danger"
-                  :class="{ 'kp-icon-btn-spin': cancelling }" :disabled="cancelling"
+                  :class="{ 'kp-icon-btn-spin': cancelling }" :disabled="mutationBusy"
                   :title="t('knowledgeBase.cancelParse')" :aria-label="t('knowledgeBase.cancelParse')"
                   @click.stop>
                   <t-icon :name="cancelling ? 'loading' : 'close-circle'" size="15px" />
                 </button>
               </t-popconfirm>
-              <t-button v-if="data?.parse_status === 'failed'" size="small" theme="primary" variant="outline"
-                @click="onRetry">
+              <t-popconfirm v-if="retryFailedAllowed"
+                :content="t('knowledgeStages.retryFailedItemsConfirm', {
+                  count: retryFailedTargetCount,
+                  counts: retryFailedCountsText,
+                  targets: retryFailedTargetsText,
+                })"
+                :confirm-btn="{ content: t('knowledgeStages.retryFailedItems'), theme: 'primary' }"
+                :cancel-btn="{ content: t('common.cancel') }"
+                :popup-props="{ attach: 'body', zIndex: 2300 }"
+                placement="bottom-right"
+                @confirm="onRetryFailedItems">
+                <t-button class="kp-action-btn" size="small" theme="primary" variant="outline"
+                  :loading="retryingFailedItems" :disabled="mutationBusy" @click.stop>
+                  <t-icon name="refresh" size="14px" />
+                  <span>{{ t('knowledgeStages.retryFailedItems') }}</span>
+                </t-button>
+              </t-popconfirm>
+              <span v-else-if="props.canEdit && data" class="kp-disabled-action"
+                :title="retryFailedDisabledReason">
+                <t-button class="kp-action-btn" size="small" theme="primary" variant="outline" disabled
+                  :aria-describedby="retryFailedDisabledReason ? 'kp-retry-summary' : undefined">
+                  <t-icon name="refresh" size="14px" />
+                  <span>{{ t('knowledgeStages.retryFailedItems') }}</span>
+                </t-button>
+              </span>
+              <t-button v-if="props.canEdit && data?.parse_status === 'failed'" class="kp-action-btn" size="small"
+                theme="primary" variant="outline" :loading="retrying" :disabled="mutationBusy" @click="onRetry">
                 <t-icon name="refresh" size="14px" />
-                <span style="margin-left: 4px">{{ t('knowledgeStages.retry') }}</span>
+                <span>{{ t('knowledgeStages.retry') }}</span>
               </t-button>
               <button v-if="showClose" type="button" class="kp-icon-btn" :aria-label="t('knowledgeStages.close')"
                 :title="t('knowledgeStages.close')" @click="emit('close')">
@@ -1486,6 +1738,11 @@ const processConfigLines = computed<string[]>(() => {
               </button>
             </div>
           </div>
+
+          <p v-if="props.canEdit && data" id="kp-retry-summary" class="kp-retry-summary" role="status">
+            <span>{{ retryFailedCountsText }}</span>
+            <span v-if="retryFailedDisabledReason"> · {{ retryFailedDisabledReason }}</span>
+          </p>
 
           <p v-if="headMetaParts.length > 0" class="kp-head-meta">
             <template v-for="(part, idx) in headMetaParts" :key="idx">
@@ -1553,8 +1810,11 @@ const processConfigLines = computed<string[]>(() => {
                 'kp-row-stage': row.isStage,
                 'kp-row-span': !row.isRoot && !row.isStage,
                 'kp-row-expandable': row.hasChildren && !row.isRoot,
-              }" :title="row.hasChildren && !row.isRoot ? t('knowledgeStages.rowSelectHint') : undefined"
-                @click="selectRow(row)">
+              }" role="button" tabindex="0"
+                :aria-label="`${rowLabel(row)} · ${localizedStatus(row.node.status)}`"
+                :title="row.hasChildren && !row.isRoot ? t('knowledgeStages.rowSelectHint') : undefined"
+                @click="selectRow(row)" @keydown.enter.self.prevent="selectRow(row)"
+                @keydown.space.self.prevent="selectRow(row)">
                 <div class="kp-cell-name">
                   <div class="kp-name-inner" :style="{ paddingLeft: row.depth * 16 + 'px' }">
                     <button v-if="row.hasChildren && !row.isRoot" type="button" class="kp-tree-toggle"
@@ -1569,11 +1829,24 @@ const processConfigLines = computed<string[]>(() => {
                       :class="{ 'kp-name-root': row.isRoot, 'kp-name-mono': !row.isRoot && !row.isStage }">{{
                         rowLabel(row) }}</span>
                     <span class="kp-name-kind">{{ rowKindLabel(row) }}</span>
+                    <t-popconfirm v-if="rowCanRetry(row)"
+                      :content="t('knowledgeStages.retryItemConfirm', { name: row.node.name })"
+                      :confirm-btn="{ content: t('knowledgeStages.retryItem'), theme: 'primary' }"
+                      :cancel-btn="{ content: t('common.cancel') }"
+                      :popup-props="{ attach: 'body', zIndex: 2300 }" placement="bottom-right"
+                      @confirm="onRetrySpan(row.node)">
+                      <button type="button" class="kp-row-retry" :class="{ 'kp-row-retry-loading': spanRetrying(row.node.span_id) }"
+                        :disabled="mutationBusy" :aria-label="`${t('knowledgeStages.retryItem')}：${row.node.name}`"
+                        @click.stop>
+                        <t-icon name="refresh" size="14px" />
+                        <span>{{ t('knowledgeStages.retryItem') }}</span>
+                      </button>
+                    </t-popconfirm>
                   </div>
                 </div>
 
                 <div class="kp-cell-dur kp-mono">
-                  <template v-if="row.node.status === 'running'">
+                  <template v-if="isNodeClockLive(row.node)">
                     <span class="kp-running-time">{{ formatDuration(liveElapsedMs(row.node)) }}</span>
                   </template>
                   <template v-else>
@@ -1601,12 +1874,12 @@ const processConfigLines = computed<string[]>(() => {
                       </span>
                     </div>
                     <div class="kp-bar"
-                      :class="['kp-bar-' + row.node.status, { 'kp-bar-running-anim': row.node.status === 'running' }]"
+                      :class="['kp-bar-' + row.node.status, { 'kp-bar-running-anim': isNodeClockLive(row.node) }]"
                       :style="barStyle(row.node)">
                       <span class="kp-bar-tip">
                         <span class="kp-bar-tip-name">{{ rowLabel(row) }}</span>
                         <span class="kp-bar-tip-sep">·</span>
-                        <span class="kp-mono">{{ row.node.status === 'running'
+                        <span class="kp-mono">{{ isNodeClockLive(row.node)
                           ? formatDuration(liveElapsedMs(row.node))
                           : formatSpanDuration(row.node) }}</span>
                         <span class="kp-bar-tip-sep">·</span>
@@ -1638,6 +1911,21 @@ const processConfigLines = computed<string[]>(() => {
                 </span>
               </div>
               <div class="kp-detail-actions">
+                <t-popconfirm v-if="selectedSpanCanRetry"
+                  :content="t('knowledgeStages.retryItemConfirm', { name: selectedRow.node.name })"
+                  :confirm-btn="{ content: t('knowledgeStages.retryItem'), theme: 'primary' }"
+                  :cancel-btn="{ content: t('common.cancel') }"
+                  :popup-props="{ attach: 'body', zIndex: 2300 }" placement="bottom-right"
+                  @confirm="onRetrySpan(selectedRow.node)">
+                  <t-button class="kp-action-btn" size="small" theme="primary" variant="outline"
+                    :loading="spanRetrying(selectedRow.node.span_id)"
+                    :disabled="mutationBusy"
+                    :aria-label="`${t('knowledgeStages.retryItem')}：${selectedRow.node.name}`"
+                    @click.stop>
+                    <t-icon name="refresh" size="14px" />
+                    <span>{{ t('knowledgeStages.retryItem') }}</span>
+                  </t-button>
+                </t-popconfirm>
                 <button type="button" class="kp-icon-btn" :title="t('knowledgeStages.copyDetails')"
                   @click.stop="copySpan(selectedRow.node)">
                   <t-icon name="copy" size="18px" />
@@ -1678,7 +1966,7 @@ const processConfigLines = computed<string[]>(() => {
                     <div class="kp-kv-row">
                       <span class="kp-kv-key">{{ t('knowledgeStages.detail.finished') }}</span>
                       <span class="kp-kv-val kp-mono">
-                        <template v-if="selectedRow.node.status === 'running'">
+                        <template v-if="isNodeClockLive(selectedRow.node)">
                           <span class="kp-kv-running">{{ t('knowledgeStages.detail.inProgress') }}</span>
                         </template>
                         <template v-else>
@@ -1689,7 +1977,7 @@ const processConfigLines = computed<string[]>(() => {
                     <div class="kp-kv-row">
                       <span class="kp-kv-key">{{ t('knowledgeStages.detail.duration') }}</span>
                       <span class="kp-kv-val kp-mono">
-                        <template v-if="selectedRow.node.status === 'running'">
+                        <template v-if="isNodeClockLive(selectedRow.node)">
                           {{ formatDuration(liveElapsedMs(selectedRow.node)) }}
                           <span class="kp-kv-tag-live">{{ t('knowledgeStages.detail.elapsed') }}</span>
                         </template>
@@ -1753,6 +2041,132 @@ const processConfigLines = computed<string[]>(() => {
                   </div>
                 </div>
 
+                <div v-if="selectedRow.isRoot" class="kp-section">
+                  <div class="kp-section-title">{{ t('knowledgeStages.token.title') }}</div>
+                  <p class="kp-section-desc">{{ t('knowledgeStages.token.hint') }}</p>
+                  <div v-if="tokenUsage?.has_data" class="kp-token-summary">
+                    <div class="kp-token-metrics">
+                      <div class="kp-token-metric">
+                        <span>{{ t('knowledgeStages.token.input') }}</span>
+                        <strong class="kp-mono">{{ formatTokenCount(tokenUsage.usage.input_tokens) }}</strong>
+                      </div>
+                      <div class="kp-token-metric">
+                        <span>{{ t('knowledgeStages.token.output') }}</span>
+                        <strong class="kp-mono">{{ formatTokenCount(tokenUsage.usage.output_tokens) }}</strong>
+                      </div>
+                      <div class="kp-token-metric">
+                        <span>{{ t('knowledgeStages.token.cacheRead') }}</span>
+                        <strong class="kp-mono">{{ formatTokenCount(tokenUsage.usage.cache_read_tokens) }}</strong>
+                      </div>
+                      <div class="kp-token-metric">
+                        <span>{{ t('knowledgeStages.token.cacheWrite') }}</span>
+                        <strong class="kp-mono">{{ formatTokenCount(tokenUsage.usage.cache_write_tokens) }}</strong>
+                      </div>
+                      <div class="kp-token-metric kp-token-metric-total">
+                        <span>{{ t('knowledgeStages.token.total') }}</span>
+                        <strong class="kp-mono">{{ formatTokenCount(tokenUsage.usage.total_tokens) }}</strong>
+                      </div>
+                    </div>
+                    <div class="kp-token-call-note">
+                      {{ t('knowledgeStages.token.calls', {
+                        calls: tokenUsage.usage.calls,
+                        measured: tokenUsage.usage.measured_calls,
+                        estimated: tokenUsage.usage.estimated_calls,
+                        unknown: tokenUsage.usage.unknown_calls,
+                      }) }}
+                    </div>
+                    <div class="kp-token-stages">
+                      <section v-for="stage in tokenUsage.stages" :key="stage.stage" class="kp-token-stage">
+                        <header class="kp-token-stage-head">
+                          <span>{{ tokenStageLabel(stage.stage) }}</span>
+                          <span class="kp-mono">{{ formatTokenCount(stage.usage.total_tokens) }} {{ t('knowledgeStages.token.tokens') }}</span>
+                        </header>
+                        <div class="kp-token-table-wrap">
+                          <table class="kp-token-table">
+                            <thead>
+                              <tr>
+                                <th>{{ t('knowledgeStages.token.model') }}</th>
+                                <th>{{ t('knowledgeStages.token.callsShort') }}</th>
+                                <th>{{ t('knowledgeStages.token.input') }}</th>
+                                <th>{{ t('knowledgeStages.token.output') }}</th>
+                                <th>{{ t('knowledgeStages.token.cacheRead') }}</th>
+                                <th>{{ t('knowledgeStages.token.cacheWrite') }}</th>
+                                <th>{{ t('knowledgeStages.token.total') }}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <tr v-for="model in stage.models" :key="`${model.model_type}:${model.model_id || model.model_name}`">
+                                <td>
+                                  <span class="kp-token-model-name">{{ model.model_name }}</span>
+                                  <span class="kp-token-model-type">{{ model.model_type }}</span>
+                                </td>
+                                <td class="kp-mono">{{ model.usage.calls }}</td>
+                                <td class="kp-mono">{{ formatTokenCount(model.usage.input_tokens) }}</td>
+                                <td class="kp-mono">{{ formatTokenCount(model.usage.output_tokens) }}</td>
+                                <td class="kp-mono">{{ formatTokenCount(model.usage.cache_read_tokens) }}</td>
+                                <td class="kp-mono">{{ formatTokenCount(model.usage.cache_write_tokens) }}</td>
+                                <td class="kp-mono kp-token-total-cell">{{ formatTokenCount(model.usage.total_tokens) }}</td>
+                              </tr>
+                            </tbody>
+                          </table>
+                        </div>
+                      </section>
+                    </div>
+                  </div>
+                  <div v-else class="kp-detail-hint">{{ t('knowledgeStages.token.empty') }}</div>
+                </div>
+
+                <div v-if="selectedTransportProgress" class="kp-section">
+                  <div class="kp-section-title">{{ t('knowledgeStages.transport.title') }}</div>
+                  <p class="kp-section-desc">
+                    <template v-if="selectedTransportProgress.waitingForCompletion">
+                      {{ t('knowledgeStages.transport.waitingForCompletion') }}
+                    </template>
+                    <template v-else-if="selectedTransportProgress.outcome === 'done'">
+                      {{ t('knowledgeStages.transport.completed') }}
+                    </template>
+                    <template v-else-if="selectedTransportProgress.outcome === 'failed'">
+                      {{ t('knowledgeStages.transport.failed') }}
+                    </template>
+                    <template v-else-if="selectedTransportProgress.outcome === 'cancelled'">
+                      {{ t('knowledgeStages.transport.cancelled') }}
+                    </template>
+                    <template v-else>
+                      {{ t('knowledgeStages.transport.inProgress') }}
+                    </template>
+                  </p>
+                  <div class="kp-transport-steps">
+                    <div v-for="step in selectedTransportProgress.milestones" :key="step.key"
+                      class="kp-transport-step" :class="{
+                        'kp-transport-step-reached': step.reached,
+                        'kp-transport-step-active': step.active,
+                      }">
+                      <span class="kp-transport-dot" />
+                      <span class="kp-transport-label">{{ t(`knowledgeStages.transport.step.${step.key}`) }}</span>
+                      <span v-if="step.at" class="kp-transport-time kp-mono">{{ formatTime(step.at) }}</span>
+                    </div>
+                  </div>
+                  <div class="kp-kv kp-transport-meta">
+                    <div v-if="selectedTransportProgress.protocol" class="kp-kv-row">
+                      <span class="kp-kv-key">{{ t('knowledgeStages.transport.protocol') }}</span>
+                      <span class="kp-kv-val kp-mono">{{ selectedTransportProgress.protocol }}</span>
+                    </div>
+                    <div v-if="selectedTransportProgress.endpoint" class="kp-kv-row">
+                      <span class="kp-kv-key">{{ t('knowledgeStages.transport.endpoint') }}</span>
+                      <span class="kp-kv-val kp-mono kp-kv-truncate">{{ selectedTransportProgress.endpoint }}</span>
+                    </div>
+                    <div v-if="selectedTransportProgress.firstEventType" class="kp-kv-row">
+                      <span class="kp-kv-key">{{ t('knowledgeStages.transport.firstEvent') }}</span>
+                      <span class="kp-kv-val kp-mono">{{ selectedTransportProgress.firstEventType }}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-if="selectedUnavailableUsageShell" class="kp-usage-warning">
+                  <span class="kp-usage-warning-glyph">!</span>
+                  <span>{{ t('knowledgeStages.transport.unavailableUsageShell') }}</span>
+                </div>
+
                 <!-- Error -->
                 <div
                   v-if="(selectedRow.node.status === 'failed' || selectedRow.node.status === 'cancelled') && (selectedRow.node.error_code || selectedRow.node.error_message)"
@@ -1784,14 +2198,14 @@ const processConfigLines = computed<string[]>(() => {
                     <div class="kp-section-bar">
                       <span class="kp-section-title">{{ t('knowledgeStages.detail.' + detailTab) }}</span>
                       <button type="button" class="kp-section-action"
-                        @click="copyValue((selectedRow.node as any)[detailTab])">
+                        @click="copyValue(detailValue(detailTab))">
                         <t-icon name="copy" size="14px" />
                         <span>{{ t('knowledgeStages.copy') }}</span>
                       </button>
                     </div>
 
-                    <div v-if="isObjectWithKeys((selectedRow.node as any)[detailTab])" class="kp-kv">
-                      <div v-for="entry in buildKvEntries((selectedRow.node as any)[detailTab])" :key="entry.key"
+                    <div v-if="isObjectWithKeys(detailValue(detailTab))" class="kp-kv">
+                      <div v-for="entry in buildKvEntries(detailValue(detailTab))" :key="entry.key"
                         class="kp-kv-row kp-kv-row-multiline">
                         <span class="kp-kv-key kp-mono">{{ entry.key }}</span>
                         <div class="kp-kv-val kp-kv-multiline">
@@ -1823,7 +2237,7 @@ const processConfigLines = computed<string[]>(() => {
                         </div>
                       </div>
                     </div>
-                    <pre v-else class="kp-json kp-mono">{{ prettyJSON((selectedRow.node as any)[detailTab]) }}</pre>
+                    <pre v-else class="kp-json kp-mono">{{ prettyJSON(detailValue(detailTab)) }}</pre>
                   </div>
                 </template>
               </template>
@@ -1954,8 +2368,36 @@ const processConfigLines = computed<string[]>(() => {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-wrap: wrap;
   flex-shrink: 0;
   margin-left: auto;
+}
+
+.kp-action-btn {
+  min-height: 36px;
+}
+
+.kp-action-btn:focus-visible {
+  outline: 2px solid var(--td-brand-color);
+  outline-offset: 2px;
+}
+
+.kp-action-btn :deep(.t-button__text) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.kp-disabled-action {
+  display: inline-flex;
+}
+
+.kp-retry-summary {
+  margin: 8px 0 0;
+  color: var(--td-text-color-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .kp-head-meta {
@@ -1979,8 +2421,8 @@ const processConfigLines = computed<string[]>(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 26px;
-  height: 26px;
+  width: 36px;
+  height: 36px;
   border: none;
   background: transparent;
   color: var(--td-text-color-placeholder);
@@ -1992,6 +2434,11 @@ const processConfigLines = computed<string[]>(() => {
 .kp-icon-btn:hover:not(:disabled) {
   background: var(--td-bg-color-secondarycontainer);
   color: var(--td-text-color-primary);
+}
+
+.kp-icon-btn:focus-visible {
+  outline: 2px solid var(--td-brand-color);
+  outline-offset: 2px;
 }
 
 .kp-icon-btn:disabled {
@@ -2206,7 +2653,7 @@ const processConfigLines = computed<string[]>(() => {
   display: grid;
   grid-template-columns: minmax(220px, 42%) 64px 1fr;
   align-items: center;
-  height: 32px;
+  min-height: 36px;
   cursor: pointer;
   position: relative;
   padding: 0 20px;
@@ -2264,6 +2711,7 @@ const processConfigLines = computed<string[]>(() => {
   align-items: center;
   gap: 7px;
   min-width: 0;
+  width: 100%;
 }
 
 .kp-tree-toggle {
@@ -2275,9 +2723,8 @@ const processConfigLines = computed<string[]>(() => {
   padding: 0;
   cursor: pointer;
   color: var(--td-text-color-placeholder);
-  width: 22px;
-  height: 22px;
-  margin: -3px 0;
+  width: 36px;
+  height: 36px;
   transition: color 120ms ease, background 150ms ease;
   flex-shrink: 0;
   border-radius: var(--td-radius-default);
@@ -2289,11 +2736,49 @@ const processConfigLines = computed<string[]>(() => {
 }
 
 .kp-tree-toggle-spacer {
-  width: 22px;
-  height: 22px;
+  width: 36px;
+  height: 36px;
   display: inline-block;
   flex-shrink: 0;
-  margin: -3px 0;
+  margin: 0;
+}
+
+.kp-tree-toggle:focus-visible,
+.kp-row-retry:focus-visible,
+.kp-tab:focus-visible,
+.kp-section-action:focus-visible {
+  outline: 2px solid var(--td-brand-color);
+  outline-offset: 2px;
+}
+
+.kp-row-retry {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 36px;
+  margin-left: auto;
+  padding: 0 8px;
+  border: 1px solid var(--td-brand-color);
+  border-radius: var(--td-radius-default);
+  background: var(--td-bg-color-container);
+  color: var(--td-brand-color);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.kp-row-retry:hover:not(:disabled) {
+  background: var(--td-brand-color-light);
+}
+
+.kp-row-retry:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.kp-row-retry-loading :deep(.t-icon) {
+  animation: kpSpin 0.9s linear infinite;
 }
 
 .kp-status-dot {
@@ -2835,6 +3320,7 @@ const processConfigLines = computed<string[]>(() => {
   align-items: center;
   gap: 4px;
   padding: 9px 14px 10px;
+  min-height: 36px;
   border: none;
   background: transparent;
   color: var(--td-text-color-secondary);
@@ -2917,6 +3403,277 @@ const processConfigLines = computed<string[]>(() => {
   color: var(--td-text-color-placeholder);
 }
 
+.kp-row:focus-visible {
+  outline: 2px solid var(--td-brand-color);
+  outline-offset: -2px;
+}
+
+.kp-transport-steps {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(92px, 1fr));
+  gap: 6px;
+}
+
+.kp-transport-step {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  gap: 3px 6px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-medium);
+  background: var(--td-bg-color-secondarycontainer);
+  color: var(--td-text-color-placeholder);
+}
+
+.kp-transport-step-reached {
+  border-color: color-mix(in srgb, var(--td-success-color) 40%, var(--td-component-stroke));
+  color: var(--td-text-color-primary);
+}
+
+.kp-transport-step-active {
+  border-color: var(--td-brand-color);
+  background: color-mix(in srgb, var(--td-brand-color-light) 45%, var(--td-bg-color-container));
+  color: var(--td-text-color-primary);
+}
+
+.kp-transport-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--td-component-border);
+}
+
+.kp-transport-step-reached .kp-transport-dot {
+  background: var(--td-success-color);
+}
+
+.kp-transport-step-active .kp-transport-dot {
+  background: var(--td-brand-color);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--td-brand-color) 18%, transparent);
+}
+
+.kp-transport-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.kp-transport-time {
+  grid-column: 2;
+  color: var(--td-text-color-placeholder);
+  font-size: 10px;
+}
+
+.kp-transport-meta {
+  margin-top: 2px;
+}
+
+.kp-usage-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--td-warning-color-3);
+  border-radius: var(--td-radius-medium);
+  background: var(--td-warning-color-light);
+  color: var(--td-text-color-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.kp-usage-warning-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--td-warning-color);
+  color: var(--td-text-color-anti);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.kp-token-summary,
+.kp-token-stages {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.kp-token-metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.kp-token-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-medium);
+  background: var(--td-bg-color-secondarycontainer);
+  color: var(--td-text-color-secondary);
+  font-size: 11px;
+}
+
+.kp-token-metric strong {
+  color: var(--td-text-color-primary);
+  font-size: 14px;
+}
+
+.kp-token-metric-total {
+  border-color: color-mix(in srgb, var(--td-brand-color) 35%, var(--td-component-stroke));
+  background: color-mix(in srgb, var(--td-brand-color-light) 45%, var(--td-bg-color-container));
+}
+
+.kp-token-call-note {
+  color: var(--td-text-color-placeholder);
+  font-size: 11px;
+}
+
+.kp-token-stage {
+  overflow: hidden;
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-medium);
+  background: var(--td-bg-color-container);
+}
+
+.kp-token-stage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  background: var(--td-bg-color-secondarycontainer);
+  color: var(--td-text-color-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.kp-token-table-wrap {
+  overflow-x: auto;
+}
+
+.kp-token-table {
+  width: 100%;
+  min-width: 620px;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.kp-token-table th,
+.kp-token-table td {
+  padding: 7px 9px;
+  border-top: 1px solid var(--td-bg-color-secondarycontainer);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.kp-token-table th {
+  color: var(--td-text-color-placeholder);
+  font-weight: 500;
+}
+
+.kp-token-table th:first-child,
+.kp-token-table td:first-child {
+  text-align: left;
+}
+
+.kp-token-model-name {
+  color: var(--td-text-color-primary);
+  font-weight: 500;
+}
+
+.kp-token-model-type {
+  margin-left: 6px;
+  color: var(--td-text-color-placeholder);
+  font-family: var(--app-font-family-mono);
+  font-size: 10px;
+}
+
+.kp-token-total-cell {
+  color: var(--td-brand-color);
+  font-weight: 600;
+}
+
+@media (max-width: 760px) {
+  .kp-head {
+    padding-inline: 12px;
+  }
+
+  .kp-head-toolbar {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .kp-head-doc-title {
+    flex-basis: calc(100% - 88px);
+  }
+
+  .kp-head-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .kp-action-btn {
+    max-width: 100%;
+    white-space: normal;
+  }
+
+  .kp-retry-summary {
+    text-align: right;
+  }
+
+  .kp-ruler {
+    display: none;
+  }
+
+  .kp-row {
+    grid-template-columns: minmax(0, 1fr);
+    padding-inline: 12px;
+  }
+
+  .kp-cell-dur,
+  .kp-cell-bar {
+    display: none;
+  }
+
+  .kp-name-kind {
+    display: none;
+  }
+
+  .kp-detail-head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .kp-detail-title {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+  }
+
+  .kp-detail-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .kp-token-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .kp-transport-steps {
+    grid-template-columns: 1fr;
+  }
+}
+
 .kp-section-bar {
   display: flex;
   align-items: center;
@@ -2933,6 +3690,7 @@ const processConfigLines = computed<string[]>(() => {
   color: var(--td-text-color-secondary);
   font-size: 11px;
   padding: 3px 8px;
+  min-height: 36px;
   border-radius: var(--td-radius-default);
   cursor: pointer;
   transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
@@ -3311,5 +4069,13 @@ const processConfigLines = computed<string[]>(() => {
   line-height: 1.6;
   color: var(--td-text-color-secondary);
   word-break: break-word;
+}
+
+:global(:root[theme-mode='light']) .kp-row-retry {
+  color-scheme: light;
+}
+
+:global(:root[theme-mode='dark']) .kp-row-retry {
+  color-scheme: dark;
 }
 </style>

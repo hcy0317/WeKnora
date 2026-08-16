@@ -49,6 +49,207 @@ type wikiPageService struct {
 	redisClient     *redis.Client
 }
 
+// atomicWikiLinkRepository is implemented by the SQL wiki repository. Keeping
+// this capability local preserves compatibility with lightweight test/mocked
+// repositories while production writes gain a single page+revision+link
+// transaction boundary.
+type atomicWikiLinkRepository interface {
+	CreateWithLinks(ctx context.Context, page *types.WikiPage) error
+	UpdateWithRevisionAndLinks(
+		ctx context.Context,
+		page *types.WikiPage,
+		rev *types.WikiPageRevision,
+		oldOutLinks types.StringArray,
+	) error
+	UpdateMetaWithLinks(ctx context.Context, page *types.WikiPage, oldOutLinks types.StringArray) error
+	UpdateAutoLinkedContentWithLinks(ctx context.Context, page *types.WikiPage, oldOutLinks types.StringArray) error
+}
+
+// guardedWikiPageWriter is the pipeline-only page write capability. It keeps
+// the exact source attempts attached until the SQL repository validates them
+// in the same transaction as the page/revision/link write.
+type guardedWikiPageWriter interface {
+	CreatePageGuarded(
+		ctx context.Context, page *types.WikiPage, guards []types.WikiSourceAttemptGuard,
+	) (*types.WikiPage, error)
+	UpdatePageGuarded(
+		ctx context.Context, page *types.WikiPage, guards []types.WikiSourceAttemptGuard,
+	) (*types.WikiPage, error)
+	UpdatePageMetaGuarded(
+		ctx context.Context, page *types.WikiPage, guards []types.WikiSourceAttemptGuard,
+	) error
+}
+
+type wikiCanonicalRepository interface {
+	ResolveCanonicalWikiPageSlugs(
+		ctx context.Context, tenantID uint64, kbID string, candidates []types.WikiCanonicalCandidate,
+	) (map[string]string, error)
+	ReconcileCanonicalWikiPages(ctx context.Context, kbID string, affectedSlugs []string) (*types.WikiCanonicalReconcileResult, error)
+}
+
+func (s *wikiPageService) wikiIngestCheckpointStore() (interfaces.WikiIngestCheckpointStore, error) {
+	store, ok := s.repo.(interfaces.WikiIngestCheckpointStore)
+	if !ok || store == nil {
+		return nil, errors.New("wiki ingest checkpoint repository is unavailable")
+	}
+	return store, nil
+}
+
+func (s *wikiPageService) PrepareWikiIngestWorkUnit(
+	ctx context.Context, unit *types.WikiIngestWorkUnit,
+) (*types.WikiIngestWorkUnit, error) {
+	store, err := s.wikiIngestCheckpointStore()
+	if err != nil {
+		return nil, err
+	}
+	return store.PrepareWikiIngestWorkUnit(ctx, unit)
+}
+
+func (s *wikiPageService) PrepareAndBindWikiIngestWorkUnit(
+	ctx context.Context, binding types.WikiIngestWorkBinding, unit *types.WikiIngestWorkUnit,
+) (*types.WikiIngestWorkUnit, error) {
+	store, err := s.wikiIngestCheckpointStore()
+	if err != nil {
+		return nil, err
+	}
+	return store.PrepareAndBindWikiIngestWorkUnit(ctx, binding, unit)
+}
+
+func (s *wikiPageService) MarkWikiIngestWorkUnitMapped(
+	ctx context.Context, workID string, output types.JSON,
+) error {
+	store, err := s.wikiIngestCheckpointStore()
+	if err != nil {
+		return err
+	}
+	return store.MarkWikiIngestWorkUnitMapped(ctx, workID, output)
+}
+
+func (s *wikiPageService) PrepareWikiTaxonomyPlan(
+	ctx context.Context, plan *types.WikiTaxonomyPlan,
+) (*types.WikiTaxonomyPlan, error) {
+	store, err := s.wikiIngestCheckpointStore()
+	if err != nil {
+		return nil, err
+	}
+	return store.PrepareWikiTaxonomyPlan(ctx, plan)
+}
+
+func (s *wikiPageService) FindMappedWikiTaxonomyPlan(
+	ctx context.Context, tenantID uint64, knowledgeBaseID, workSetDigest, missingSetDigest, contractKey string,
+) (*types.WikiTaxonomyPlan, error) {
+	store, err := s.wikiIngestCheckpointStore()
+	if err != nil {
+		return nil, err
+	}
+	return store.FindMappedWikiTaxonomyPlan(ctx, tenantID, knowledgeBaseID, workSetDigest, missingSetDigest, contractKey)
+}
+
+func (s *wikiPageService) SaveWikiTaxonomyPlanProgress(
+	ctx context.Context, planID string, expected, output types.JSON,
+) error {
+	store, err := s.wikiIngestCheckpointStore()
+	if err != nil {
+		return err
+	}
+	return store.SaveWikiTaxonomyPlanProgress(ctx, planID, expected, output)
+}
+
+func (s *wikiPageService) MarkWikiTaxonomyPlanMapped(
+	ctx context.Context, planID string, output types.JSON,
+) error {
+	store, err := s.wikiIngestCheckpointStore()
+	if err != nil {
+		return err
+	}
+	return store.MarkWikiTaxonomyPlanMapped(ctx, planID, output)
+}
+
+func (s *wikiPageService) PrepareWikiSlugApplication(
+	ctx context.Context, application *types.WikiSlugApplication,
+) (*types.WikiSlugApplication, error) {
+	store, err := s.wikiIngestCheckpointStore()
+	if err != nil {
+		return nil, err
+	}
+	return store.PrepareWikiSlugApplication(ctx, application)
+}
+
+func (s *wikiPageService) MarkWikiSlugApplicationApplying(
+	ctx context.Context, planID, generatedOutput string,
+) error {
+	store, err := s.wikiIngestCheckpointStore()
+	if err != nil {
+		return err
+	}
+	return store.MarkWikiSlugApplicationApplying(ctx, planID, generatedOutput)
+}
+
+func (s *wikiPageService) FindWikiSlugApplication(
+	ctx context.Context, tenantID uint64, knowledgeBaseID, slug, contributionKey string,
+) (*types.WikiSlugApplication, error) {
+	store, err := s.wikiIngestCheckpointStore()
+	if err != nil {
+		return nil, err
+	}
+	return store.FindWikiSlugApplication(ctx, tenantID, knowledgeBaseID, slug, contributionKey)
+}
+
+func (s *wikiPageService) ListWikiSlugContributionMarkers(
+	ctx context.Context, workIDs []string,
+) ([]types.WikiSlugContributionMarker, error) {
+	store, err := s.wikiIngestCheckpointStore()
+	if err != nil {
+		return nil, err
+	}
+	return store.ListWikiSlugContributionMarkers(ctx, workIDs)
+}
+
+func (s *wikiPageService) CreatePageGuarded(
+	ctx context.Context, page *types.WikiPage, guards []types.WikiSourceAttemptGuard,
+) (*types.WikiPage, error) {
+	return s.CreatePage(types.WithWikiSourceAttemptGuards(ctx, guards), page)
+}
+
+func (s *wikiPageService) UpdatePageGuarded(
+	ctx context.Context, page *types.WikiPage, guards []types.WikiSourceAttemptGuard,
+) (*types.WikiPage, error) {
+	return s.UpdatePage(types.WithWikiSourceAttemptGuards(ctx, guards), page)
+}
+
+func (s *wikiPageService) UpdatePageMetaGuarded(
+	ctx context.Context, page *types.WikiPage, guards []types.WikiSourceAttemptGuard,
+) error {
+	ctx = types.WithWikiSourceAttemptGuards(ctx, guards)
+	normalizeWikiHierarchy(page)
+	page.UpdatedAt = time.Now()
+	atomicRepo, ok := s.repo.(atomicWikiLinkRepository)
+	if !ok {
+		return errors.New("guarded wiki metadata repository is unavailable")
+	}
+	return atomicRepo.UpdateMetaWithLinks(ctx, page, page.OutLinks)
+}
+
+func (s *wikiPageService) ResolveCanonicalWikiPageSlugs(
+	ctx context.Context, tenantID uint64, kbID string, candidates []types.WikiCanonicalCandidate,
+) (map[string]string, error) {
+	repo, ok := s.repo.(wikiCanonicalRepository)
+	if !ok {
+		return nil, errors.New("wiki canonical repository is unavailable")
+	}
+	return repo.ResolveCanonicalWikiPageSlugs(ctx, tenantID, kbID, candidates)
+}
+
+func (s *wikiPageService) ReconcileCanonicalWikiPages(
+	ctx context.Context, kbID string, affectedSlugs []string,
+) (*types.WikiCanonicalReconcileResult, error) {
+	repo, ok := s.repo.(wikiCanonicalRepository)
+	if !ok {
+		return nil, errors.New("wiki canonical repository is unavailable")
+	}
+	return repo.ReconcileCanonicalWikiPages(ctx, kbID, affectedSlugs)
+}
+
 // NewWikiPageService creates a new wiki page service
 func NewWikiPageService(
 	repo interfaces.WikiPageRepository,
@@ -98,12 +299,22 @@ func (s *wikiPageService) CreatePage(ctx context.Context, page *types.WikiPage) 
 	page.CreatedAt = now
 	page.UpdatedAt = now
 
-	if err := s.repo.Create(ctx, page); err != nil {
+	atomicRepo, atomic := s.repo.(atomicWikiLinkRepository)
+	var err error
+	if atomic {
+		err = atomicRepo.CreateWithLinks(ctx, page)
+	} else {
+		err = s.repo.Create(ctx, page)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("create wiki page: %w", err)
 	}
 
-	// Update inbound links on target pages
-	s.updateInLinks(ctx, page.KnowledgeBaseID, page.Slug, page.OutLinks)
+	if !atomic {
+		// Compatibility path for non-SQL test adapters. The production SQL
+		// repository always takes the atomic branch above.
+		s.updateInLinks(ctx, page.KnowledgeBaseID, page.Slug, page.OutLinks)
+	}
 
 	return page, nil
 }
@@ -166,6 +377,7 @@ func (s *wikiPageService) UpdatePage(ctx context.Context, page *types.WikiPage) 
 	existing.OutLinks = s.parseOutLinks(existing.Content)
 	normalizeWikiHierarchy(existing)
 
+	atomicRepo, atomic := s.repo.(atomicWikiLinkRepository)
 	if contentChanged {
 		// The new version is authored by whoever is driving this write.
 		existing.LastEditSource = types.WikiEditSourceFromContext(ctx)
@@ -174,8 +386,14 @@ func (s *wikiPageService) UpdatePage(ctx context.Context, page *types.WikiPage) 
 		// Snapshot the superseded version and write the new one atomically,
 		// so the content of every past version is preserved and a failed
 		// update leaves no snapshot behind.
-		if err := s.repo.UpdateWithRevision(ctx, existing, revisionFromPage(&prev)); err != nil {
-			return nil, fmt.Errorf("update wiki page: %w", err)
+		var updateErr error
+		if atomic {
+			updateErr = atomicRepo.UpdateWithRevisionAndLinks(ctx, existing, revisionFromPage(&prev), oldOutLinks)
+		} else {
+			updateErr = s.repo.UpdateWithRevision(ctx, existing, revisionFromPage(&prev))
+		}
+		if updateErr != nil {
+			return nil, fmt.Errorf("update wiki page: %w", updateErr)
 		}
 		// Bound per-page history; best-effort — a failed prune only means
 		// slightly more storage until the next content change.
@@ -183,15 +401,22 @@ func (s *wikiPageService) UpdatePage(ctx context.Context, page *types.WikiPage) 
 	} else {
 		// No user-visible change — persist bookkeeping fields but preserve
 		// the version so downstream consumers can rely on it.
-		if err := s.repo.UpdateMeta(ctx, existing); err != nil {
-			return nil, fmt.Errorf("update wiki page meta: %w", err)
+		var updateErr error
+		if atomic {
+			updateErr = atomicRepo.UpdateMetaWithLinks(ctx, existing, oldOutLinks)
+		} else {
+			updateErr = s.repo.UpdateMeta(ctx, existing)
+		}
+		if updateErr != nil {
+			return nil, fmt.Errorf("update wiki page meta: %w", updateErr)
 		}
 	}
 
-	// Update inbound links: remove old, add new. If content didn't change,
-	// oldOutLinks == existing.OutLinks and these calls are effectively no-ops.
-	s.removeInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, oldOutLinks)
-	s.updateInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, existing.OutLinks)
+	if !atomic {
+		// Compatibility path for non-SQL test adapters.
+		s.removeInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, oldOutLinks)
+		s.updateInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, existing.OutLinks)
+	}
 
 	return existing, nil
 }
@@ -220,12 +445,21 @@ func (s *wikiPageService) UpdateAutoLinkedContent(ctx context.Context, page *typ
 	existing.OutLinks = s.parseOutLinks(existing.Content)
 	existing.UpdatedAt = time.Now()
 
-	if err := s.repo.UpdateAutoLinkedContent(ctx, existing); err != nil {
-		return fmt.Errorf("update auto-linked content: %w", err)
+	atomicRepo, atomic := s.repo.(atomicWikiLinkRepository)
+	var updateErr error
+	if atomic {
+		updateErr = atomicRepo.UpdateAutoLinkedContentWithLinks(ctx, existing, oldOutLinks)
+	} else {
+		updateErr = s.repo.UpdateAutoLinkedContent(ctx, existing)
+	}
+	if updateErr != nil {
+		return fmt.Errorf("update auto-linked content: %w", updateErr)
 	}
 
-	s.removeInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, oldOutLinks)
-	s.updateInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, existing.OutLinks)
+	if !atomic {
+		s.removeInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, oldOutLinks)
+		s.updateInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, existing.OutLinks)
+	}
 
 	return nil
 }

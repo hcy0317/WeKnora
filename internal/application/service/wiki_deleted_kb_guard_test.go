@@ -113,7 +113,7 @@ func TestEnqueueWikiFinalizeOnlySchedulesAcceptedRows(t *testing.T) {
 			queue := &wikiGuardTaskQueue{}
 			svc := &wikiIngestService{pendingRepo: repo, task: queue}
 
-			svc.enqueueFinalize(
+			err := svc.enqueueFinalize(
 				context.Background(),
 				WikiIngestPayload{TenantID: 7, KnowledgeBaseID: "kb-1"},
 				[]string{"slug-1"},
@@ -124,9 +124,11 @@ func TestEnqueueWikiFinalizeOnlySchedulesAcceptedRows(t *testing.T) {
 
 			require.Len(t, repo.guardedOps, 3)
 			if accepted {
+				require.NoError(t, err)
 				require.Len(t, queue.tasks, 1)
 				assert.Equal(t, types.TypeWikiFinalize, queue.tasks[0].Type())
 			} else {
+				require.Error(t, err)
 				assert.Empty(t, queue.tasks)
 			}
 		})

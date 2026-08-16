@@ -149,7 +149,7 @@ func (s *vectorStoreService) UpdateStore(ctx context.Context, store *types.Vecto
 }
 
 // DeleteStore deletes a vector store by tenant + id, after verifying that no
-// knowledge base is currently bound to it.
+// active or soft-deleted knowledge base still retains a binding to it.
 //
 // Guard rules:
 //
@@ -163,9 +163,8 @@ func (s *vectorStoreService) UpdateStore(ctx context.Context, store *types.Vecto
 //     serializes writes via WAL + max-open-conns=1, so the lock hint is
 //     skipped and we rely on the transaction boundary alone.
 //  3. Count knowledge_bases rows via the shared CountByVectorStoreID
-//     repository method (tx-aware), which leverages the composite index
-//     (tenant_id, vector_store_id). GORM auto-applies the soft-delete
-//     scope — no explicit deleted_at predicate is needed.
+//     repository method (tx-aware), including soft-deleted rows until their
+//     async delete task atomically removes manifests and clears the binding.
 //  4. After commit, unregister from the in-memory registry. Wrapped in
 //     defer/recover so a panic in UnregisterByStoreID surfaces as a
 //     structured warning instead of silently leaking the stale engine.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Tencent/WeKnora/internal/application/repository"
@@ -27,6 +28,14 @@ import (
 // test crossing into the repository test file's identifiers couples the
 // two too tightly).
 const spanTrackerTestDDL = `
+CREATE TABLE IF NOT EXISTS knowledges (
+    id                     VARCHAR(64) PRIMARY KEY,
+    parse_status           VARCHAR(32) NOT NULL,
+    pending_subtasks_count INTEGER NOT NULL DEFAULT 0,
+    error_message          TEXT NOT NULL DEFAULT '',
+    processed_at           DATETIME,
+    updated_at             DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS knowledge_processing_spans (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     knowledge_id    VARCHAR(64) NOT NULL,
@@ -56,12 +65,119 @@ func setupSpanTrackerTest(t *testing.T) (SpanTracker, *gorm.DB) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(spanTrackerTestDDL).Error)
-	// Pass nil for the heartbeat db: these tests don't exercise
-	// heartbeat side-effects (those are covered in the housekeeping
-	// suite). Keeping it nil also avoids needing the knowledges
-	// table just to validate span behaviour.
+	// Pass nil for the heartbeat db: these tests don't exercise heartbeat
+	// side-effects (those are covered in the housekeeping suite). The
+	// knowledges table remains present for settlement and queue-state guards.
 	repo := repository.NewKnowledgeSpanRepository(db)
 	return NewSpanTracker(repo, nil), db
+}
+
+func TestSpanTracker_QueuedChildClaimReusesSpanWithoutFalseCancellation(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	root, attempt, err := tracker.OpenAttempt(ctx, "kid-queued-claim", "")
+	require.NoError(t, err)
+	queued := tracker.QueueSubSpan(ctx, root, "postprocess.summary", types.SpanKindSubSpan,
+		types.JSONMap{"queued_input": true})
+	require.NotNil(t, queued)
+	assert.Equal(t, types.SpanStatusPending, queued.Status)
+	duplicate := tracker.QueueSubSpan(ctx, root, "postprocess.summary", types.SpanKindSubSpan, nil)
+	require.NotNil(t, duplicate)
+	assert.Equal(t, queued.SpanID, duplicate.SpanID, "duplicate enqueue must reuse the pending claim")
+
+	running := tracker.BeginSubSpan(ctx, root, "postprocess.summary", types.SpanKindSubSpan,
+		types.JSONMap{"worker_input": true})
+	require.NotNil(t, running)
+	assert.Equal(t, queued.SpanID, running.SpanID)
+	assert.Equal(t, attempt, running.Attempt)
+	var rows []types.KnowledgeProcessingSpan
+	require.NoError(t, db.Where("knowledge_id = ? AND attempt = ? AND name = ?",
+		"kid-queued-claim", attempt, "postprocess.summary").Find(&rows).Error)
+	require.Len(t, rows, 1)
+	assert.Equal(t, types.SpanStatusRunning, rows[0].Status)
+	assert.Empty(t, rows[0].ErrorCode)
+	assert.Equal(t, true, rows[0].Input["queued_input"])
+	assert.Equal(t, true, rows[0].Input["worker_input"])
+}
+
+func TestSpanTracker_FailingPendingChildNormalizesStartedAt(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	root, attempt, err := tracker.OpenAttempt(ctx, "kid-pending-fail-time", "")
+	require.NoError(t, err)
+	queued := tracker.QueueSubSpan(ctx, root, "postprocess.summary", types.SpanKindSubSpan, nil)
+	require.NotNil(t, queued)
+	before := time.Now().Add(-time.Second)
+	tracker.FailSpan(ctx, queued, "ENQUEUE_FAILED", "queue unavailable", errors.New("queue unavailable"))
+	var row types.KnowledgeProcessingSpan
+	require.NoError(t, db.Where("knowledge_id = ? AND attempt = ? AND span_id = ?",
+		"kid-pending-fail-time", attempt, queued.SpanID).Take(&row).Error)
+	require.NotNil(t, row.StartedAt)
+	assert.True(t, row.StartedAt.After(before))
+	assert.GreaterOrEqual(t, row.DurationMs, int64(0))
+}
+
+func TestSpanTracker_QueueSubSpanRejectsCancelledKnowledgeAndSupersededAttempt(t *testing.T) {
+	t.Run("cancelled knowledge", func(t *testing.T) {
+		tracker, db := setupSpanTrackerTest(t)
+		ctx := context.Background()
+		_, attempt, err := tracker.OpenAttempt(ctx, "kid-queue-cancelled", "")
+		require.NoError(t, err)
+		post := tracker.BeginStage(ctx, "kid-queue-cancelled", attempt, types.StagePostProcess, nil)
+		require.NotNil(t, post)
+		require.NoError(t, db.Exec(`INSERT INTO knowledges
+			(id, parse_status, pending_subtasks_count) VALUES (?, ?, 1)`,
+			"kid-queue-cancelled", types.ParseStatusCancelled).Error)
+
+		assert.Nil(t, tracker.QueueSubSpan(ctx, post, "postprocess.summary", types.SpanKindSubSpan, nil))
+		var count int64
+		require.NoError(t, db.Model(&types.KnowledgeProcessingSpan{}).
+			Where("knowledge_id = ? AND attempt = ? AND name = ?",
+				"kid-queue-cancelled", attempt, "postprocess.summary").Count(&count).Error)
+		assert.Zero(t, count)
+	})
+
+	t.Run("superseded attempt", func(t *testing.T) {
+		tracker, db := setupSpanTrackerTest(t)
+		ctx := context.Background()
+		_, oldAttempt, err := tracker.OpenAttempt(ctx, "kid-queue-superseded", "")
+		require.NoError(t, err)
+		oldPost := tracker.BeginStage(ctx, "kid-queue-superseded", oldAttempt, types.StagePostProcess, nil)
+		require.NotNil(t, oldPost)
+		require.NoError(t, db.Exec(`INSERT INTO knowledges
+			(id, parse_status, pending_subtasks_count) VALUES (?, ?, 1)`,
+			"kid-queue-superseded", types.ParseStatusFinalizing).Error)
+		_, latestAttempt, err := tracker.OpenAttempt(ctx, "kid-queue-superseded", "")
+		require.NoError(t, err)
+		require.Greater(t, latestAttempt, oldAttempt)
+
+		assert.Nil(t, tracker.QueueSubSpan(ctx, oldPost, "postprocess.summary", types.SpanKindSubSpan, nil))
+		var count int64
+		require.NoError(t, db.Model(&types.KnowledgeProcessingSpan{}).
+			Where("knowledge_id = ? AND attempt = ? AND name = ?",
+				"kid-queue-superseded", oldAttempt, "postprocess.summary").Count(&count).Error)
+		assert.Zero(t, count)
+	})
+}
+
+func TestSpanTracker_RealRetryPreservesFailedHistory(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	root, attempt, err := tracker.OpenAttempt(ctx, "kid-real-retry", "")
+	require.NoError(t, err)
+	first := tracker.BeginSubSpan(ctx, root, "postprocess.summary", types.SpanKindSubSpan, nil)
+	require.NotNil(t, first)
+	tracker.FailSpan(ctx, first, "SUMMARY_FAILED", "first delivery failed", errors.New("first delivery failed"))
+
+	retry := tracker.BeginSubSpan(ctx, root, "postprocess.summary", types.SpanKindSubSpan, nil)
+	require.NotNil(t, retry)
+	assert.NotEqual(t, first.SpanID, retry.SpanID)
+	var rows []types.KnowledgeProcessingSpan
+	require.NoError(t, db.Where("knowledge_id = ? AND attempt = ? AND name = ?",
+		"kid-real-retry", attempt, "postprocess.summary").Order("id ASC").Find(&rows).Error)
+	require.Len(t, rows, 2)
+	assert.Equal(t, types.SpanStatusFailed, rows[0].Status)
+	assert.Equal(t, types.SpanStatusRunning, rows[1].Status)
 }
 
 // TestSpanTracker_OpenAttempt_AllocatesFreshNumbers covers the contract
@@ -90,6 +206,22 @@ func TestSpanTracker_OpenAttempt_AllocatesFreshNumbers(t *testing.T) {
 		Where("knowledge_id = ? AND kind = 'root'", "kid").
 		Count(&count).Error)
 	assert.Equal(t, int64(2), count, "previous attempt's root must remain after reparse")
+}
+
+func TestSpanTracker_OpenAttemptFailureDoesNotUpdateMemory(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	require.NoError(t, db.Exec(`CREATE TRIGGER reject_root_insert BEFORE INSERT ON knowledge_processing_spans
+		WHEN NEW.kind = 'root' BEGIN SELECT RAISE(ABORT, 'injected root failure'); END;`).Error)
+
+	root, attempt, err := tracker.OpenAttempt(context.Background(), "kid-open-failure", "trace")
+	require.ErrorContains(t, err, "injected root failure")
+	assert.Nil(t, root)
+	assert.Zero(t, attempt)
+
+	impl := tracker.(*spanTracker)
+	impl.startsMu.Lock()
+	defer impl.startsMu.Unlock()
+	assert.Empty(t, impl.starts, "failed repository transaction must not populate in-memory start times")
 }
 
 // TestSpanTracker_FailSpan_CascadesDownstream verifies that failing a
@@ -260,6 +392,27 @@ func TestSpanTracker_LookupSpanByName_FitsLongName(t *testing.T) {
 	assert.Equal(t, created.Name, found.Name)
 }
 
+func TestSpanTracker_LookupSpanByName_ReturnsLatestRetrySpan(t *testing.T) {
+	tracker, _ := setupSpanTrackerTest(t)
+	ctx := context.Background()
+
+	_, attempt, err := tracker.OpenAttempt(ctx, "kid-retry-parent", "")
+	require.NoError(t, err)
+	parent := tracker.BeginStage(ctx, "kid-retry-parent", attempt, types.StageMultimodal, nil)
+	require.NotNil(t, parent)
+
+	first := tracker.BeginSubSpan(ctx, parent, "multimodal.image[2]", types.SpanKindGeneration, nil)
+	require.NotNil(t, first)
+	second := tracker.BeginSubSpan(ctx, parent, "multimodal.image[2]", types.SpanKindGeneration, nil)
+	require.NotNil(t, second)
+	require.NotEqual(t, first.SpanID, second.SpanID)
+
+	found := tracker.LookupSpanByName(ctx, "kid-retry-parent", attempt, "multimodal.image[2]")
+	require.NotNil(t, found)
+	assert.Equal(t, second.SpanID, found.SpanID,
+		"vlm.predict from a retry must attach to the new image span, not the superseded row")
+}
+
 // TestSpanTracker_BeginSubSpan_HangsUnderParent confirms multimodal /
 // embedding fan-out subspans reference the parent stage's span_id —
 // the structural invariant the buildSpanTree handler walks.
@@ -290,13 +443,410 @@ func TestSpanTracker_BeginSubSpan_HangsUnderParent(t *testing.T) {
 	assert.Equal(t, parent.SpanID, rows[0].ParentSpanID, "subspan must reference parent stage's span_id")
 }
 
-// TestSpanTracker_BeginStage_ReentryIsIdempotent guarantees that a second
-// BeginStage call for the same (kid, attempt, stage) reuses the existing
-// span row instead of inserting a duplicate. Without this, an asynq retry
-// or any code path that begins a stage twice would produce two timeline
-// segments for the same stage, and LookupStage would resolve to whichever
-// row sorts first — both regressions the original implementation had.
-func TestSpanTracker_BeginStage_ReentryIsIdempotent(t *testing.T) {
+func TestSpanTracker_RecordGeneration_PersistsUsageUnderProcessingStage(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	_, attempt, err := tracker.OpenAttempt(ctx, "kid-usage", "trace-root")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, "kid-usage", attempt, types.StagePostProcess, nil)
+	require.NotNil(t, post)
+	summary := tracker.BeginSubSpan(ctx, post, "postprocess.summary", types.SpanKindSubSpan, nil)
+	require.NotNil(t, summary)
+	started := time.Now().Add(-250 * time.Millisecond)
+	finished := time.Now()
+	tracker.RecordGeneration(ctx, types.KnowledgeGenerationUsage{
+		KnowledgeID:     "kid-usage",
+		Attempt:         attempt,
+		TraceID:         "trace-1",
+		SpanID:          "generation-1",
+		Stage:           "postprocess.summary",
+		TaskType:        types.TypeSummaryGeneration,
+		Name:            "chat.completion",
+		ModelType:       "chat",
+		ModelID:         "model-1",
+		ModelName:       "gpt-test",
+		Purpose:         "document_summary",
+		InputTokens:     100,
+		OutputTokens:    20,
+		TotalTokens:     120,
+		CacheReadTokens: 80,
+		Unit:            "TOKENS",
+		UsageAvailable:  true,
+		Status:          types.SpanStatusDone,
+		StartedAt:       started,
+		FinishedAt:      finished,
+	})
+
+	var row types.KnowledgeProcessingSpan
+	require.NoError(t, db.Table("knowledge_processing_spans").
+		Where("knowledge_id = ? AND span_id = ?", "kid-usage", "generation-1").First(&row).Error)
+	assert.Equal(t, types.SpanKindGeneration, row.Kind)
+	assert.Equal(t, summary.SpanID, row.ParentSpanID)
+	assert.Equal(t, "gpt-test", row.Metadata["model_name"])
+	usage, ok := row.Output["usage"].(map[string]interface{})
+	if !ok {
+		usageMap, mapOK := row.Output["usage"].(types.JSONMap)
+		require.True(t, mapOK)
+		usage = map[string]interface{}(usageMap)
+	}
+	assert.EqualValues(t, 120, usage["total_tokens"])
+}
+
+func TestSpanTracker_RecordGenerationKeepsRetryAndCancellationHistory(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	_, attempt, err := tracker.OpenAttempt(ctx, "kid-generation-history", "trace-root")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, "kid-generation-history", attempt, types.StagePostProcess, nil)
+	extract := tracker.BeginSubSpan(ctx, post, "postprocess.wiki.extract", types.SpanKindSubSpan, nil)
+	require.NotNil(t, extract)
+	started := time.Now().Add(-time.Second)
+
+	first := types.KnowledgeGenerationUsage{
+		KnowledgeID: "kid-generation-history",
+		Attempt:     attempt,
+		SpanID:      "wiki-generation-first",
+		Stage:       "postprocess.wiki.extract",
+		Name:        "chat.response.stream",
+		Status:      types.SpanStatusRunning,
+		StartedAt:   started,
+	}
+	tracker.RecordGeneration(ctx, first)
+
+	var running types.KnowledgeProcessingSpan
+	require.NoError(t, db.Table("knowledge_processing_spans").
+		Where("knowledge_id = ? AND span_id = ?", first.KnowledgeID, first.SpanID).
+		First(&running).Error)
+	assert.Equal(t, types.SpanStatusRunning, running.Status)
+	assert.Nil(t, running.FinishedAt, "active generation must remain visibly unfinished")
+
+	first.Status = types.SpanStatusCancelled
+	first.ErrorMessage = context.Canceled.Error()
+	first.FinishedAt = time.Now()
+	tracker.RecordGeneration(ctx, first)
+	tracker.RecordGeneration(ctx, types.KnowledgeGenerationUsage{
+		KnowledgeID: first.KnowledgeID,
+		Attempt:     attempt,
+		SpanID:      "wiki-generation-retry",
+		Stage:       first.Stage,
+		Name:        first.Name,
+		Status:      types.SpanStatusDone,
+		StartedAt:   time.Now().Add(-100 * time.Millisecond),
+		FinishedAt:  time.Now(),
+	})
+
+	var rows []types.KnowledgeProcessingSpan
+	require.NoError(t, db.Table("knowledge_processing_spans").
+		Where("knowledge_id = ? AND kind = ?", first.KnowledgeID, types.SpanKindGeneration).
+		Order("id ASC").Find(&rows).Error)
+	require.Len(t, rows, 2, "retry must append a new generation instead of replacing cancelled history")
+	assert.Equal(t, types.SpanStatusCancelled, rows[0].Status)
+	assert.Equal(t, types.SpanStatusDone, rows[1].Status)
+	assert.NotNil(t, rows[0].FinishedAt)
+}
+
+func TestSpanTracker_SettleQuestionGroup_WaitsForEveryBatch(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	_, attempt, err := tracker.OpenAttempt(ctx, "kid-question-wait", "")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, "kid-question-wait", attempt, types.StagePostProcess, nil)
+	group := tracker.BeginSubSpan(ctx, post, postprocessQuestionGroupSpanName, types.SpanKindSubSpan,
+		types.JSONMap{"batch_count": 2})
+	batch0 := tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[0]", types.SpanKindSubSpan, nil)
+	batch1 := tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[1]", types.SpanKindSubSpan, nil)
+
+	tracker.EndSpan(ctx, batch0, nil)
+	tracker.SettleQuestionGroup(ctx, "kid-question-wait", attempt)
+	assertQuestionGroupStatus(t, db, group.SpanID, types.SpanStatusRunning)
+
+	tracker.EndSpan(ctx, batch1, nil)
+	tracker.SettleQuestionGroup(ctx, "kid-question-wait", attempt)
+	assertQuestionGroupStatus(t, db, group.SpanID, types.SpanStatusDone)
+}
+
+func TestSpanTracker_SettleQuestionGroup_RequiresExactBatchSlots(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	_, attempt, err := tracker.OpenAttempt(ctx, "kid-question-exact-slots", "")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, "kid-question-exact-slots", attempt, types.StagePostProcess, nil)
+	group := tracker.BeginSubSpan(ctx, post, postprocessQuestionGroupSpanName, types.SpanKindSubSpan,
+		types.JSONMap{"batch_count": 2})
+	batch0 := tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[0]", types.SpanKindSubSpan, nil)
+	batch99 := tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[99]", types.SpanKindSubSpan, nil)
+	tracker.EndSpan(ctx, batch0, nil)
+	tracker.EndSpan(ctx, batch99, nil)
+
+	tracker.SettleQuestionGroup(ctx, "kid-question-exact-slots", attempt)
+	assertQuestionGroupStatus(t, db, group.SpanID, types.SpanStatusRunning)
+
+	batch1 := tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[1]", types.SpanKindSubSpan, nil)
+	tracker.EndSpan(ctx, batch1, nil)
+	tracker.SettleQuestionGroup(ctx, "kid-question-exact-slots", attempt)
+	assertQuestionGroupStatus(t, db, group.SpanID, types.SpanStatusDone)
+}
+
+func TestSpanTracker_SettlePostProcessTree_LegacyPlanWithoutBranchesStaysRunning(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	_, attempt, err := tracker.OpenAttempt(ctx, "kid-postprocess-legacy-empty", "")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, "kid-postprocess-legacy-empty", attempt, types.StagePostProcess, nil)
+
+	tracker.SettlePostProcessTree(ctx, "kid-postprocess-legacy-empty", attempt)
+	assertQuestionGroupStatus(t, db, post.SpanID, types.SpanStatusRunning)
+}
+
+func TestSpanTracker_SettleQuestionGroup_FailsOnlyAfterEveryBatchIsTerminal(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	_, attempt, err := tracker.OpenAttempt(ctx, "kid-question-fail", "")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, "kid-question-fail", attempt, types.StagePostProcess, nil)
+	group := tracker.BeginSubSpan(ctx, post, postprocessQuestionGroupSpanName, types.SpanKindSubSpan,
+		types.JSONMap{"batch_count": 2})
+	batch0 := tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[0]", types.SpanKindSubSpan, nil)
+	batch1 := tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[1]", types.SpanKindSubSpan, nil)
+
+	tracker.FailSpan(ctx, batch0, "QUESTION_FAILED", "upstream failed", errors.New("boom"))
+	tracker.SettleQuestionGroup(ctx, "kid-question-fail", attempt)
+	assertQuestionGroupStatus(t, db, group.SpanID, types.SpanStatusRunning)
+
+	tracker.EndSpan(ctx, batch1, nil)
+	tracker.SettleQuestionGroup(ctx, "kid-question-fail", attempt)
+	assertQuestionGroupStatus(t, db, group.SpanID, types.SpanStatusFailed)
+}
+
+func TestSpanTracker_SettleQuestionGroup_UsesLatestRetryForEachBatch(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	_, attempt, err := tracker.OpenAttempt(ctx, "kid-question-retry", "")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, "kid-question-retry", attempt, types.StagePostProcess, nil)
+	group := tracker.BeginSubSpan(ctx, post, postprocessQuestionGroupSpanName, types.SpanKindSubSpan,
+		types.JSONMap{"batch_count": 1})
+	_ = tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[0]", types.SpanKindSubSpan, nil)
+	retry := tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[0]", types.SpanKindSubSpan, nil)
+
+	tracker.SettleQuestionGroup(ctx, "kid-question-retry", attempt)
+	assertQuestionGroupStatus(t, db, group.SpanID, types.SpanStatusRunning)
+
+	tracker.EndSpan(ctx, retry, nil)
+	tracker.SettleQuestionGroup(ctx, "kid-question-retry", attempt)
+	assertQuestionGroupStatus(t, db, group.SpanID, types.SpanStatusDone)
+}
+
+func TestSpanTracker_SettleQuestionGroup_PersistsWithCancelledContext(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	_, attempt, err := tracker.OpenAttempt(ctx, "kid-question-cancelled-ctx", "")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, "kid-question-cancelled-ctx", attempt, types.StagePostProcess, nil)
+	group := tracker.BeginSubSpan(ctx, post, postprocessQuestionGroupSpanName, types.SpanKindSubSpan,
+		types.JSONMap{"batch_count": 1})
+	batch := tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[0]", types.SpanKindSubSpan, nil)
+	tracker.EndSpan(ctx, batch, nil)
+
+	cancelledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	tracker.SettleQuestionGroup(cancelledCtx, "kid-question-cancelled-ctx", attempt)
+	assertQuestionGroupStatus(t, db, group.SpanID, types.SpanStatusDone)
+}
+
+func TestSpanTracker_SettleQuestionGroup_ConcurrentLastBatchesDoNotHang(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	ctx := context.Background()
+	_, attempt, err := tracker.OpenAttempt(ctx, "kid-question-concurrent", "")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, "kid-question-concurrent", attempt, types.StagePostProcess, nil)
+	group := tracker.BeginSubSpan(ctx, post, postprocessQuestionGroupSpanName, types.SpanKindSubSpan,
+		types.JSONMap{"batch_count": 2})
+	batch0 := tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[0]", types.SpanKindSubSpan, nil)
+	batch1 := tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[1]", types.SpanKindSubSpan, nil)
+
+	start := make(chan struct{})
+	done := make(chan struct{}, 2)
+	for _, batch := range []*Span{batch0, batch1} {
+		go func(batch *Span) {
+			<-start
+			tracker.EndSpan(ctx, batch, nil)
+			tracker.SettleQuestionGroup(ctx, "kid-question-concurrent", attempt)
+			done <- struct{}{}
+		}(batch)
+	}
+	close(start)
+	<-done
+	<-done
+	assertQuestionGroupStatus(t, db, group.SpanID, types.SpanStatusDone)
+}
+
+func TestSpanTracker_QuestionGroup_CancelAndSupersedeAreTerminal(t *testing.T) {
+	t.Run("user cancel", func(t *testing.T) {
+		tracker, db := setupSpanTrackerTest(t)
+		ctx := context.Background()
+		_, attempt, err := tracker.OpenAttempt(ctx, "kid-question-user-cancel", "")
+		require.NoError(t, err)
+		post := tracker.BeginStage(ctx, "kid-question-user-cancel", attempt, types.StagePostProcess, nil)
+		group := tracker.BeginSubSpan(ctx, post, postprocessQuestionGroupSpanName, types.SpanKindSubSpan,
+			types.JSONMap{"batch_count": 1})
+		_ = tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[0]", types.SpanKindSubSpan, nil)
+
+		tracker.AbortAttempt(ctx, "kid-question-user-cancel", attempt,
+			"USER_CANCELLED", "cancelled", "user cancelled")
+		assertQuestionGroupStatus(t, db, group.SpanID, types.SpanStatusCancelled)
+	})
+
+	t.Run("new attempt supersedes old", func(t *testing.T) {
+		tracker, db := setupSpanTrackerTest(t)
+		ctx := context.Background()
+		_, attempt, err := tracker.OpenAttempt(ctx, "kid-question-superseded", "")
+		require.NoError(t, err)
+		post := tracker.BeginStage(ctx, "kid-question-superseded", attempt, types.StagePostProcess, nil)
+		group := tracker.BeginSubSpan(ctx, post, postprocessQuestionGroupSpanName, types.SpanKindSubSpan,
+			types.JSONMap{"batch_count": 1})
+		_ = tracker.BeginSubSpan(ctx, group, "postprocess.question.batch[0]", types.SpanKindSubSpan, nil)
+
+		_, _, err = tracker.OpenAttempt(ctx, "kid-question-superseded", "")
+		require.NoError(t, err)
+		assertQuestionGroupStatus(t, db, group.SpanID, types.SpanStatusCancelled)
+	})
+}
+
+func assertQuestionGroupStatus(t *testing.T, db *gorm.DB, spanID, expected string) {
+	t.Helper()
+	var row types.KnowledgeProcessingSpan
+	require.NoError(t, db.Table("knowledge_processing_spans").Where("span_id = ?", spanID).First(&row).Error)
+	assert.Equal(t, expected, row.Status)
+}
+
+func assertProcessingSpanStatus(t *testing.T, db *gorm.DB, knowledgeID string, attempt int, name, kind, expected string) {
+	t.Helper()
+	var row types.KnowledgeProcessingSpan
+	require.NoError(t, db.Table("knowledge_processing_spans").
+		Where("knowledge_id = ? AND attempt = ? AND name = ? AND kind = ?", knowledgeID, attempt, name, kind).
+		First(&row).Error)
+	assert.Equal(t, expected, row.Status)
+}
+
+func TestSettlePostProcessTree_WaitsForEveryDurableBranch(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	const knowledgeID = "kid-postprocess-waits"
+	_, attempt, err := tracker.OpenAttempt(ctx, knowledgeID, "")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, knowledgeID, attempt, types.StagePostProcess, nil)
+	summary := tracker.BeginSubSpan(ctx, post, "postprocess.summary", types.SpanKindSubSpan, nil)
+	wiki := tracker.BeginSubSpan(ctx, post, "postprocess.wiki", types.SpanKindSubSpan, nil)
+
+	tracker.EndSpan(ctx, summary, nil)
+	tracker.SettlePostProcessTree(ctx, knowledgeID, attempt)
+
+	assertProcessingSpanStatus(t, db, knowledgeID, attempt, types.StagePostProcess,
+		types.SpanKindStage, types.SpanStatusRunning)
+	assertProcessingSpanStatus(t, db, knowledgeID, attempt, "knowledge_processing",
+		types.SpanKindRoot, types.SpanStatusRunning)
+
+	tracker.EndSpan(ctx, wiki, nil)
+	tracker.SettlePostProcessTree(ctx, knowledgeID, attempt)
+
+	assertProcessingSpanStatus(t, db, knowledgeID, attempt, types.StagePostProcess,
+		types.SpanKindStage, types.SpanStatusDone)
+	assertProcessingSpanStatus(t, db, knowledgeID, attempt, "knowledge_processing",
+		types.SpanKindRoot, types.SpanStatusDone)
+}
+
+func TestSettlePostProcessTree_PropagatesFinalBranchFailureToParents(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	const knowledgeID = "kid-postprocess-failed"
+	_, attempt, err := tracker.OpenAttempt(ctx, knowledgeID, "")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, knowledgeID, attempt, types.StagePostProcess, nil)
+	summary := tracker.BeginSubSpan(ctx, post, "postprocess.summary", types.SpanKindSubSpan, nil)
+
+	tracker.FailSpan(ctx, summary, "SUMMARY_FAILED", "upstream failed", errors.New("upstream failed"))
+	tracker.SettlePostProcessTree(ctx, knowledgeID, attempt)
+
+	assertProcessingSpanStatus(t, db, knowledgeID, attempt, types.StagePostProcess,
+		types.SpanKindStage, types.SpanStatusFailed)
+	assertProcessingSpanStatus(t, db, knowledgeID, attempt, "knowledge_processing",
+		types.SpanKindRoot, types.SpanStatusFailed)
+}
+
+func TestSettlePostProcessTree_UsesLatestRetryForLogicalBranch(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	const knowledgeID = "kid-postprocess-retry"
+	_, attempt, err := tracker.OpenAttempt(ctx, knowledgeID, "")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, knowledgeID, attempt, types.StagePostProcess, nil)
+
+	failedWiki := tracker.BeginSubSpan(ctx, post, "postprocess.wiki", types.SpanKindSubSpan, nil)
+	tracker.FailSpan(ctx, failedWiki, "WIKI_FAILED", "transient", errors.New("transient"))
+	successfulRetry := tracker.BeginSubSpan(ctx, post, "postprocess.wiki", types.SpanKindSubSpan, nil)
+	tracker.EndSpan(ctx, successfulRetry, nil)
+	tracker.SettlePostProcessTree(ctx, knowledgeID, attempt)
+
+	assertProcessingSpanStatus(t, db, knowledgeID, attempt, types.StagePostProcess,
+		types.SpanKindStage, types.SpanStatusDone)
+	assertProcessingSpanStatus(t, db, knowledgeID, attempt, "knowledge_processing",
+		types.SpanKindRoot, types.SpanStatusDone)
+}
+
+func TestSettlePostProcessTree_FailsWhenPlannedBranchIsMissing(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	const knowledgeID = "kid-postprocess-missing-planned-branch"
+	_, attempt, err := tracker.OpenAttempt(ctx, knowledgeID, "")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, knowledgeID, attempt, types.StagePostProcess, types.JSONMap{
+		"expected_branches": []string{"postprocess.summary", "postprocess.wiki"},
+		"fanout_complete":   true,
+	})
+	summary := tracker.BeginSubSpan(ctx, post, "postprocess.summary", types.SpanKindSubSpan, nil)
+	tracker.EndSpan(ctx, summary, nil)
+
+	tracker.SettlePostProcessTree(ctx, knowledgeID, attempt)
+
+	assertProcessingSpanStatus(t, db, knowledgeID, attempt, types.StagePostProcess,
+		types.SpanKindStage, types.SpanStatusFailed)
+	assertProcessingSpanStatus(t, db, knowledgeID, attempt, "knowledge_processing",
+		types.SpanKindRoot, types.SpanStatusFailed)
+	var row types.KnowledgeProcessingSpan
+	require.NoError(t, db.Table("knowledge_processing_spans").
+		Where("knowledge_id = ? AND attempt = ? AND name = ?", knowledgeID, attempt, types.StagePostProcess).
+		First(&row).Error)
+	assert.Equal(t, "POSTPROCESS_BRANCH_MISSING", row.ErrorCode)
+}
+
+func TestSettlePostProcessTree_PersistsThroughCancelledWorkerContext(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	const knowledgeID = "kid-postprocess-cancelled-context"
+	_, attempt, err := tracker.OpenAttempt(ctx, knowledgeID, "")
+	require.NoError(t, err)
+	post := tracker.BeginStage(ctx, knowledgeID, attempt, types.StagePostProcess, nil)
+	summary := tracker.BeginSubSpan(ctx, post, "postprocess.summary", types.SpanKindSubSpan, nil)
+	tracker.EndSpan(ctx, summary, nil)
+	cancel()
+
+	tracker.SettlePostProcessTree(ctx, knowledgeID, attempt)
+
+	assertProcessingSpanStatus(t, db, knowledgeID, attempt, types.StagePostProcess,
+		types.SpanKindStage, types.SpanStatusDone)
+	assertProcessingSpanStatus(t, db, knowledgeID, attempt, "knowledge_processing",
+		types.SpanKindRoot, types.SpanStatusDone)
+}
+
+// TestSpanTracker_BeginStage_DoesNotReenterAfterTerminalRoot guarantees that
+// a late delivery cannot reopen a stage after its main-pipeline failure has
+// already closed the attempt root. Retryable failures are no longer finalized
+// until their last Asynq delivery, so a failed root is a terminal boundary.
+func TestSpanTracker_BeginStage_DoesNotReenterAfterTerminalRoot(t *testing.T) {
 	tracker, db := setupSpanTrackerTest(t)
 	ctx := context.Background()
 
@@ -305,14 +855,11 @@ func TestSpanTracker_BeginStage_ReentryIsIdempotent(t *testing.T) {
 
 	first := tracker.BeginStage(ctx, "kid", attempt, types.StageDocReader, types.JSONMap{"pages": 1})
 	require.NotNil(t, first)
-	// Simulate an intermediate End so the row is in a terminal state when
-	// the re-entry happens (mirrors retry-after-failure ordering).
+	// A main-stage failure closes both the stage and the attempt root.
 	tracker.FailSpan(ctx, first, "TEST", "first failure", errors.New("boom"))
 
 	second := tracker.BeginStage(ctx, "kid", attempt, types.StageDocReader, types.JSONMap{"pages": 2})
-	require.NotNil(t, second)
-	assert.Equal(t, first.SpanID, second.SpanID,
-		"re-entry must reuse the existing stage span_id")
+	require.Nil(t, second)
 
 	type row struct {
 		SpanID, Status string
@@ -323,8 +870,34 @@ func TestSpanTracker_BeginStage_ReentryIsIdempotent(t *testing.T) {
 		Where("knowledge_id = ? AND attempt = ? AND name = ?", "kid", attempt, types.StageDocReader).
 		Find(&rows).Error)
 	require.Len(t, rows, 1, "exactly one row per (knowledge, attempt, stage)")
-	assert.Equal(t, types.SpanStatusRunning, rows[0].Status,
-		"row must transition back to running after re-entry")
+	assert.Equal(t, types.SpanStatusFailed, rows[0].Status,
+		"terminal attempt stages must stay frozen")
+}
+
+func TestSpanTracker_BeginStage_ReentryWithNilInputPreservesPersistedPlan(t *testing.T) {
+	tracker, db := setupSpanTrackerTest(t)
+	ctx := context.Background()
+	_, attempt, err := tracker.OpenAttempt(ctx, "kid-stage-input", "")
+	require.NoError(t, err)
+	want := types.JSONMap{
+		"fanout_complete":   false,
+		"expected_branches": []string{"postprocess.summary", "postprocess.wiki"},
+		"fanout_plan":       types.JSONMap{"version": 1, "wiki": true},
+	}
+	first := tracker.BeginStage(ctx, "kid-stage-input", attempt, types.StagePostProcess, want)
+	require.NotNil(t, first)
+
+	second := tracker.BeginStage(ctx, "kid-stage-input", attempt, types.StagePostProcess, nil)
+	require.NotNil(t, second)
+	assert.Equal(t, false, second.Input["fanout_complete"])
+	assert.ElementsMatch(t, []any{"postprocess.summary", "postprocess.wiki"}, second.Input["expected_branches"])
+
+	var row types.KnowledgeProcessingSpan
+	require.NoError(t, db.Where("knowledge_id = ? AND attempt = ? AND span_id = ?",
+		"kid-stage-input", attempt, first.SpanID).Take(&row).Error)
+	assert.Equal(t, false, row.Input["fanout_complete"])
+	assert.ElementsMatch(t, []any{"postprocess.summary", "postprocess.wiki"}, row.Input["expected_branches"])
+	require.NotNil(t, row.Input["fanout_plan"])
 }
 
 // TestSpanTracker_FailSpan_CascadesDependentSubspans verifies that when a

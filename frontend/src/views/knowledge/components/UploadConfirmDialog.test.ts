@@ -6,6 +6,7 @@ const dialog = readFileSync(new URL('./UploadConfirmDialog.vue', import.meta.url
 const host = readFileSync(new URL('../../../components/UploadConfirmHost.vue', import.meta.url), 'utf8')
 const knowledgeBase = readFileSync(new URL('../KnowledgeBase.vue', import.meta.url), 'utf8')
 const platform = readFileSync(new URL('../../platform/index.vue', import.meta.url), 'utf8')
+const docContent = readFileSync(new URL('../../../components/doc-content.vue', import.meta.url), 'utf8')
 
 test('selects multiple document tags and returns them with the confirmation result', () => {
   assert.match(host, /:tag-ids="uploadConfirmStore\.tagIds"/)
@@ -40,6 +41,13 @@ test('takes the upload destination folder from the confirmation result', () => {
   assert.match(knowledgeBase, /targetFolder: result\.targetFolder \|\| ROOT_FOLDER_PATH/)
   assert.match(knowledgeBase, /targetFolder: selectedFolderPath\.value/)
   assert.match(knowledgeBase, /folderOptions: folderOptions\.value/)
+})
+
+test('keeps the global upload dialog below document detail drawers', () => {
+  assert.match(dialog, /\.upload-confirm-overlay\s*\{[\s\S]*?z-index:\s*1900;/)
+  assert.match(dialog, /:z-index="1950"/)
+  assert.match(docContent, /:zIndex="2000"/)
+  assert.match(docContent, /:zIndex="2100"/)
 })
 
 test('creates sub-folders from per-row actions without changing the selected destination', () => {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -32,6 +33,38 @@ type GeneratedQuestion struct {
 }
 
 const maxGeneratedQuestionSourceIDLength = 64
+
+// StableGeneratedQuestionID derives the durable logical identity used by
+// asynchronous question publication. Question text is intentionally excluded:
+// retries may receive different wording from the model, while the logical slot
+// must keep addressing the same vector.
+func StableGeneratedQuestionID(
+	knowledgeID, chunkID string, contentRevision, batchIndex, ordinal int,
+) string {
+	hash := sha256.New()
+	for _, part := range []string{
+		"generated-question-v1", knowledgeID, chunkID,
+		strconv.Itoa(contentRevision), strconv.Itoa(batchIndex), strconv.Itoa(ordinal),
+	} {
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(part))
+	}
+	return "q" + hex.EncodeToString(hash.Sum(nil)[:12])
+}
+
+func QuestionGenerationKey(
+	tenantID uint64, knowledgeID, chunkID string, contentRevision, batchIndex int,
+) string {
+	hash := sha256.New()
+	for _, part := range []string{
+		"question-generation-v1", strconv.FormatUint(tenantID, 10), knowledgeID, chunkID,
+		strconv.Itoa(contentRevision), strconv.Itoa(batchIndex),
+	} {
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(part))
+	}
+	return "qg-" + hex.EncodeToString(hash.Sum(nil)[:16])
+}
 
 // GeneratedQuestionSourceID builds the retrieval source identifier for a
 // generated question. PostgreSQL stores source_id as varchar(64), while a

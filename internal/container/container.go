@@ -83,6 +83,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/models/embedding"
 	"github.com/Tencent/WeKnora/internal/models/limiter"
+	"github.com/Tencent/WeKnora/internal/models/openaiapi"
 	"github.com/Tencent/WeKnora/internal/models/utils/ollama"
 	"github.com/Tencent/WeKnora/internal/router"
 	"github.com/Tencent/WeKnora/internal/storageallowlist"
@@ -119,6 +120,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(initDatabase))
 	must(container.Provide(initFileService))
 	must(container.Provide(initRedisClient))
+	must(container.Invoke(registerOpenAIProtocolStore))
 	must(container.Provide(initAntsPool))
 
 	must(container.Invoke(registerLangfuseCleanup))
@@ -178,6 +180,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewWikiPageRepository))
 	must(container.Provide(repository.NewMemoryRepository))
 	must(container.Provide(repository.NewTaskPendingOpsRepository))
+	must(container.Provide(repository.NewQuestionGenerationManifestRepository))
 	must(container.Provide(repository.NewTaskDeadLetterRepository))
 
 	// MCP manager for managing MCP client connections
@@ -209,6 +212,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(service.NewAgentShareService))
 	must(container.Provide(service.NewKnowledgeService))
 	must(container.Provide(service.NewSpanTracker))
+	must(container.Invoke(registerKnowledgeUsageRecorder))
 	must(container.Provide(service.NewChunkService))
 	must(container.Provide(service.NewKnowledgeTagService))
 	must(container.Provide(embedding.NewBatchEmbedder))
@@ -433,15 +437,23 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	logger.Debugf(ctx, "[Container] Registering router and starting task server...")
 	must(container.Provide(router.NewRouter))
 	if redisAvailable {
+		// Recover durable Wiki rows before this replica starts consuming the
+		// queue. That removes the local startup race where a pending task could
+		// become active between active-worker inspection and orphan-claim release.
+		// Active tasks owned by other replicas remain visible through Redis and
+		// keep their claims protected.
+		must(container.Invoke(recoverPendingWikiTasksWithInspector))
+		must(container.Invoke(startPendingSpanRetryRecovery))
+		must(container.Invoke(startPendingKBDeletionRecovery))
 		must(container.Invoke(router.RunAsynqServer))
 	} else {
 		must(container.Invoke(router.RegisterSyncHandlers))
+		// Lite tasks execute inline, so handlers must be registered before the
+		// durable wake-up triggers are recreated.
+		must(container.Invoke(recoverPendingWikiTasksWithInspector))
+		must(container.Invoke(startPendingSpanRetryRecovery))
+		must(container.Invoke(startPendingKBDeletionRecovery))
 	}
-	// Wiki operation rows are durable, while their wake-up triggers may be
-	// lost across a process restart (always in Lite mode, and in Redis mode if
-	// persistence succeeded immediately before trigger enqueue failed). Re-arm
-	// them only after the matching handlers are ready.
-	must(container.Invoke(recoverPendingWikiTasks))
 
 	logger.Infof(ctx, "[Container] Container initialization completed successfully")
 	return container
@@ -556,6 +568,10 @@ func registerModelConcurrencyLimiter(rdb *redis.Client, ss interfaces.SystemSett
 	}
 	logger.Infof(context.Background(),
 		"[ModelLimiter] background model concurrency governed per-model, limit=%d (distributed via redis)", limit)
+}
+
+func registerOpenAIProtocolStore(rdb *redis.Client) {
+	openaiapi.SetProtocolStore(openaiapi.NewRedisProtocolStore(rdb))
 }
 
 // registerLiteModelConcurrencyLimiter installs an in-process per-model governor
@@ -723,6 +739,9 @@ func initDatabase(cfg *config.Config) (*gorm.DB, error) {
 		// Run base migrations (all versioned migrations including embeddings)
 		// The embeddings migration will be conditionally executed based on skip_embedding parameter in DSN
 		if err := database.RunMigrationsWithOptions(migrateDSN, migrationOpts); err != nil {
+			if fatalErr := fatalMigrationStartupError(err); fatalErr != nil {
+				return nil, fatalErr
+			}
 			// Log warning but don't fail startup - migrations might be handled externally
 			logger.Warnf(context.Background(), "Database migration failed: %v", err)
 			logger.Warnf(
@@ -731,18 +750,18 @@ func initDatabase(cfg *config.Config) (*gorm.DB, error) {
 			)
 		}
 
-		// Post-migration: resolve __pending_env__ storage provider markers for historical KBs.
-		// The SQL migration marks KBs that have documents but no provider with "__pending_env__";
-		// we replace that with the actual STORAGE_TYPE from the environment.
-		resolveStorageProviderPending(db)
-		migrateLegacyStorageBackends(db)
-
-		// Post-migration: declarative built-in models from config/builtin_models.yaml (optional).
-		if err := types.LoadBuiltinModelsConfig(context.Background(), db, config.ConfigDir()); err != nil {
-			logger.Warnf(context.Background(), "Load builtin models config failed: %v", err)
-		}
 	} else {
 		logger.Infof(context.Background(), "Auto-migration is disabled (AUTO_MIGRATE=false)")
+	}
+
+	// Startup maintenance is separate from schema migration. Deployments that
+	// run a one-shot migrator start this process with AUTO_MIGRATE=false after
+	// the schema gate succeeds; they still need environment-backed storage
+	// binding, orphan cleanup, and declarative built-in model refresh.
+	resolveStorageProviderPending(db)
+	migrateLegacyStorageBackends(db)
+	if err := types.LoadBuiltinModelsConfig(context.Background(), db, config.ConfigDir()); err != nil {
+		logger.Warnf(context.Background(), "Load builtin models config failed: %v", err)
 	}
 
 	// Get underlying SQL DB object
@@ -763,6 +782,51 @@ func initDatabase(cfg *config.Config) (*gorm.DB, error) {
 	sqlDB.SetConnMaxLifetime(time.Duration(10) * time.Minute)
 
 	return db, nil
+}
+
+// RunMigrationsOnly applies versioned migrations and exits without building
+// the application container or starting background workers. Dirty-state
+// recovery is opt-in so deployment cutovers fail closed by default.
+func RunMigrationsOnly() error {
+	var migrateDSN string
+	var sqliteDBPath string
+	switch os.Getenv("DB_DRIVER") {
+	case "postgres":
+		retrieveDriver := strings.Split(os.Getenv("RETRIEVE_DRIVER"), ",")
+		skipEmbedding := "true"
+		if slices.Contains(retrieveDriver, "postgres") {
+			skipEmbedding = "false"
+		}
+		migrateDSN = fmt.Sprintf(
+			"postgres://%s:%s@%s:%s/%s?sslmode=disable&options=-c%%20app.skip_embedding=%s",
+			os.Getenv("DB_USER"),
+			url.QueryEscape(os.Getenv("DB_PASSWORD")),
+			os.Getenv("DB_HOST"),
+			os.Getenv("DB_PORT"),
+			os.Getenv("DB_NAME"),
+			skipEmbedding,
+		)
+	case "sqlite":
+		sqliteDBPath = os.Getenv("DB_PATH")
+		if sqliteDBPath == "" {
+			sqliteDBPath = "./data/weknora.db"
+		}
+		migrateDSN = "sqlite3://" + sqliteDBPath
+	default:
+		return fmt.Errorf("unsupported database driver: %s", os.Getenv("DB_DRIVER"))
+	}
+
+	return database.RunMigrationsWithOptions(migrateDSN, database.MigrationOptions{
+		AutoRecoverDirty: os.Getenv("AUTO_RECOVER_DIRTY") == "true",
+		SQLiteDBPath:     sqliteDBPath,
+	})
+}
+
+func fatalMigrationStartupError(err error) error {
+	if errors.Is(err, database.ErrMigrationGate) || errors.Is(err, database.ErrMigrationUnsafe) {
+		return fmt.Errorf("database migration safety gate failed: %w", err)
+	}
+	return nil
 }
 
 // resolveStorageProviderPending replaces the "__pending_env__" sentinel in
@@ -1478,6 +1542,15 @@ func registerLangfuseCleanup(mgr *langfuse.Manager, cleaner interfaces.ResourceC
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		return mgr.Shutdown(ctx)
+	})
+}
+
+func registerKnowledgeUsageRecorder(mgr *langfuse.Manager, tracker service.SpanTracker) {
+	if mgr == nil || tracker == nil {
+		return
+	}
+	mgr.SetKnowledgeUsageRecorder(func(ctx context.Context, record types.KnowledgeGenerationUsage) {
+		tracker.RecordGeneration(ctx, record)
 	})
 }
 

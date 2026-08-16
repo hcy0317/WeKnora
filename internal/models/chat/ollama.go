@@ -201,26 +201,40 @@ func (c *OllamaChat) ChatStream(
 
 		var thinking thinkingEmitter
 		err := c.ollamaService.Chat(ctx, chatReq, func(resp ollamaapi.ChatResponse) error {
+			cancelled := func() error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				return context.Canceled
+			}
 			// 发送思考内容（支持 Qwen3、DeepSeek 等推理模型）
 			if resp.Message.Thinking != "" {
-				thinking.emit(streamChan, resp.Message.Thinking)
+				if !thinking.emit(ctx, streamChan, resp.Message.Thinking) {
+					return cancelled()
+				}
 			}
 
 			if resp.Message.Content != "" {
 				// 思考阶段结束后，发送思考完成事件
-				thinking.finish(streamChan)
-				streamChan <- types.StreamResponse{
+				if !thinking.finish(ctx, streamChan) {
+					return cancelled()
+				}
+				if !sendStreamResponse(ctx, streamChan, types.StreamResponse{
 					ResponseType: types.ResponseTypeAnswer,
 					Content:      resp.Message.Content,
 					Done:         false,
+				}) {
+					return cancelled()
 				}
 			}
 
 			if len(resp.Message.ToolCalls) > 0 {
-				streamChan <- types.StreamResponse{
+				if !sendStreamResponse(ctx, streamChan, types.StreamResponse{
 					ResponseType: types.ResponseTypeToolCall,
 					ToolCalls:    c.toolCallTo(resp.Message.ToolCalls),
 					Done:         false,
+				}) {
+					return cancelled()
 				}
 
 				// Ollama returns tool calls as complete objects (not incremental deltas).
@@ -239,7 +253,7 @@ func (c *OllamaChat) ChatStream(
 					switch tc.Function.Name {
 					case "thinking":
 						if thought, ok := argsMap["thought"].(string); ok && thought != "" {
-							streamChan <- types.StreamResponse{
+							if !sendStreamResponse(ctx, streamChan, types.StreamResponse{
 								ResponseType: types.ResponseTypeThinking,
 								Content:      thought,
 								Done:         false,
@@ -247,6 +261,8 @@ func (c *OllamaChat) ChatStream(
 									"source":       "thinking_tool",
 									"tool_call_id": tooli2s(tc.Function.Index),
 								},
+							}) {
+								return cancelled()
 							}
 						}
 					}
@@ -264,10 +280,12 @@ func (c *OllamaChat) ChatStream(
 					usage.MarkPromptCacheUnsupported()
 				}
 				logUsage(ctx, c.modelName, usage)
-				streamChan <- types.StreamResponse{
+				if !sendStreamResponse(ctx, streamChan, types.StreamResponse{
 					ResponseType: types.ResponseTypeAnswer,
 					Done:         true,
 					Usage:        usage,
+				}) {
+					return cancelled()
 				}
 			}
 
@@ -276,11 +294,11 @@ func (c *OllamaChat) ChatStream(
 		if err != nil {
 			logger.GetLogger(ctx).Errorf("流式聊天请求失败: %v", err)
 			// 发送错误响应
-			streamChan <- types.StreamResponse{
+			sendStreamResponse(ctx, streamChan, types.StreamResponse{
 				ResponseType: types.ResponseTypeError,
 				Content:      err.Error(),
 				Done:         true,
-			}
+			})
 		}
 	}()
 

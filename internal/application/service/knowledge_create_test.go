@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"mime/multipart"
@@ -127,6 +128,40 @@ func (s *createKnowledgeTaskEnqueuerStub) Enqueue(
 	return &asynq.TaskInfo{ID: "task-1", Queue: "default"}, nil
 }
 
+type createManualKnowledgeRepoStub struct {
+	createKnowledgeFileRepoStub
+}
+
+func (r *createManualKnowledgeRepoStub) CreateKnowledge(ctx context.Context, knowledge *types.Knowledge) error {
+	knowledge.ID = "manual-knowledge-1"
+	return r.createKnowledgeFileRepoStub.CreateKnowledge(ctx, knowledge)
+}
+
+func TestCreateKnowledgeFromManualPublishEnqueuesBoundAttempt(t *testing.T) {
+	repo := &createManualKnowledgeRepoStub{}
+	queue := &capturingReparseTaskEnqueuer{}
+	tracker := &finalizingAttemptTracker{}
+	svc := &knowledgeService{
+		repo:      repo,
+		kbService: &createKnowledgeFileKBServiceStub{kb: &types.KnowledgeBase{ID: "kb-1"}},
+		fileSvc:   &createKnowledgeFileServiceStub{}, task: queue, spanTracker: tracker,
+	}
+	ctx := newCreateKnowledgeFileContext()
+	ctx = context.WithValue(ctx, types.TenantInfoContextKey, &types.Tenant{ID: 7})
+
+	knowledge, err := svc.CreateKnowledgeFromManual(ctx, "kb-1", &types.ManualKnowledgePayload{
+		Title: "manual", Content: "# content", Status: types.ManualKnowledgeStatusPublish,
+	}, "")
+
+	require.NoError(t, err)
+	require.NotNil(t, knowledge)
+	require.Equal(t, 1, tracker.openCalls)
+	require.NotNil(t, queue.task)
+	var payload types.ManualProcessPayload
+	require.NoError(t, json.Unmarshal(queue.task.Payload(), &payload))
+	require.Equal(t, 8, payload.Attempt)
+}
+
 func TestCreateKnowledgeFromFileDoesNotPersistWhenStorageSaveFails(t *testing.T) {
 	t.Parallel()
 
@@ -163,10 +198,11 @@ func TestCreateKnowledgeFromFilePersistsStoredFilePathOnCreate(t *testing.T) {
 	fileSvc := &createKnowledgeFileServiceStub{}
 	task := &createKnowledgeTaskEnqueuerStub{}
 	svc := &knowledgeService{
-		repo:      repo,
-		kbService: &createKnowledgeFileKBServiceStub{kb: &types.KnowledgeBase{ID: "kb-1"}},
-		fileSvc:   fileSvc,
-		task:      task,
+		repo:        repo,
+		kbService:   &createKnowledgeFileKBServiceStub{kb: &types.KnowledgeBase{ID: "kb-1"}},
+		fileSvc:     fileSvc,
+		task:        task,
+		spanTracker: &attemptTestTracker{},
 	}
 
 	knowledge, err := svc.CreateKnowledgeFromFile(
@@ -204,10 +240,11 @@ func TestCreateKnowledgeFromImageFallsBackWhenLegacyStorageConfigIsIncomplete(t 
 	}
 	kb.SetStorageProvider("cos")
 	svc := &knowledgeService{
-		repo:      repo,
-		kbService: &createKnowledgeFileKBServiceStub{kb: kb},
-		fileSvc:   fileSvc,
-		task:      task,
+		repo:        repo,
+		kbService:   &createKnowledgeFileKBServiceStub{kb: kb},
+		fileSvc:     fileSvc,
+		task:        task,
+		spanTracker: &attemptTestTracker{},
 	}
 	ctx := context.WithValue(newCreateKnowledgeFileContext(), types.TenantInfoContextKey, &types.Tenant{
 		StorageEngineConfig: &types.StorageEngineConfig{
@@ -273,10 +310,11 @@ func TestCreateKnowledgeFromFile_PersistsProcessOverrides(t *testing.T) {
 	fileSvc := &createKnowledgeFileServiceStub{}
 	task := &createKnowledgeTaskEnqueuerStub{}
 	svc := &knowledgeService{
-		repo:      repo,
-		kbService: &createKnowledgeFileKBServiceStub{kb: &types.KnowledgeBase{ID: "kb-1"}},
-		fileSvc:   fileSvc,
-		task:      task,
+		repo:        repo,
+		kbService:   &createKnowledgeFileKBServiceStub{kb: &types.KnowledgeBase{ID: "kb-1"}},
+		fileSvc:     fileSvc,
+		task:        task,
+		spanTracker: &attemptTestTracker{},
 	}
 
 	chunkSize := 512

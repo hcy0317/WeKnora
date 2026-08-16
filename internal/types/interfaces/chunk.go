@@ -57,6 +57,12 @@ type ChunkRepository interface {
 	ListChunksByParentIDs(ctx context.Context, tenantID uint64, parentIDs []string) ([]*types.Chunk, error)
 	// UpdateChunk updates a chunk
 	UpdateChunk(ctx context.Context, chunk *types.Chunk) error
+	// CompareAndSwapChunkMetadata replaces metadata only when both the content
+	// revision and the complete previously-read metadata still match.
+	CompareAndSwapChunkMetadata(
+		ctx context.Context, tenantID uint64, chunkID string, expectedRevision int,
+		expectedMetadata, nextMetadata types.JSON,
+	) (bool, error)
 	// CreateChunkRevision stores an immutable snapshot of a superseded revision.
 	CreateChunkRevision(ctx context.Context, revision *types.ChunkRevision) error
 	// SaveChunkRevision atomically snapshots the old row and applies the new

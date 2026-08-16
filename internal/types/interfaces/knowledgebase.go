@@ -242,3 +242,28 @@ type KnowledgeBaseRepository interface {
 		ctx context.Context, tenantID uint64, userID string,
 	) (map[string]time.Time, error)
 }
+
+// KnowledgeBaseDeletionFinalizer is an optional narrow capability implemented
+// by production repositories that can atomically finish asynchronous KB
+// deletion without expanding the main repository interface used by fakes.
+type KnowledgeBaseDeletionFinalizer interface {
+	FinalizeKnowledgeBaseDeletion(
+		ctx context.Context, tenantID uint64, knowledgeBaseID, expectedVectorStoreID string,
+	) error
+}
+
+type KnowledgeBaseDeletionPreparer interface {
+	PrepareKnowledgeBaseDeletion(
+		ctx context.Context, tenantID uint64, knowledgeBaseID string, op *types.TaskPendingOp,
+	) error
+}
+
+// KnowledgeBaseDeletionAuthorizer proves that an asynchronous deletion task
+// targets a soft-deleted KB and its exact durable outbox before destructive
+// cleanup starts.
+type KnowledgeBaseDeletionAuthorizer interface {
+	AuthorizeKnowledgeBaseDeletion(
+		ctx context.Context, tenantID uint64, knowledgeBaseID, dedupKey string,
+		payload *types.KBDeletePayload,
+	) error
+}

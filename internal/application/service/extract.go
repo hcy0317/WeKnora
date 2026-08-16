@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -115,8 +117,12 @@ func NewChunkExtractTask(
 	}
 	task := asynq.NewTask(types.TypeChunkExtract, payload,
 		asynq.Queue(types.QueueGraph), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
-	info, err := client.Enqueue(task)
+	info, err := client.Enqueue(task,
+		asynq.TaskID(fmt.Sprintf("knowledge-fanout:%s:%d:graph:%d", knowledgeID, attempt, chunkIndex)))
 	if err != nil {
+		if errors.Is(err, asynq.ErrTaskIDConflict) || errors.Is(err, asynq.ErrDuplicateTask) {
+			return true, nil
+		}
 		logger.Errorf(ctx, "failed to enqueue task: %v", err)
 		return false, fmt.Errorf("failed to enqueue task: %v", err)
 	}
@@ -130,12 +136,14 @@ func NewDataTableSummaryTask(
 	client interfaces.TaskEnqueuer,
 	tenantID uint64,
 	knowledgeID string,
+	attempt int,
 	summaryModel string,
 	embeddingModel string,
 ) error {
 	taskPayload := DataTableSummaryPayload{
 		TenantID:       tenantID,
 		KnowledgeID:    knowledgeID,
+		Attempt:        attempt,
 		SummaryModel:   summaryModel,
 		EmbeddingModel: embeddingModel,
 	}
@@ -163,6 +171,7 @@ func enqueueDataTableSummaryIfNeeded(
 	client interfaces.TaskEnqueuer,
 	tenantID uint64,
 	knowledgeID string,
+	attempt int,
 	fileName, fileType, summaryModelID, embeddingModelID string,
 ) {
 	ft := normalizeFileExtension(fileType)
@@ -172,7 +181,7 @@ func enqueueDataTableSummaryIfNeeded(
 	if !isDataTableFileType(ft) {
 		return
 	}
-	if err := NewDataTableSummaryTask(ctx, client, tenantID, knowledgeID, summaryModelID, embeddingModelID); err != nil {
+	if err := NewDataTableSummaryTask(ctx, client, tenantID, knowledgeID, attempt, summaryModelID, embeddingModelID); err != nil {
 		logger.Warnf(ctx, "Failed to enqueue data table summary task for knowledge %s: %v", knowledgeID, err)
 	}
 }
@@ -185,6 +194,7 @@ type ChunkExtractService struct {
 	knowledgeRepo     interfaces.KnowledgeRepository
 	chunkRepo         interfaces.ChunkRepository
 	graphEngine       interfaces.RetrieveGraphRepository
+	redisClient       *redis.Client
 	// spanTracker records this graph-extract task's subspan under the
 	// parent attempt's postprocess stage so the trace viewer shows real
 	// per-chunk graph extraction time rather than the upstream's enqueue.
@@ -200,6 +210,7 @@ func NewChunkExtractService(
 	chunkRepo interfaces.ChunkRepository,
 	graphEngine interfaces.RetrieveGraphRepository,
 	spanTracker SpanTracker,
+	redisClient *redis.Client,
 ) interfaces.TaskHandler {
 	return &ChunkExtractService{
 		template:          config.ExtractManager.ExtractGraph,
@@ -209,6 +220,7 @@ func NewChunkExtractService(
 		chunkRepo:         chunkRepo,
 		graphEngine:       graphEngine,
 		spanTracker:       spanTracker,
+		redisClient:       redisClient,
 	}
 }
 
@@ -220,7 +232,7 @@ func (s *ChunkExtractService) tracker() SpanTracker {
 }
 
 // Handle handles the chunk extraction task
-func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
+func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) (retErr error) {
 	var p types.ExtractChunkPayload
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		logger.Errorf(ctx, "failed to unmarshal task payload: %v", err)
@@ -239,6 +251,14 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 			p.Attempt, p.KnowledgeID)
 		return nil
 	}
+	ctx, ownerLease, err := acquireTaskProcessingWorkerLease(ctx, s.redisClient, types.ProcessingOwnerRef{
+		TenantID: p.TenantID, KnowledgeID: p.KnowledgeID,
+		Attempt: p.Attempt, Name: fmt.Sprintf("postprocess.graph.chunk[%d]", p.ChunkIndex),
+	}, t.Type(), s.tracker())
+	if err != nil {
+		return fmt.Errorf("acquire graph processing owner: %w", err)
+	}
+	defer ownerLease.Release()
 
 	// Open a postprocess subspan keyed by chunk ordinal so the trace
 	// shows real per-chunk graph extraction time. Skipped silently when
@@ -258,23 +278,33 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 				})
 		}
 	}
-	var handleErr error
 	graphOut := types.JSONMap{}
 	defer func() {
+		if ownerErr := ownerLease.CommitFence(); ownerErr != nil {
+			retErr = fmt.Errorf("graph processing owner fence: %w", ownerErr)
+			return
+		}
+		// Persist the concrete child terminal state before draining the durable
+		// counter. The last drain may settle both ancestors immediately, so the
+		// aggregator must be able to observe this child first.
+		if gSpan != nil {
+			if retErr != nil {
+				if isFinalAsynqAttempt(ctx) {
+					markTerminalPostprocessFailure(ctx, s.tracker(), gSpan)
+				}
+				s.tracker().FailSpan(ctx, gSpan, "GRAPH_EXTRACT_FAILED", retErr.Error(), retErr)
+			} else {
+				s.tracker().EndSpan(ctx, gSpan, graphOut)
+			}
+		}
 		// Decrement the parent's enrichment counter on terminal exit so a
 		// completed (or terminally-failed) per-chunk extract releases its
 		// slot in pending_subtasks_count. KnowledgeID is the new (post-#? )
 		// payload field; legacy in-flight tasks without it are skipped.
-		finalizeSubtaskDetached(ctx, s.knowledgeRepo, p.KnowledgeID,
+		if finalizeSubtaskDetached(ctx, s.knowledgeRepo, p.KnowledgeID, p.Attempt,
 			fmt.Sprintf("graph_chunk[%d]", p.ChunkIndex),
-			handleErr, false, isFinalAsynqAttempt(ctx))
-		if gSpan == nil {
-			return
-		}
-		if handleErr != nil {
-			s.tracker().FailSpan(ctx, gSpan, "GRAPH_EXTRACT_FAILED", handleErr.Error(), handleErr)
-		} else {
-			s.tracker().EndSpan(ctx, gSpan, graphOut)
+			retErr, false, isFinalAsynqAttempt(ctx)) {
+			s.tracker().SettlePostProcessTree(ctx, p.KnowledgeID, p.Attempt)
 		}
 	}()
 
@@ -285,7 +315,7 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 	if p.KnowledgeID != "" && s.knowledgeRepo != nil {
 		if k, kerr := s.knowledgeRepo.GetKnowledgeByIDOnly(ctx, p.KnowledgeID); kerr == nil && k != nil {
 			switch k.ParseStatus {
-			case types.ParseStatusCancelled, types.ParseStatusDeleting:
+			case types.ParseStatusCancelled, types.ParseStatusDeleting, types.ParseStatusFailed:
 				logger.Infof(ctx, "graph extract: knowledge %s aborted (%s), skipping chunk %s",
 					p.KnowledgeID, k.ParseStatus, p.ChunkID)
 				graphOut["skipped"] = "knowledge_" + k.ParseStatus
@@ -297,7 +327,7 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 	chunk, err := s.chunkRepo.GetChunkByID(ctx, p.TenantID, p.ChunkID)
 	if err != nil {
 		logger.Errorf(ctx, "failed to get chunk: %v", err)
-		handleErr = err
+		retErr = err
 		return err
 	}
 	// Capture chunk content shape on output — lets traces answer "WHAT
@@ -310,7 +340,7 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 	kb, err := s.knowledgeBaseRepo.GetKnowledgeBaseByID(ctx, chunk.KnowledgeBaseID)
 	if err != nil {
 		logger.Errorf(ctx, "failed to get knowledge base: %v", err)
-		handleErr = err
+		retErr = err
 		return err
 	}
 
@@ -334,7 +364,7 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 	chatModel, err := s.modelService.GetChatModel(ctx, p.ModelID)
 	if err != nil {
 		logger.Errorf(ctx, "failed to get chat model: %v", err)
-		handleErr = err
+		retErr = err
 		return err
 	}
 
@@ -353,7 +383,7 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 	extractor := chatpipeline.NewExtractor(chatModel, template)
 	graph, err := extractor.Extract(ctx, chunk.Content)
 	if err != nil {
-		handleErr = err
+		retErr = err
 		return err
 	}
 
@@ -367,12 +397,14 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 	for _, node := range graph.Node {
 		node.Chunks = []string{chunk.ID}
 	}
-	if err = s.graphEngine.AddGraph(ctx,
-		types.NameSpace{KnowledgeBase: chunk.KnowledgeBaseID, Knowledge: chunk.KnowledgeID},
-		[]*types.GraphData{graph},
-	); err != nil {
+	if err = ownerLease.CommitWithFence(ctx, func(guardedCtx context.Context) error {
+		return s.graphEngine.AddGraph(guardedCtx,
+			types.NameSpace{KnowledgeBase: chunk.KnowledgeBaseID, Knowledge: chunk.KnowledgeID},
+			[]*types.GraphData{graph},
+		)
+	}); err != nil {
 		logger.Errorf(ctx, "failed to add graph: %v", err)
-		handleErr = err
+		retErr = fmt.Errorf("graph processing owner guarded write: %w", err)
 		return err
 	}
 	graphOut["nodes_added"] = len(graph.Node)
@@ -411,6 +443,7 @@ type DataTableSummaryPayload struct {
 	types.TracingContext
 	TenantID       uint64 `json:"tenant_id"`
 	KnowledgeID    string `json:"knowledge_id"`
+	Attempt        int    `json:"attempt,omitempty"`
 	SummaryModel   string `json:"summary_model"`
 	EmbeddingModel string `json:"embedding_model"`
 }

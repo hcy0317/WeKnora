@@ -33,7 +33,7 @@
                     trigger="click"
                     placement="bottom-left"
                     attach="body"
-                    :z-index="3100"
+                    :z-index="1950"
                     overlay-class-name="upload-destination-popup"
                     destroy-on-close
                   >
@@ -1446,7 +1446,10 @@ const handleConfirm = () => {
 .upload-confirm-overlay {
   position: fixed;
   inset: 0;
-  z-index: 3000;
+  // Keep upload configuration below the document detail drawer (2000) and
+  // its processing trace drawer (2100). Opening a document while an upload is
+  // pending must never hide the document behind this global host.
+  z-index: 1900;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2217,10 +2220,11 @@ const handleConfirm = () => {
 </style>
 
 <style lang="less">
-// Must sit above the upload modal (z-index 3000). Do not reuse card-more-popup here —
+// Must sit above the upload modal (z-index 1900) but below document details.
+// Do not reuse card-more-popup here —
 // its global z-index: 99 !important would hide the menu behind the modal overlay.
 .upload-destination-popup {
-  z-index: 3100 !important;
+  z-index: 1950 !important;
 
   .t-popup__content {
     padding: 4px !important;

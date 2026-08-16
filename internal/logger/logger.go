@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/sirupsen/logrus"
@@ -270,11 +271,7 @@ func ConfigureFromEnv() {
 
 	// 设置日志格式而不修改全局时区
 	tmpl := resolveLogFormatFromEnv()
-	appLogger.SetFormatter(&CustomFormatter{
-		ForceColor:   forceColor,
-		Template:     tmpl,
-		threadNeeded: strings.Contains(tmpl, "%thread"),
-	})
+	appLogger.SetFormatter(formatterForConfig(forceColor, tmpl))
 	appLogger.SetReportCaller(false)
 }
 
@@ -351,6 +348,18 @@ func resolveLogPathFromEnv() string {
 // %d=时间 %level=级别 %thread=goroutine %logger=caller %traceId=请求ID %msg=消息+结构化字段
 func resolveLogFormatFromEnv() string {
 	return strings.TrimSpace(os.Getenv("LOG_FORMAT"))
+}
+
+func formatterForConfig(forceColor bool, format string) logrus.Formatter {
+	format = strings.TrimSpace(format)
+	if strings.EqualFold(format, "json") {
+		return &logrus.JSONFormatter{TimestampFormat: time.RFC3339Nano}
+	}
+	return &CustomFormatter{
+		ForceColor:   forceColor,
+		Template:     format,
+		threadNeeded: strings.Contains(format, "%thread"),
+	}
 }
 
 func defaultMacAppLogPath() string {

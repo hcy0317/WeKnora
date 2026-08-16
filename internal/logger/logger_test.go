@@ -2,6 +2,7 @@ package logger
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -59,6 +60,24 @@ func TestFormat_DefaultModeUnchanged(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "\n") {
 		t.Errorf("default output should end with newline, got %q", got)
+	}
+}
+
+func TestFormatterForConfig_JSONIsStructuredLoggerNotLiteralTemplate(t *testing.T) {
+	formatter := formatterForConfig(false, "json")
+	entry := newEntry(logrus.InfoLevel, "stream dispatched", logrus.Fields{
+		"protocol": "responses",
+	})
+	out, err := formatter.Format(entry)
+	if err != nil {
+		t.Fatalf("Format returned error: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("LOG_FORMAT=json must emit valid JSON, got %q: %v", string(out), err)
+	}
+	if payload["msg"] != "stream dispatched" || payload["protocol"] != "responses" {
+		t.Fatalf("unexpected structured log payload: %#v", payload)
 	}
 }
 

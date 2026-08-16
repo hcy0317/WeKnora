@@ -28,7 +28,7 @@ func TestNewWikiIngestPendingOpPersistsResolvedLanguage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			pendingOp, err := newWikiIngestPendingOp(tt.ctx, 7, "kb-1", "knowledge-1")
+			pendingOp, err := newWikiIngestPendingOp(tt.ctx, 7, "kb-1", "knowledge-1", 4)
 			if err != nil {
 				t.Fatalf("newWikiIngestPendingOp() error = %v", err)
 			}
@@ -38,6 +38,9 @@ func TestNewWikiIngestPendingOpPersistsResolvedLanguage(t *testing.T) {
 			}
 			if op.Language != tt.want {
 				t.Fatalf("op.Language = %q, want %q", op.Language, tt.want)
+			}
+			if op.Attempt != 4 {
+				t.Fatalf("op.Attempt = %d, want 4", op.Attempt)
 			}
 		})
 	}

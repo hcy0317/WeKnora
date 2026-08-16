@@ -238,8 +238,7 @@ func (w *weaviateRepository) BatchSave(ctx context.Context,
 	for _, embedding := range embeddingList {
 		embeddingDB := toWeaviateVectorEmbedding(embedding, additionalParams)
 		if len(embeddingDB.Embedding) == 0 {
-			log.Warnf("[Weaviate] Skipping empty embedding for chunk ID: %s", embedding.ChunkID)
-			continue
+			return fmt.Errorf("empty embedding vector for chunk ID: %s", embedding.ChunkID)
 		}
 
 		dimension := len(embeddingDB.Embedding)
@@ -273,9 +272,21 @@ func (w *weaviateRepository) BatchSave(ctx context.Context,
 			batcher.WithObjects(obj)
 		}
 		// Flush batch
-		if _, err := batcher.Do(ctx); err != nil {
+		responses, err := batcher.Do(ctx)
+		if err != nil {
 			log.Errorf("[Weaviate] Failed to execute batch operation for dimension %d: %v", dimension, err)
 			return fmt.Errorf("failed to batch save (dimension %d): %w", dimension, err)
+		}
+		if len(responses) != len(embeddings) {
+			return fmt.Errorf("batch save response count mismatch: got %d, want %d", len(responses), len(embeddings))
+		}
+		for _, response := range responses {
+			if response.Result == nil || response.Result.Status == nil {
+				return fmt.Errorf("batch save returned an incomplete object response")
+			}
+			if *response.Result.Status != "SUCCESS" {
+				return fmt.Errorf("failed to batch save object %s", response.ID)
+			}
 		}
 		totalSaved += len(embeddings)
 		log.Infof("[Weaviate] Saved %d points to collection %s", len(embeddings), collectionName)
@@ -306,8 +317,12 @@ func (w *weaviateRepository) DeleteByChunkIDList(ctx context.Context, chunkIDLis
 		WithOutput("minimal")
 
 	// Execute deletion
-	if _, err := filter.Do(ctx); err != nil {
+	response, err := filter.Do(ctx)
+	if err != nil {
 		log.Errorf("[Weaviate] Failed to delete by chunk IDs: %v", err)
+		return fmt.Errorf("failed to delete by chunk IDs: %w", err)
+	}
+	if err := batchDeleteResponseError(response); err != nil {
 		return fmt.Errorf("failed to delete by chunk IDs: %w", err)
 	}
 	log.Infof("[Weaviate] Successfully deleted documents by chunk IDs")
@@ -337,8 +352,12 @@ func (w *weaviateRepository) DeleteByKnowledgeIDList(ctx context.Context,
 		WithOutput("minimal")
 
 	// Execute deletion
-	if _, err := filter.Do(ctx); err != nil {
+	response, err := filter.Do(ctx)
+	if err != nil {
 		log.Errorf("[Weaviate] Failed to delete by knowledge IDs: %v", err)
+		return fmt.Errorf("failed to delete by knowledge IDs: %w", err)
+	}
+	if err := batchDeleteResponseError(response); err != nil {
 		return fmt.Errorf("failed to delete by knowledge IDs: %w", err)
 	}
 	log.Infof("[Weaviate] Successfully deleted documents by knowledge IDs")
@@ -367,12 +386,34 @@ func (w *weaviateRepository) DeleteBySourceIDList(ctx context.Context,
 		WithOutput("minimal")
 
 	// Execute deletion
-	if _, err := filter.Do(ctx); err != nil {
+	response, err := filter.Do(ctx)
+	if err != nil {
 		log.Errorf("[Weaviate] Failed to delete by source IDs: %v", err)
+		return fmt.Errorf("failed to delete by source IDs: %w", err)
+	}
+	if err := batchDeleteResponseError(response); err != nil {
 		return fmt.Errorf("failed to delete by source IDs: %w", err)
 	}
 	log.Infof("[Weaviate] Successfully deleted documents by source IDs")
 	return nil
+}
+
+func batchDeleteResponseError(response *models.BatchDeleteResponse) error {
+	if response == nil || response.Results == nil {
+		return fmt.Errorf("batch delete returned an incomplete response")
+	}
+	if response.Results.Successful+response.Results.Failed != response.Results.Matches {
+		return fmt.Errorf("batch delete returned inconsistent completion counters")
+	}
+	if response.Results.Failed == 0 {
+		return nil
+	}
+	for _, object := range response.Results.Objects {
+		if object != nil && object.Status != nil && *object.Status == "FAILED" {
+			return fmt.Errorf("batch delete failed for object %s", object.ID)
+		}
+	}
+	return fmt.Errorf("batch delete failed for %d objects", response.Results.Failed)
 }
 
 // BatchUpdateChunkEnabledStatus updates the enabled status of chunks in batch

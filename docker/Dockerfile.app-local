@@ -1,0 +1,6 @@
+FROM weknora-app-builder:local AS builder
+
+FROM wechatopenai/weknora-app:latest
+
+COPY --from=builder /app/WeKnora /app/WeKnora
+COPY --from=builder /app/migrations /app/migrations

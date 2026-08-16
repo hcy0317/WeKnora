@@ -63,8 +63,9 @@ func (TaskDeadLetter) TableName() string {
 // should prefer these so SQL queries (run from the ops console) don't
 // have to guess at variations.
 const (
-	TaskScopeKnowledgeBase = "knowledge_base"
-	TaskScopeKnowledge     = "knowledge"
-	TaskScopeTenant        = "tenant"
-	TaskScopeUnknown       = "unknown"
+	TaskScopeKnowledgeBase         = "knowledge_base"
+	TaskScopeKnowledgeBaseDeletion = "knowledge_base_deletion"
+	TaskScopeKnowledge             = "knowledge"
+	TaskScopeTenant                = "tenant"
+	TaskScopeUnknown               = "unknown"
 )

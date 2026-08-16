@@ -377,6 +377,19 @@
           <p class="form-desc">{{ $t('model.editor.thinkingControlDesc') }}</p>
         </div>
 
+        <div v-if="showReasoningEffortField" class="form-item">
+          <label class="form-label">{{ $t('model.editor.reasoningEffortLabel') }}</label>
+          <t-select v-model="formData.reasoningEffort" clearable>
+            <t-option
+              v-for="opt in reasoningEffortOptions"
+              :key="opt.value"
+              :value="opt.value"
+              :label="opt.label"
+            />
+          </t-select>
+          <p class="form-desc">{{ $t('model.editor.reasoningEffortDesc') }}</p>
+        </div>
+
         <!--
           Background concurrency cap for this model. Only chat / embedding / vllm
           are gated by the governor (see internal/models/limiter), so we surface
@@ -441,6 +454,8 @@ interface ModelFormData {
   maxConcurrency?: number
   /** extra_config.thinking_control — how agent thinking on/off maps to API fields. */
   thinkingControl?: string
+  /** extra_config.reasoning_effort — fixed reasoning budget for compatible gateways. */
+  reasoningEffort?: string
   // 自定义 HTTP 请求头（类似 OpenAI Python SDK 的 extra_headers）
   customHeaders?: CustomHeaderItem[]
   /** LKEAP Rerank：腾讯云 SecretKey（创建时写入 app_secret） */
@@ -668,6 +683,11 @@ const showThinkingControlField = computed(() =>
   activeModelType.value === 'chat' && formData.value.source === 'remote',
 )
 
+const showReasoningEffortField = computed(() =>
+  (activeModelType.value === 'chat' || activeModelType.value === 'vllm')
+  && formData.value.source === 'remote',
+)
+
 const resolvedThinkingControl = (): ThinkingControlValue =>
   defaultThinkingControl(
     formData.value.provider || '',
@@ -708,6 +728,10 @@ const thinkingControlOptions = computed(() => {
     hint: t(`model.editor.thinkingControl.${key}.hint`),
   }))
 })
+
+const reasoningEffortOptions = computed(() => (
+  ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map(value => ({ value, label: value }))
+))
 
 // Header icon for the SettingDrawer — uses the same TDesign icon name table
 // as the model card list, so the drawer's leading badge visually matches the
@@ -876,6 +900,7 @@ const formData = ref<ModelFormData>({
   supportsVision: false,
   maxConcurrency: undefined,
   thinkingControl: defaultThinkingControl('generic', ''),
+  reasoningEffort: '',
   customHeaders: [],
   appSecret: '',
   lkeapRegion: 'ap-guangzhou',
@@ -1117,6 +1142,7 @@ const resetForm = () => {
     supportsVision: false,
     maxConcurrency: undefined,
     thinkingControl: defaultThinkingControl('generic', ''),
+    reasoningEffort: '',
     customHeaders: [],
     appSecret: '',
     lkeapRegion: 'ap-guangzhou',
@@ -1382,6 +1408,9 @@ const checkRemoteAPI = async () => {
           baseUrl: formData.value.baseUrl || '',
           apiKey: formData.value.apiKey || '',
           provider: formData.value.provider,
+          ...(formData.value.reasoningEffort?.trim()
+            ? { extraConfig: { reasoning_effort: formData.value.reasoningEffort.trim() } }
+            : {}),
           ...idPayload,
           ...headerPayload,
         })
@@ -1436,12 +1465,18 @@ const checkRemoteAPI = async () => {
 
       case 'vllm':
         // VLLM 模型（多模态）
-        // VLLM 使用 checkRemoteModel 进行基础连接测试
+        // 复用统一入口，但显式声明 VLLM，让后端发送真实图片请求，
+        // 验证 Responses/Chat 协议、token 字段与 reasoning.effort。
         result = await checkRemoteModel({
+          modelType: 'vllm',
           modelName: formData.value.modelName,
           baseUrl: formData.value.baseUrl || '',
           apiKey: formData.value.apiKey || '',
           provider: formData.value.provider,
+          interfaceType: formData.value.interfaceType,
+          ...(formData.value.reasoningEffort?.trim()
+            ? { extraConfig: { reasoning_effort: formData.value.reasoningEffort.trim() } }
+            : {}),
           ...idPayload,
           ...headerPayload,
         })

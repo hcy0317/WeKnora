@@ -318,7 +318,8 @@ type DocumentProcessPayload struct {
 	// branch. Asynq retries within an attempt keep the same value so
 	// retried spans overwrite the previous attempt's row rather than
 	// fan out into a new attempt for every retry.
-	Attempt int `json:"attempt,omitempty"`
+	Attempt     int  `json:"attempt,omitempty"`
+	NeedCleanup bool `json:"need_cleanup,omitempty"`
 }
 
 // FAQImportPayload represents the FAQ import task payload (including dry run mode)
@@ -492,6 +493,7 @@ type ManualProcessPayload struct {
 	KnowledgeBaseID string `json:"knowledge_base_id"`
 	Content         string `json:"content"`      // cleaned markdown content
 	NeedCleanup     bool   `json:"need_cleanup"` // true for update, false for create
+	Attempt         int    `json:"attempt,omitempty"`
 }
 
 // ImageMultimodalPayload represents the image multimodal processing task payload.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -394,6 +395,9 @@ func newDeadLetterKnowledgeFailer(ks interfaces.KnowledgeService, tracker servic
 		if t == nil {
 			return
 		}
+		if failDeadLetterPostprocessOwner(ctx, tracker, t, taskErr) {
+			return
+		}
 		if t.Type() == types.TypeKnowledgeListDelete {
 			markKnowledgeListDeleteFailed(ctx, repo, t, taskErr)
 			return
@@ -429,6 +433,101 @@ func newDeadLetterKnowledgeFailer(ks interfaces.KnowledgeService, tracker servic
 		}
 		logger.Infof(ctx, "dead-letter callback: marked knowledge %s as failed (task=%s)", probe.KnowledgeID, t.Type())
 	}
+}
+
+type deadLetterPostprocessOwnerRef struct {
+	KnowledgeID string
+	Attempt     int
+	Name        string
+}
+
+func deadLetterPostprocessOwner(t *asynq.Task) (deadLetterPostprocessOwnerRef, bool) {
+	var owner deadLetterPostprocessOwnerRef
+	if t == nil {
+		return owner, false
+	}
+	switch t.Type() {
+	case types.TypeSummaryGeneration:
+		var payload types.SummaryGenerationPayload
+		if json.Unmarshal(t.Payload(), &payload) != nil || payload.Refresh {
+			return owner, false
+		}
+		owner = deadLetterPostprocessOwnerRef{
+			KnowledgeID: payload.KnowledgeID, Attempt: payload.Attempt, Name: "postprocess.summary",
+		}
+	case types.TypeQuestionGeneration:
+		var payload types.QuestionGenerationPayload
+		if json.Unmarshal(t.Payload(), &payload) != nil {
+			return owner, false
+		}
+		name := "postprocess.question"
+		if len(payload.ChunkIDs) > 0 || payload.ChunkID != "" {
+			name = fmt.Sprintf("postprocess.question.batch[%d]", payload.BatchIndex)
+		}
+		owner = deadLetterPostprocessOwnerRef{
+			KnowledgeID: payload.KnowledgeID, Attempt: payload.Attempt, Name: name,
+		}
+	case types.TypeChunkExtract:
+		var payload types.ExtractChunkPayload
+		if json.Unmarshal(t.Payload(), &payload) != nil {
+			return owner, false
+		}
+		owner = deadLetterPostprocessOwnerRef{
+			KnowledgeID: payload.KnowledgeID, Attempt: payload.Attempt,
+			Name: fmt.Sprintf("postprocess.graph.chunk[%d]", payload.ChunkIndex),
+		}
+	default:
+		return owner, false
+	}
+	return owner, owner.KnowledgeID != "" && owner.Attempt > 0 && owner.Name != ""
+}
+
+// failDeadLetterPostprocessOwner is the terminal hand-off for enrichment
+// workers. Handler defers normally close these spans, but a lost processing
+// lease can make the defer return before writing any terminal state. Once
+// Asynq exhausts the retry budget, this callback owns that exact logical span
+// and lets the repository reducer settle its parents and the knowledge row.
+func failDeadLetterPostprocessOwner(
+	ctx context.Context, tracker service.SpanTracker, t *asynq.Task, taskErr error,
+) bool {
+	owner, ok := deadLetterPostprocessOwner(t)
+	if !ok {
+		return false
+	}
+	if tracker == nil {
+		logger.Warnf(ctx, "dead-letter callback: postprocess owner tracker unavailable kid=%s attempt=%d owner=%s",
+			owner.KnowledgeID, owner.Attempt, owner.Name)
+		return true
+	}
+	span := tracker.LookupSpanByName(ctx, owner.KnowledgeID, owner.Attempt, owner.Name)
+	if span == nil {
+		logger.Warnf(ctx, "dead-letter callback: postprocess owner missing kid=%s attempt=%d owner=%s",
+			owner.KnowledgeID, owner.Attempt, owner.Name)
+		return true
+	}
+	if span.Status == types.SpanStatusPending || span.Status == types.SpanStatusRunning {
+		message := "task " + t.Type() + " exhausted retries"
+		if taskErr != nil {
+			message += ": " + taskErr.Error()
+		}
+		if len(message) > 1024 {
+			message = message[:1024]
+		}
+		input := make(types.JSONMap, len(span.Input)+1)
+		for key, value := range span.Input {
+			input[key] = value
+		}
+		input["terminal_failure"] = true
+		if err := tracker.UpdateSpanInput(ctx, span, input); err != nil {
+			logger.Warnf(ctx, "dead-letter callback: failed to mark terminal owner kid=%s attempt=%d owner=%s: %v",
+				owner.KnowledgeID, owner.Attempt, owner.Name, err)
+		}
+		tracker.FailSpan(ctx, span, "TASK_RETRIES_EXHAUSTED", message, taskErr)
+	}
+	tracker.SettlePostProcessTree(ctx, owner.KnowledgeID, owner.Attempt)
+	logger.Infof(ctx, "dead-letter callback: settled postprocess owner kid=%s attempt=%d owner=%s",
+		owner.KnowledgeID, owner.Attempt, owner.Name)
+	return true
 }
 
 func markKnowledgeListDeleteFailed(

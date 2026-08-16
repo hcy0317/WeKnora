@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -22,6 +23,14 @@ var (
 	migrationVersionSet     bool
 	currentMigrationError   string
 )
+
+// ErrMigrationGate identifies pre-migration safety failures that must prevent
+// application startup rather than falling back to externally managed schema.
+var ErrMigrationGate = errors.New("postgres migration safety gate rejected")
+
+// ErrMigrationUnsafe identifies migration states where continuing application
+// startup could run new code against a partial or incompatible schema.
+var ErrMigrationUnsafe = errors.New("database migration left schema unsafe")
 
 // CachedMigrationVersion returns the migration version captured at startup.
 // Returns (version, dirty, ok). ok is false if the version was never captured.
@@ -97,6 +106,268 @@ type MigrationOptions struct {
 	SQLiteDBPath string
 }
 
+const (
+	knowledgeSpanMigrationVersion = 55
+	rootAttemptUniqueVersion      = 85
+	postgresCollisionBaseVersion  = 80
+	sqliteCollisionBaseVersion    = 3
+)
+
+type migrationGateSnapshot struct {
+	Version      uint
+	VersionKnown bool
+	Dirty        bool
+}
+
+type migrationGateProbe struct {
+	RelationExists func(context.Context) (bool, error)
+	DuplicateRoots func(context.Context) (int64, error)
+}
+
+type migrationUpRunner interface {
+	Version() (uint, bool, error)
+	Up() error
+}
+
+func logDirtyMigrationGate(ctx context.Context, version uint) {
+	logger.GetLogger(ctx).WithFields(logger.Fields{
+		"version": version, "dirty": true,
+		"relation_exists": "not_checked", "decision": "reject_dirty",
+		"duplicate_count": "not_checked",
+	}).Error("postgres migration gate")
+}
+
+func runMigrationUpOnce(
+	ctx context.Context,
+	runner migrationUpRunner,
+	gate func(context.Context, migrationGateSnapshot) error,
+) error {
+	version, dirty, err := runner.Version()
+	versionKnown := err == nil
+	if err != nil && err != migrate.ErrNilVersion {
+		return fmt.Errorf("%w: read migration version before safety gate: %v", ErrMigrationUnsafe, err)
+	}
+	if gate != nil {
+		if err := gate(ctx, migrationGateSnapshot{
+			Version: version, VersionKnown: versionKnown, Dirty: dirty,
+		}); err != nil {
+			return err
+		}
+	}
+	return runner.Up()
+}
+
+func runPostgresMigrationGate(
+	ctx context.Context, snapshot migrationGateSnapshot, probe migrationGateProbe,
+) error {
+	versionField := any("nil")
+	if snapshot.VersionKnown {
+		versionField = snapshot.Version
+	}
+	if snapshot.Dirty {
+		logDirtyMigrationGate(ctx, snapshot.Version)
+		return fmt.Errorf("%w: migration version is dirty", ErrMigrationGate)
+	}
+	relationExists, err := probe.RelationExists(ctx)
+	if err != nil {
+		logger.GetLogger(ctx).WithFields(logger.Fields{
+			"version": versionField, "dirty": snapshot.Dirty,
+			"relation_exists": "unknown", "decision": "probe_error",
+			"duplicate_count": "not_checked",
+		}).Error("postgres migration gate")
+		return fmt.Errorf("%w: relation probe: %v", ErrMigrationGate, err)
+	}
+
+	decision := "allow_without_duplicate_check"
+	duplicateCount := "not_checked"
+	logDecision := func() {
+		logger.GetLogger(ctx).WithFields(logger.Fields{
+			"version":         versionField,
+			"dirty":           snapshot.Dirty,
+			"relation_exists": relationExists,
+			"decision":        decision,
+			"duplicate_count": duplicateCount,
+		}).Info("postgres migration gate")
+	}
+
+	if (!snapshot.VersionKnown || snapshot.Version < knowledgeSpanMigrationVersion) && relationExists {
+		decision = "reject_schema_drift_early_relation"
+		logDecision()
+		return fmt.Errorf("%w: schema drift: knowledge_processing_spans exists before migration %d", ErrMigrationGate, knowledgeSpanMigrationVersion)
+	}
+	if snapshot.VersionKnown && snapshot.Version >= knowledgeSpanMigrationVersion && !relationExists {
+		decision = "reject_schema_drift_missing_relation"
+		logDecision()
+		return fmt.Errorf("%w: schema drift: knowledge_processing_spans is missing", ErrMigrationGate)
+	}
+	if snapshot.VersionKnown && snapshot.Version >= rootAttemptUniqueVersion {
+		decision = "allow_already_at_root_unique_version"
+		logDecision()
+		return nil
+	}
+	if relationExists {
+		count, countErr := probe.DuplicateRoots(ctx)
+		if countErr != nil {
+			decision = "reject_duplicate_probe_error"
+			logDecision()
+			return fmt.Errorf("%w: duplicate root probe: %v", ErrMigrationGate, countErr)
+		}
+		duplicateCount = fmt.Sprintf("%d", count)
+		if count > 0 {
+			decision = "reject_duplicate_roots"
+			logDecision()
+			return fmt.Errorf("%w: migration 000085 blocked: found %d duplicate root attempt group(s)", ErrMigrationGate, count)
+		}
+		decision = "allow_no_duplicate_roots"
+	}
+	logDecision()
+	return nil
+}
+
+func postgresMigrationProbe(db *sql.DB) migrationGateProbe {
+	return migrationGateProbe{
+		RelationExists: func(ctx context.Context) (bool, error) {
+			var exists bool
+			err := db.QueryRowContext(ctx,
+				"SELECT to_regclass('knowledge_processing_spans') IS NOT NULL").Scan(&exists)
+			return exists, err
+		},
+		DuplicateRoots: func(ctx context.Context) (int64, error) {
+			var count int64
+			err := db.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM (
+					SELECT knowledge_id, attempt
+					FROM knowledge_processing_spans
+					WHERE kind = 'root'
+					GROUP BY knowledge_id, attempt
+					HAVING COUNT(*) > 1
+				) duplicate_roots`).Scan(&count)
+			return count, err
+		},
+	}
+}
+
+func postgresRelationExists(ctx context.Context, db *sql.DB, relation string) (bool, error) {
+	var exists bool
+	err := db.QueryRowContext(ctx, "SELECT to_regclass($1) IS NOT NULL", relation).Scan(&exists)
+	return exists, err
+}
+
+func postgresColumnExists(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	var exists bool
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2
+		)`, table, column).Scan(&exists)
+	return exists, err
+}
+
+func postgresCollisionMarkers(
+	ctx context.Context, db *sql.DB, version uint,
+) (legacyExists, upstreamExists bool, err error) {
+	switch version {
+	case 81:
+		legacyExists, err = postgresRelationExists(
+			ctx, db, "idx_knowledge_processing_spans_root_attempt_unique",
+		)
+		if err == nil {
+			upstreamExists, err = postgresColumnExists(ctx, db, "messages", "artifacts")
+		}
+	case 82:
+		legacyExists, err = postgresColumnExists(ctx, db, "task_pending_ops", "claim_token")
+		if err == nil {
+			upstreamExists, err = postgresRelationExists(ctx, db, "tenant_sandbox_configs")
+		}
+	case 83:
+		legacyExists, err = postgresRelationExists(ctx, db, "question_generation_manifests")
+		if err == nil {
+			upstreamExists, err = postgresColumnExists(ctx, db, "sessions", "sandbox_config_id")
+		}
+	case 84:
+		legacyExists, err = postgresRelationExists(ctx, db, "wiki_ingest_work_units")
+		if err == nil {
+			upstreamExists, err = postgresRelationExists(ctx, db, "memory_subjects")
+		}
+	case 85:
+		legacyExists, err = postgresRelationExists(ctx, db, "wiki_canonical_identities")
+		if err == nil {
+			upstreamExists, err = postgresRelationExists(ctx, db, "memory_subjects")
+		}
+	}
+	return legacyExists, upstreamExists, err
+}
+
+func reconcilePostgresMigrationCollision(
+	ctx context.Context, m *migrate.Migrate, db *sql.DB, version uint, dirty bool,
+) (uint, error) {
+	if dirty || version < 81 || version > 85 {
+		return version, nil
+	}
+	legacyExists, upstreamExists, err := postgresCollisionMarkers(ctx, db, version)
+	if err != nil {
+		return version, fmt.Errorf("inspect PostgreSQL migration collision at version %d: %w", version, err)
+	}
+	if !legacyExists || upstreamExists {
+		return version, nil
+	}
+
+	logger.Warnf(ctx,
+		"Detected legacy local PostgreSQL migration version %d; replaying collision range from %d",
+		version, postgresCollisionBaseVersion+1)
+	if err := m.Force(postgresCollisionBaseVersion); err != nil {
+		return version, fmt.Errorf("rewind legacy PostgreSQL migration version %d to %d: %w",
+			version, postgresCollisionBaseVersion, err)
+	}
+	return postgresCollisionBaseVersion, nil
+}
+
+func sqliteTableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
+	var exists bool
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?
+		)`, table).Scan(&exists)
+	return exists, err
+}
+
+func reconcileSQLiteMigrationCollision(
+	ctx context.Context, m *migrate.Migrate, db *sql.DB, version uint, dirty bool,
+) (uint, error) {
+	if dirty || version < 4 || version > 6 {
+		return version, nil
+	}
+	memoryExists, err := sqliteTableExists(ctx, db, "memory_subjects")
+	if err != nil {
+		return version, fmt.Errorf("inspect upstream SQLite memory migration: %w", err)
+	}
+	if memoryExists {
+		return version, nil
+	}
+
+	legacyTable := map[uint]string{
+		4: "question_generation_manifests",
+		5: "wiki_ingest_work_units",
+		6: "wiki_canonical_identities",
+	}[version]
+	legacyExists, err := sqliteTableExists(ctx, db, legacyTable)
+	if err != nil {
+		return version, fmt.Errorf("inspect legacy SQLite migration %d: %w", version, err)
+	}
+	if !legacyExists {
+		return version, nil
+	}
+
+	logger.Warnf(ctx,
+		"Detected legacy local SQLite migration version %d; replaying collision range from %d",
+		version, sqliteCollisionBaseVersion+1)
+	if err := m.Force(sqliteCollisionBaseVersion); err != nil {
+		return version, fmt.Errorf("rewind legacy SQLite migration version %d to %d: %w",
+			version, sqliteCollisionBaseVersion, err)
+	}
+	return sqliteCollisionBaseVersion, nil
+}
+
 // RunMigrationsWithOptions executes all pending database migrations with custom options
 func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 	ctx := context.Background()
@@ -109,26 +380,28 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 	}
 
 	var m *migrate.Migrate
+	var sqliteMigrationDB *sql.DB
 	if opts.SQLiteDBPath != "" {
 		sqlDB, err := sql.Open("sqlite3", opts.SQLiteDBPath)
 		if err != nil {
 			logger.Errorf(ctx, "Failed to open sqlite db for migration: %v", err)
-			wrapped := fmt.Errorf("failed to open sqlite db for migration: %w", err)
+			wrapped := fmt.Errorf("%w: failed to open sqlite db for migration: %v", ErrMigrationUnsafe, err)
 			setMigrationState(0, false, wrapped.Error(), false)
 			return wrapped
 		}
+		sqliteMigrationDB = sqlDB
 		driver, err := sqlite3migrate.WithInstance(sqlDB, &sqlite3migrate.Config{})
 		if err != nil {
 			sqlDB.Close()
 			logger.Errorf(ctx, "Failed to create sqlite3 migrate driver: %v", err)
-			wrapped := fmt.Errorf("failed to create sqlite3 migrate driver: %w", err)
+			wrapped := fmt.Errorf("%w: failed to create sqlite3 migrate driver: %v", ErrMigrationUnsafe, err)
 			setMigrationState(0, false, wrapped.Error(), false)
 			return wrapped
 		}
 		m, err = migrate.NewWithDatabaseInstance(migrationsPath, "sqlite3", driver)
 		if err != nil {
 			logger.Errorf(ctx, "Failed to create migrate instance: %v", err)
-			wrapped := fmt.Errorf("failed to create migrate instance: %w", err)
+			wrapped := fmt.Errorf("%w: failed to create migrate instance: %v", ErrMigrationUnsafe, err)
 			setMigrationState(0, false, wrapped.Error(), false)
 			return wrapped
 		}
@@ -137,7 +410,7 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 		m, err = migrate.New(migrationsPath, dsn)
 		if err != nil {
 			logger.Errorf(ctx, "Failed to create migrate instance: %v", err)
-			wrapped := fmt.Errorf("failed to create migrate instance: %w", err)
+			wrapped := fmt.Errorf("%w: failed to create migrate instance: %v", ErrMigrationUnsafe, err)
 			setMigrationState(0, false, wrapped.Error(), false)
 			return wrapped
 		}
@@ -148,7 +421,7 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 	oldVersion, oldDirty, versionErr := m.Version()
 	if versionErr != nil && versionErr != migrate.ErrNilVersion {
 		logger.Errorf(ctx, "Failed to get migration version: %v", versionErr)
-		return captureMigrationFailure(m, fmt.Errorf("failed to get migration version: %w", versionErr))
+		return captureMigrationFailure(m, fmt.Errorf("%w: failed to get migration version: %v", ErrMigrationUnsafe, versionErr))
 	}
 
 	if versionErr == migrate.ErrNilVersion {
@@ -156,6 +429,7 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 	} else {
 		logger.Infof(ctx, "Current migration version: %d, dirty: %v", oldVersion, oldDirty)
 	}
+	initialVersion := oldVersion
 
 	// If database is in dirty state, try to recover or return error
 	if oldDirty {
@@ -163,18 +437,29 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 		if opts.AutoRecoverDirty {
 			logger.Infof(ctx, "AutoRecoverDirty is enabled, attempting recovery...")
 			if err := recoverFromDirtyState(ctx, m, oldVersion); err != nil {
-				return captureMigrationFailure(m, err)
+				return captureMigrationFailure(m, fmt.Errorf("%w: %v", ErrMigrationUnsafe, err))
 			}
 			// Update oldVersion after recovery
-			oldVersion, _, _ = m.Version()
+			oldVersion, oldDirty, versionErr = m.Version()
+			if versionErr != nil && versionErr != migrate.ErrNilVersion {
+				return captureMigrationFailure(m, fmt.Errorf("%w: failed to read migration version after dirty recovery: %v", ErrMigrationUnsafe, versionErr))
+			}
+			if oldDirty {
+				logDirtyMigrationGate(ctx, oldVersion)
+				return captureMigrationFailure(m, fmt.Errorf("%w: dirty recovery did not clear version %d", ErrMigrationUnsafe, oldVersion))
+			}
 		} else {
+			if opts.SQLiteDBPath == "" && !strings.HasPrefix(dsn, "sqlite3://") {
+				logDirtyMigrationGate(ctx, oldVersion)
+			}
 			// Calculate the version to force to (usually the previous version)
 			forceVersion := int(oldVersion) - 1
 			if oldVersion == 0 || forceVersion < 0 {
 				forceVersion = 0
 			}
 			return captureMigrationFailure(m, fmt.Errorf(
-				"database is in dirty state at version %d. This usually means a migration failed partway through. "+
+				"%w: "+
+					"database is in dirty state at version %d. This usually means a migration failed partway through. "+
 					"To fix this:\n"+
 					"1. Check if the migration partially applied changes and manually fix if needed\n"+
 					"2. Use the force command to set the version to the last successful migration (usually %d):\n"+
@@ -182,6 +467,7 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 					"   Or if using make: make migrate-force version=%d\n"+
 					"3. After fixing, restart the application to retry the migration\n"+
 					"Or enable AutoRecoverDirty option to automatically retry",
+				ErrMigrationUnsafe,
 				oldVersion,
 				forceVersion,
 				forceVersion,
@@ -190,10 +476,51 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 		}
 	}
 
+	if versionErr == nil && sqliteMigrationDB != nil {
+		reconciledVersion, err := reconcileSQLiteMigrationCollision(
+			ctx, m, sqliteMigrationDB, oldVersion, oldDirty,
+		)
+		if err != nil {
+			return captureMigrationFailure(m, fmt.Errorf("%w: %v", ErrMigrationUnsafe, err))
+		}
+		oldVersion = reconciledVersion
+	}
+
+	var gateDB *sql.DB
+	if opts.SQLiteDBPath == "" && !strings.HasPrefix(dsn, "sqlite3://") {
+		var err error
+		gateDB, err = sql.Open("postgres", dsn)
+		if err != nil {
+			return captureMigrationFailure(m, fmt.Errorf("%w: open postgres migration gate connection: %v", ErrMigrationUnsafe, err))
+		}
+		defer gateDB.Close()
+		if versionErr == nil {
+			reconciledVersion, reconcileErr := reconcilePostgresMigrationCollision(
+				ctx, m, gateDB, oldVersion, oldDirty,
+			)
+			if reconcileErr != nil {
+				return captureMigrationFailure(m, fmt.Errorf("%w: %v", ErrMigrationUnsafe, reconcileErr))
+			}
+			oldVersion = reconciledVersion
+		}
+	}
+	upOnce := func() error {
+		var gate func(context.Context, migrationGateSnapshot) error
+		if gateDB != nil {
+			gate = func(ctx context.Context, snapshot migrationGateSnapshot) error {
+				return runPostgresMigrationGate(ctx, snapshot, postgresMigrationProbe(gateDB))
+			}
+		}
+		return runMigrationUpOnce(ctx, m, gate)
+	}
+
 	// Run all pending migrations
 	logger.Infof(ctx, "Running pending migrations...")
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+	if err := upOnce(); err != nil && err != migrate.ErrNoChange {
 		logger.Errorf(ctx, "Migration failed: %v", err)
+		if errors.Is(err, ErrMigrationGate) {
+			return captureMigrationFailure(m, err)
+		}
 		// Check if error is due to dirty state (in case it became dirty during migration)
 		currentVersion, currentDirty, versionCheckErr := m.Version()
 		if versionCheckErr == nil && currentDirty {
@@ -202,13 +529,13 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 				logger.Infof(ctx, "Attempting to recover from dirty state...")
 				// Try to recover and retry
 				if recoverErr := recoverFromDirtyState(ctx, m, currentVersion); recoverErr != nil {
-					return captureMigrationFailure(m, recoverErr)
+					return captureMigrationFailure(m, fmt.Errorf("%w: %v", ErrMigrationUnsafe, recoverErr))
 				}
 				// Retry migration after recovery
 				logger.Infof(ctx, "Retrying migration after recovery...")
-				if retryErr := m.Up(); retryErr != nil && retryErr != migrate.ErrNoChange {
+				if retryErr := upOnce(); retryErr != nil && retryErr != migrate.ErrNoChange {
 					logger.Errorf(ctx, "Migration failed after recovery attempt: %v", retryErr)
-					return captureMigrationFailure(m, fmt.Errorf("migration failed after recovery attempt: %w", retryErr))
+					return captureMigrationFailure(m, fmt.Errorf("%w: migration failed after recovery attempt: %v", ErrMigrationUnsafe, retryErr))
 				}
 			} else {
 				// Calculate the version to force to (usually the previous version)
@@ -217,7 +544,8 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 					forceVersion = 0
 				}
 				return captureMigrationFailure(m, fmt.Errorf(
-					"migration failed and database is now in dirty state at version %d. "+
+					"%w: "+
+						"migration failed and database is now in dirty state at version %d. "+
 						"To fix this:\n"+
 						"1. Check if the migration partially applied changes and manually fix if needed\n"+
 						"2. Use the force command to set the version to the last successful migration (usually %d):\n"+
@@ -225,6 +553,7 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 						"   Or if using make: make migrate-force version=%d\n"+
 						"3. After fixing, restart the application to retry the migration\n"+
 						"Or enable AutoRecoverDirty option to automatically retry",
+					ErrMigrationUnsafe,
 					currentVersion,
 					forceVersion,
 					forceVersion,
@@ -232,26 +561,26 @@ func RunMigrationsWithOptions(dsn string, opts MigrationOptions) error {
 				))
 			}
 		} else {
-			return captureMigrationFailure(m, fmt.Errorf("failed to run migrations: %w", err))
+			return captureMigrationFailure(m, fmt.Errorf("%w: failed to run migrations: %v", ErrMigrationUnsafe, err))
 		}
 	}
 
 	// Get current version after migration
 	version, dirty, err := m.Version()
 	if err != nil && err != migrate.ErrNilVersion {
-		return captureMigrationFailure(m, fmt.Errorf("failed to get migration version: %w", err))
+		return captureMigrationFailure(m, fmt.Errorf("%w: failed to get migration version: %v", ErrMigrationUnsafe, err))
 	}
 
 	setMigrationState(version, dirty, "", true)
 
-	if oldVersion != version {
-		logger.Infof(ctx, "Database migrated from version %d to %d", oldVersion, version)
+	if initialVersion != version {
+		logger.Infof(ctx, "Database migrated from version %d to %d", initialVersion, version)
 	} else {
 		logger.Infof(ctx, "Database is up to date (version: %d)", version)
 	}
 
 	if dirty {
-		logger.Warnf(ctx, "Database is in dirty state! Manual intervention may be required.")
+		return captureMigrationFailure(m, fmt.Errorf("%w: migration completed with dirty version %d", ErrMigrationUnsafe, version))
 	}
 
 	return nil

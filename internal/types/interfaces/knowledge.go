@@ -127,6 +127,16 @@ type KnowledgeService interface {
 		knowledgeID string,
 		processOverrides *types.KnowledgeProcessOverrides,
 	) (*types.Knowledge, error)
+	// RetryFailedKnowledgeSpan creates a new partial-repair attempt for one
+	// supported failed post-processing owner and publishes only that worker.
+	RetryFailedKnowledgeSpan(
+		ctx context.Context,
+		request types.KnowledgeSpanRetryRequest,
+	) (*types.KnowledgeSpanRetryPreparation, error)
+	RetryFailedKnowledgeSpans(
+		ctx context.Context,
+		request types.KnowledgeSpanAggregateRetryRequest,
+	) (*types.KnowledgeSpanAggregateRetryResult, error)
 	// CancelKnowledgeParse marks an in-progress parse as cancelled by the
 	// user. The knowledge row and any partially written chunks/index are
 	// kept; downstream queued tasks for the same knowledge are best-effort
@@ -292,12 +302,15 @@ type KnowledgeRepository interface {
 	// UpdateActiveDeletingKnowledgeColumns updates an active, non-deleted knowledge row
 	// only when it is still in the transient deleting state.
 	UpdateActiveDeletingKnowledgeColumns(ctx context.Context, id string, values map[string]interface{}) (bool, error)
-	// FinalizeSubtask atomically decrements pending_subtasks_count for the
-	// given knowledge and promotes parse_status from "finalizing" to
-	// "completed" when the count reaches zero. Returns the post-decrement
-	// count, whether this caller's UPDATE was the one that promoted the
-	// row, and any error.
+	// FinalizeSubtask atomically decrements the legacy observer/barrier
+	// counter. Business completion is owned by the span repository reducer;
+	// the promotion result is retained for compatibility and is always false.
 	FinalizeSubtask(ctx context.Context, id string) (int, bool, error)
+	// FinalizeSubtaskForAttempt is the worker-safe counter drain. It only
+	// decrements while attempt is still the latest open processing root and is
+	// serialized with OpenAttempt, so a superseded worker cannot drain a newer
+	// attempt's observer counter.
+	FinalizeSubtaskForAttempt(ctx context.Context, id string, attempt int) (int, bool, error)
 	// SetFinalizing atomically transitions a row from "processing" to
 	// "finalizing" and writes the initial pending_subtasks_count. Returns
 	// whether the transition took place (false when the row's parse_status
@@ -346,4 +359,10 @@ type KnowledgeRepository interface {
 	GetKnowledgeTags(ctx context.Context, knowledgeIDs []string) (map[string][]*types.KnowledgeTag, error)
 	// DeleteKnowledgeTagRelations deletes all tag relations for a knowledge entry.
 	DeleteKnowledgeTagRelations(ctx context.Context, knowledgeID string) error
+}
+
+type KnowledgeListDeletionFinalizer interface {
+	DeleteKnowledgeListAndAdjustStorage(
+		ctx context.Context, tenantID uint64, ids []string,
+	) error
 }

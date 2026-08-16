@@ -12,6 +12,8 @@ import (
 	"github.com/Tencent/WeKnora/internal/agent"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSlugify(t *testing.T) {
@@ -334,6 +336,17 @@ func TestGenerateWithTemplateMasksImageURLsBeforeLLM(t *testing.T) {
 	}
 }
 
+func TestGenerateWithTemplateRejectsBlankNonStreamingResponse(t *testing.T) {
+	model := &templateCaptureChatModel{response: "  \n\t "}
+
+	_, err := (&wikiIngestService{}).generateWithTemplate(
+		context.Background(), model, "plain {{.Value}}", map[string]string{"Value": "input"},
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty response content")
+}
+
 type templateCaptureChatModel struct {
 	prompt   string
 	response string
@@ -360,11 +373,27 @@ func (m *templateCaptureChatModel) Chat(
 }
 
 func (m *templateCaptureChatModel) ChatStream(
-	context.Context,
-	[]chat.Message,
-	*chat.ChatOptions,
+	ctx context.Context,
+	messages []chat.Message,
+	opts *chat.ChatOptions,
 ) (<-chan types.StreamResponse, error) {
-	return nil, nil
+	if len(messages) > 0 {
+		m.prompt = messages[0].Content
+	}
+	m.messages = append([]chat.Message(nil), messages...)
+	if opts != nil {
+		m.options = *opts
+	}
+	m.purpose, m.prefix = types.LLMCallMetadataFromContext(ctx)
+	stream := make(chan types.StreamResponse, 1)
+	stream <- types.StreamResponse{
+		ResponseType: types.ResponseTypeAnswer,
+		Content:      m.response,
+		Done:         true,
+		FinishReason: "stop",
+	}
+	close(stream)
+	return stream, nil
 }
 
 func (m *templateCaptureChatModel) GetModelName() string { return "capture" }
@@ -492,7 +521,7 @@ func TestWikiIngestCleanupContextDetachedFromCancelledParent(t *testing.T) {
 
 	repo := &wikiPendingRepoForCleanupTest{}
 	svc := &wikiIngestService{pendingRepo: repo}
-	if err := svc.trimPendingList(cleanupCtx, []int64{7}); err != nil {
+	if err := svc.trimPendingList(cleanupCtx, []int64{7}, nil); err != nil {
 		t.Fatalf("trimPendingList() error = %v", err)
 	}
 	if repo.deleteCtxErr != nil {
@@ -508,7 +537,7 @@ func TestTrimPendingListReturnsDeleteError(t *testing.T) {
 	repo := &wikiPendingRepoForCleanupTest{deleteErr: wantErr}
 	svc := &wikiIngestService{pendingRepo: repo}
 
-	err := svc.trimPendingList(context.Background(), []int64{1, 2, 3})
+	err := svc.trimPendingList(context.Background(), []int64{1, 2, 3}, nil)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("trimPendingList() error = %v, want %v", err, wantErr)
 	}

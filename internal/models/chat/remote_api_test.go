@@ -27,6 +27,45 @@ func newTestRemoteChat(t *testing.T) *RemoteAPIChat {
 	return chat
 }
 
+func TestBuildOutbound_ReasoningEffort(t *testing.T) {
+	messages := []Message{{Role: "user", Content: "hello"}}
+
+	t.Run("configured effort is sent as a top-level field", func(t *testing.T) {
+		chat, err := NewRemoteAPIChat(&ChatConfig{
+			Source:    types.ModelSourceRemote,
+			BaseURL:   "",
+			ModelName: "gpt-5.6-sol",
+			APIKey:    "test-key",
+			ModelID:   "test-model",
+			Provider:  "openai",
+			ExtraConfig: map[string]string{
+				extraConfigReasoningEffort: "xhigh",
+			},
+		})
+		require.NoError(t, err)
+
+		body, _, useRaw, err := chat.buildOutbound(messages, &ChatOptions{MaxTokens: 32}, false)
+		require.NoError(t, err)
+		assert.True(t, useRaw, "reasoning_effort requires the raw HTTP request path")
+
+		request, ok := body.(map[string]any)
+		require.True(t, ok, "request should be converted to a generic JSON object")
+		assert.Equal(t, "xhigh", request[extraConfigReasoningEffort])
+		assert.Equal(t, "gpt-5.6-sol", request["model"])
+		assert.EqualValues(t, 32, request["max_tokens"], "model names must not shape the initial request")
+		assert.NotContains(t, request, "max_completion_tokens")
+	})
+
+	t.Run("blank effort preserves the SDK path", func(t *testing.T) {
+		chat := newTestRemoteChat(t)
+		body, _, useRaw, err := chat.buildOutbound(messages, &ChatOptions{}, false)
+		require.NoError(t, err)
+		assert.False(t, useRaw)
+		_, ok := body.(*openai.ChatCompletionRequest)
+		assert.True(t, ok)
+	})
+}
+
 func TestBuildChatCompletionRequest_ParallelToolCalls(t *testing.T) {
 	chat := newTestRemoteChat(t)
 	messages := []Message{{Role: "user", Content: "hello"}}
@@ -129,82 +168,20 @@ func TestBuildChatCompletionRequest_MCPToolsFormat(t *testing.T) {
 	}
 }
 
-// TestBuildChatCompletionRequest_GPT5MaxCompletionTokens 验证 GPT-5 / o-series
-// 模型的 MaxTokens 自动迁移到 MaxCompletionTokens，且采样参数被剔除。
-// 见 issue #1283：Azure OpenAI 的 gpt-5 系列模型不再支持 max_tokens 字段。
-func TestBuildChatCompletionRequest_GPT5MaxCompletionTokens(t *testing.T) {
-	build := func(t *testing.T, providerName, modelName string) *RemoteAPIChat {
-		t.Helper()
-		c, err := NewRemoteAPIChat(&ChatConfig{
-			Source:    types.ModelSourceRemote,
-			BaseURL:   "https://example.openai.azure.com",
-			ModelName: modelName,
-			APIKey:    "test-key",
-			ModelID:   modelName,
-			Provider:  providerName,
-			ExtraConfig: map[string]string{
-				"api_version": "2025-04-01-preview",
-			},
-		})
-		require.NoError(t, err)
-		return c
-	}
-
-	messages := []Message{{Role: "user", Content: "test"}}
-
-	cases := []struct {
-		name              string
-		provider          string
-		model             string
-		shouldRewriteMaxT bool
-	}{
-		{"AzureOpenAI gpt-5.2", "azure_openai", "gpt-5.2", true},
-		{"AzureOpenAI gpt-5-mini", "azure_openai", "gpt-5-mini", true},
-		{"OpenAI gpt-5", "openai", "gpt-5", true},
-		{"OpenAI o1-mini", "openai", "o1-mini", true},
-		{"OpenAI o3", "openai", "o3", true},
-		{"OpenAI o4-mini", "openai", "o4-mini", true},
-		{"OpenAI gpt-4o (unchanged)", "openai", "gpt-4o", false},
-		{"AzureOpenAI gpt-4 (unchanged)", "azure_openai", "gpt-4", false},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := build(t, tc.provider, tc.model)
-			opts := &ChatOptions{
-				Temperature:      0.7,
-				TopP:             0.9,
-				MaxTokens:        128,
-				FrequencyPenalty: 0.1,
-				PresencePenalty:  0.2,
-			}
-			req := c.shapedRequest(messages, opts, false)
-
-			if tc.shouldRewriteMaxT {
-				assert.Equal(t, 0, req.MaxTokens, "MaxTokens must NOT be sent for GPT-5/o-series")
-				assert.Equal(t, 128, req.MaxCompletionTokens, "MaxCompletionTokens should be populated from MaxTokens")
-				assert.EqualValues(t, 0, req.Temperature, "temperature must be omitted")
-				assert.EqualValues(t, 0, req.TopP, "top_p must be omitted")
-				assert.EqualValues(t, 0, req.FrequencyPenalty, "frequency_penalty must be omitted")
-				assert.EqualValues(t, 0, req.PresencePenalty, "presence_penalty must be omitted")
-			} else {
-				assert.Equal(t, 128, req.MaxTokens)
-				assert.Equal(t, 0, req.MaxCompletionTokens)
-				assert.InDelta(t, 0.7, req.Temperature, 1e-6)
-			}
+func TestBuildChatCompletionRequestDoesNotInferShapeFromModelName(t *testing.T) {
+	for _, modelName := range []string{"gpt-5.2", "o3-mini", "private-reasoning-alias", "qwen-vl-custom"} {
+		t.Run(modelName, func(t *testing.T) {
+			chat := &RemoteAPIChat{modelName: modelName, adapter: baseProvider{}}
+			req := chat.shapedRequest(
+				[]Message{{Role: "user", Content: "test"}},
+				&ChatOptions{Temperature: 0.7, TopP: 0.9, MaxTokens: 128},
+				false,
+			)
+			assert.Equal(t, 128, req.MaxTokens)
+			assert.Zero(t, req.MaxCompletionTokens)
+			assert.InDelta(t, 0.7, req.Temperature, 1e-6)
 		})
 	}
-
-	t.Run("MaxCompletionTokens takes precedence over MaxTokens", func(t *testing.T) {
-		c := build(t, "openai", "gpt-5.2")
-		opts := &ChatOptions{
-			MaxTokens:           128,
-			MaxCompletionTokens: 2048,
-		}
-		req := c.shapedRequest(messages, opts, false)
-		assert.Equal(t, 0, req.MaxTokens)
-		assert.Equal(t, 2048, req.MaxCompletionTokens)
-	})
 }
 
 func TestBuildChatCompletionRequest_ToolChoice(t *testing.T) {

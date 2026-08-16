@@ -918,6 +918,7 @@ func (r *realKBRepo) CountByVectorStoreID(ctx context.Context, db *gorm.DB, tena
 	}
 	var count int64
 	err := db.WithContext(ctx).
+		Unscoped().
 		Model(&types.KnowledgeBase{}).
 		Where("tenant_id = ? AND vector_store_id = ?", tenantID, storeID).
 		Count(&count).Error
@@ -1035,7 +1036,7 @@ func TestDeleteStore_Guard_RejectsBoundKB(t *testing.T) {
 	require.Empty(t, registry.unregistered, "registry must NOT be unregistered when guard fires")
 }
 
-func TestDeleteStore_Guard_IgnoresSoftDeletedKB(t *testing.T) {
+func TestDeleteStore_Guard_RejectsSoftDeletedKBWithPendingBinding(t *testing.T) {
 	ctx := context.Background()
 	svc, db, registry := newGuardTestService(t)
 	insertGuardStore(t, db, "store-A", 1)
@@ -1044,8 +1045,8 @@ func TestDeleteStore_Guard_IgnoresSoftDeletedKB(t *testing.T) {
 	require.NoError(t, db.Where("id = ?", kbID).Delete(&types.KnowledgeBase{}).Error)
 
 	err := svc.DeleteStore(ctx, 1, "store-A")
-	require.NoError(t, err)
-	require.Equal(t, []string{"store-A"}, registry.unregistered)
+	require.ErrorContains(t, err, "still has 1 knowledge base")
+	require.Empty(t, registry.unregistered)
 }
 
 func TestDeleteStore_Guard_IgnoresOtherTenantKB(t *testing.T) {

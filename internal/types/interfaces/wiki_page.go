@@ -408,3 +408,20 @@ type WikiPageRepository interface {
 	// UpdateIssueStatus updates an issue's status.
 	UpdateIssueStatus(ctx context.Context, issueID string, status string) error
 }
+
+// WikiIngestCheckpointStore is the durable saga store used by partial Wiki
+// repair. It is intentionally optional so lightweight Wiki implementations do
+// not have to emulate SQL transaction semantics.
+type WikiIngestCheckpointStore interface {
+	PrepareWikiIngestWorkUnit(ctx context.Context, unit *types.WikiIngestWorkUnit) (*types.WikiIngestWorkUnit, error)
+	PrepareAndBindWikiIngestWorkUnit(ctx context.Context, binding types.WikiIngestWorkBinding, unit *types.WikiIngestWorkUnit) (*types.WikiIngestWorkUnit, error)
+	MarkWikiIngestWorkUnitMapped(ctx context.Context, workID string, output types.JSON) error
+	PrepareWikiTaxonomyPlan(ctx context.Context, plan *types.WikiTaxonomyPlan) (*types.WikiTaxonomyPlan, error)
+	FindMappedWikiTaxonomyPlan(ctx context.Context, tenantID uint64, knowledgeBaseID, workSetDigest, missingSetDigest, contractKey string) (*types.WikiTaxonomyPlan, error)
+	SaveWikiTaxonomyPlanProgress(ctx context.Context, planID string, expected, output types.JSON) error
+	MarkWikiTaxonomyPlanMapped(ctx context.Context, planID string, output types.JSON) error
+	PrepareWikiSlugApplication(ctx context.Context, application *types.WikiSlugApplication) (*types.WikiSlugApplication, error)
+	FindWikiSlugApplication(ctx context.Context, tenantID uint64, knowledgeBaseID, slug, contributionKey string) (*types.WikiSlugApplication, error)
+	MarkWikiSlugApplicationApplying(ctx context.Context, planID, generatedOutput string) error
+	ListWikiSlugContributionMarkers(ctx context.Context, workIDs []string) ([]types.WikiSlugContributionMarker, error)
+}

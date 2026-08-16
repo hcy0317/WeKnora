@@ -30,7 +30,9 @@ func (r *taskPendingOpsRepository) Enqueue(ctx context.Context, op *types.TaskPe
 	if err := preparePendingOp(op); err != nil {
 		return err
 	}
-	return r.db.WithContext(ctx).Create(op).Error
+	return r.db.WithContext(ctx).
+		Omit("ClaimedAt", "ClaimToken", "ClaimedByTaskID", "ClaimHeartbeatAt").
+		Create(op).Error
 }
 
 func preparePendingOp(op *types.TaskPendingOp) error {
@@ -84,7 +86,7 @@ func (r *taskPendingOpsRepository) EnqueueIfKnowledgeBaseActive(
 			}
 			return err
 		}
-		if err := tx.Create(op).Error; err != nil {
+		if err := tx.Omit("ClaimedAt", "ClaimToken", "ClaimedByTaskID", "ClaimHeartbeatAt").Create(op).Error; err != nil {
 			return err
 		}
 		accepted = true
@@ -148,7 +150,7 @@ func (r *taskPendingOpsRepository) SeedKnowledgeFinalizingWithPendingOp(
 		if res.RowsAffected == 0 {
 			return nil
 		}
-		if err := tx.Create(op).Error; err != nil {
+		if err := tx.Omit("ClaimedAt", "ClaimToken", "ClaimedByTaskID", "ClaimHeartbeatAt").Create(op).Error; err != nil {
 			return err
 		}
 		promoted = true
@@ -225,6 +227,32 @@ func (r *taskPendingOpsRepository) ClaimBatch(
 	limit int,
 	staleBefore time.Time,
 ) ([]*types.TaskPendingOp, error) {
+	return r.claimBatch(ctx, taskType, scope, scopeID, limit, staleBefore, nil)
+}
+
+// ClaimBatchOwned claims a disjoint key set under one stable ownership term.
+// claimed_at records the term start while claim_heartbeat_at is the renewable
+// liveness timestamp. The token and Asynq task id never change during renewal.
+func (r *taskPendingOpsRepository) ClaimBatchOwned(
+	ctx context.Context,
+	taskType, scope, scopeID string,
+	limit int,
+	staleBefore time.Time,
+	owner types.TaskClaimOwner,
+) ([]*types.TaskPendingOp, error) {
+	if !owner.Valid() {
+		return nil, errors.New("claim pending ops: claim token and task id are required")
+	}
+	return r.claimBatch(ctx, taskType, scope, scopeID, limit, staleBefore, &owner)
+}
+
+func (r *taskPendingOpsRepository) claimBatch(
+	ctx context.Context,
+	taskType, scope, scopeID string,
+	limit int,
+	staleBefore time.Time,
+	owner *types.TaskClaimOwner,
+) ([]*types.TaskPendingOp, error) {
 	if limit <= 0 {
 		limit = 1
 	}
@@ -232,6 +260,7 @@ func (r *taskPendingOpsRepository) ClaimBatch(
 		limit = 1000
 	}
 	now := time.Now()
+	owned := owner != nil
 	var claimed []*types.TaskPendingOp
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 1. Pick up to `limit` distinct dedup_keys to claim, oldest first.
@@ -251,10 +280,11 @@ WHERE id IN (
 		FROM task_pending_ops
 		WHERE task_type = ? AND scope = ? AND scope_id = ?
 			AND (claimed_at IS NULL OR claimed_at < ?)
+			AND (? OR claim_token IS NULL)
 			AND dedup_key NOT IN (
 				SELECT dedup_key FROM task_pending_ops
 				WHERE task_type = ? AND scope = ? AND scope_id = ?
-					AND claimed_at IS NOT NULL AND claimed_at >= ?
+					AND claimed_at IS NOT NULL AND COALESCE(claim_heartbeat_at, claimed_at) >= ?
 			)
 	) anchors WHERE anchors.rn = 1
 )
@@ -262,7 +292,7 @@ ORDER BY id ASC
 LIMIT ?
 FOR UPDATE SKIP LOCKED`
 			if err := tx.Raw(anchorSQL,
-				taskType, scope, scopeID, staleBefore,
+				taskType, scope, scopeID, staleBefore, owned,
 				taskType, scope, scopeID, staleBefore,
 				limit).
 				Scan(&keys).Error; err != nil {
@@ -272,10 +302,11 @@ FOR UPDATE SKIP LOCKED`
 			freshKeys := tx.Model(&types.TaskPendingOp{}).
 				Select("dedup_key").
 				Where("task_type = ? AND scope = ? AND scope_id = ?", taskType, scope, scopeID).
-				Where("claimed_at IS NOT NULL AND claimed_at >= ?", staleBefore)
+				Where("claimed_at IS NOT NULL AND COALESCE(claim_heartbeat_at, claimed_at) >= ?", staleBefore)
 			if err := tx.Model(&types.TaskPendingOp{}).
 				Where("task_type = ? AND scope = ? AND scope_id = ?", taskType, scope, scopeID).
 				Where("(claimed_at IS NULL OR claimed_at < ?)", staleBefore).
+				Where("(? OR claim_token IS NULL)", owned).
 				Where("dedup_key NOT IN (?)", freshKeys).
 				Group("dedup_key").
 				Order("MIN(id) ASC").
@@ -304,10 +335,20 @@ FOR UPDATE SKIP LOCKED`
 		if len(ids) == 0 {
 			return nil
 		}
-		if err := tx.Model(&types.TaskPendingOp{}).
-			Where("id IN ?", ids).
-			Update("claimed_at", now).Error; err != nil {
-			return err
+		updates := map[string]any{"claimed_at": now, "claim_heartbeat_at": now}
+		updateQuery := tx.Model(&types.TaskPendingOp{}).Where("id IN ?", ids)
+		if owner == nil {
+			updateQuery = updateQuery.Where("claim_token IS NULL")
+		} else {
+			updates["claim_token"] = owner.Token
+			updates["claimed_by_task_id"] = owner.TaskID
+		}
+		result := updateQuery.Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != int64(len(ids)) {
+			return fmt.Errorf("claim pending ops: claimed %d of %d rows", result.RowsAffected, len(ids))
 		}
 		return tx.Where("id IN ?", ids).Order("id ASC").Find(&claimed).Error
 	})
@@ -326,8 +367,147 @@ func (r *taskPendingOpsRepository) ReleaseByIDs(ctx context.Context, ids []int64
 	}
 	return r.db.WithContext(ctx).
 		Model(&types.TaskPendingOp{}).
-		Where("id IN ?", ids).
-		Update("claimed_at", nil).Error
+		Where("id IN ? AND claim_token IS NULL", ids).
+		Updates(map[string]any{
+			"claimed_at": nil, "claim_heartbeat_at": nil,
+		}).Error
+}
+
+func (r *taskPendingOpsRepository) RenewClaims(
+	ctx context.Context, ids []int64, owner types.TaskClaimOwner,
+) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if !owner.Valid() {
+		return errors.New("renew pending claims: claim token and task id are required")
+	}
+	renewedAt := time.Now()
+	result := r.db.WithContext(ctx).
+		Model(&types.TaskPendingOp{}).
+		Where("id IN ? AND claim_token = ? AND claimed_by_task_id = ?", ids, owner.Token, owner.TaskID).
+		Update("claim_heartbeat_at", renewedAt)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != int64(len(ids)) {
+		return fmt.Errorf(
+			"renew pending claims: ownership changed for %d of %d rows",
+			len(ids)-int(result.RowsAffected), len(ids),
+		)
+	}
+	return nil
+}
+
+func (r *taskPendingOpsRepository) ReleaseClaims(
+	ctx context.Context, ids []int64, owner types.TaskClaimOwner,
+) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if !owner.Valid() {
+		return errors.New("release pending claims: claim token and task id are required")
+	}
+	result := r.db.WithContext(ctx).
+		Model(&types.TaskPendingOp{}).
+		Where("id IN ? AND claim_token = ? AND claimed_by_task_id = ?", ids, owner.Token, owner.TaskID).
+		Updates(map[string]any{
+			"claimed_at": nil, "claim_heartbeat_at": nil,
+			"claim_token": nil, "claimed_by_task_id": nil,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != int64(len(ids)) {
+		return fmt.Errorf(
+			"release pending claims: ownership changed for %d of %d rows",
+			len(ids)-int(result.RowsAffected), len(ids),
+		)
+	}
+	return nil
+}
+
+func (r *taskPendingOpsRepository) DeleteClaims(
+	ctx context.Context, ids []int64, owner types.TaskClaimOwner,
+) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if !owner.Valid() {
+		return errors.New("delete pending claims: claim token and task id are required")
+	}
+	result := r.db.WithContext(ctx).
+		Where("id IN ? AND claim_token = ? AND claimed_by_task_id = ?", ids, owner.Token, owner.TaskID).
+		Delete(&types.TaskPendingOp{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != int64(len(ids)) {
+		return fmt.Errorf("delete pending claims: ownership changed for %d of %d rows", len(ids)-int(result.RowsAffected), len(ids))
+	}
+	return nil
+}
+
+func (r *taskPendingOpsRepository) IncrClaimFailCount(
+	ctx context.Context, id int64, owner types.TaskClaimOwner,
+) (int, error) {
+	if id <= 0 || !owner.Valid() {
+		return 0, errors.New("increment pending claim failure: id, claim token and task id are required")
+	}
+	var count int
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&types.TaskPendingOp{}).
+			Where("id = ? AND claim_token = ? AND claimed_by_task_id = ?", id, owner.Token, owner.TaskID).
+			UpdateColumn("fail_count", gorm.Expr("fail_count + 1"))
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("increment pending claim failure: ownership changed")
+		}
+		return tx.Model(&types.TaskPendingOp{}).Where("id = ?", id).Pluck("fail_count", &count).Error
+	})
+	return count, err
+}
+
+func (r *taskPendingOpsRepository) InspectClaim(
+	ctx context.Context, taskType, scope, scopeID, dedupKey string,
+) (*types.TaskPendingOpClaimSnapshot, error) {
+	if taskType == "" || scope == "" || scopeID == "" || dedupKey == "" {
+		return nil, errors.New("inspect pending claim: queue tuple and dedup key are required")
+	}
+	var rows []types.TaskPendingOp
+	if err := r.db.WithContext(ctx).
+		Where("task_type = ? AND scope = ? AND scope_id = ? AND dedup_key = ?", taskType, scope, scopeID, dedupKey).
+		Order("id ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	snapshot := &types.TaskPendingOpClaimSnapshot{Found: len(rows) > 0, Consistent: true}
+	if len(rows) == 0 {
+		return snapshot, nil
+	}
+	first := rows[0]
+	snapshot.ClaimToken = first.ClaimToken
+	snapshot.ClaimedByTaskID = first.ClaimedByTaskID
+	snapshot.ClaimedAt = first.ClaimedAt
+	snapshot.HeartbeatAt = first.ClaimHeartbeatAt
+	for i := range rows {
+		row := rows[i]
+		snapshot.RowIDs = append(snapshot.RowIDs, row.ID)
+		if row.ClaimToken != first.ClaimToken || row.ClaimedByTaskID != first.ClaimedByTaskID ||
+			!sameOptionalTime(row.ClaimedAt, first.ClaimedAt) ||
+			!sameOptionalTime(row.ClaimHeartbeatAt, first.ClaimHeartbeatAt) {
+			snapshot.Consistent = false
+		}
+	}
+	return snapshot, nil
+}
+
+func sameOptionalTime(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
 }
 
 // DeleteByIDs removes the given rows in one statement. Empty input is a
@@ -337,7 +517,7 @@ func (r *taskPendingOpsRepository) DeleteByIDs(ctx context.Context, ids []int64)
 		return nil
 	}
 	return r.db.WithContext(ctx).
-		Where("id IN ?", ids).
+		Where("id IN ? AND claim_token IS NULL", ids).
 		Delete(&types.TaskPendingOp{}).Error
 }
 
@@ -363,7 +543,7 @@ func (r *taskPendingOpsRepository) DeleteByScope(ctx context.Context, scope, sco
 func (r *taskPendingOpsRepository) IncrFailCount(ctx context.Context, id int64) (int, error) {
 	var newCount int
 	err := r.db.WithContext(ctx).Raw(
-		`UPDATE task_pending_ops SET fail_count = fail_count + 1 WHERE id = ? RETURNING fail_count`,
+		`UPDATE task_pending_ops SET fail_count = fail_count + 1 WHERE id = ? AND claim_token IS NULL RETURNING fail_count`,
 		id,
 	).Scan(&newCount).Error
 	if err != nil {
@@ -413,6 +593,23 @@ func (r *taskPendingOpsRepository) DeleteByDedupKey(
 		q = q.Where("op = ?", op)
 	}
 	return q.Delete(&types.TaskPendingOp{}).Error
+}
+
+func (r *taskPendingOpsRepository) AckKnowledgeBaseDeletion(
+	ctx context.Context, tenantID uint64, knowledgeBaseID, dedupKey string,
+) error {
+	result := r.db.WithContext(ctx).Where(
+		"tenant_id = ? AND task_type = ? AND scope = ? AND scope_id = ? AND op = ? AND dedup_key = ?",
+		tenantID, types.TypeKBDelete, types.TaskScopeKnowledgeBaseDeletion,
+		knowledgeBaseID, "delete", dedupKey,
+	).Delete(&types.TaskPendingOp{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("ack knowledge base deletion: expected 1 outbox row, deleted %d", result.RowsAffected)
+	}
+	return nil
 }
 
 // taskDeadLetterRepository implements interfaces.TaskDeadLetterRepository.

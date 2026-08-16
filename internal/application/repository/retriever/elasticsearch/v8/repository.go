@@ -12,8 +12,11 @@ import (
 	typesLocal "github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/elastic/go-elasticsearch/v8"
+	"github.com/elastic/go-elasticsearch/v8/typedapi/core/bulk"
+	"github.com/elastic/go-elasticsearch/v8/typedapi/core/deletebyquery"
 	"github.com/elastic/go-elasticsearch/v8/typedapi/core/search"
 	"github.com/elastic/go-elasticsearch/v8/typedapi/types"
+	"github.com/elastic/go-elasticsearch/v8/typedapi/types/enums/operationtype"
 	"github.com/elastic/go-elasticsearch/v8/typedapi/types/enums/scriptlanguage"
 	"github.com/google/uuid"
 )
@@ -206,13 +209,51 @@ func (e *elasticsearchRepository) BatchSave(ctx context.Context,
 	}
 
 	// Execute the bulk request
-	_, err := indexRequest.Do(ctx)
+	resp, err := indexRequest.Do(ctx)
 	if err != nil {
 		log.Errorf("[Elasticsearch] Failed to execute bulk operation: %v", err)
 		return fmt.Errorf("failed to do bulk: %w", err)
 	}
+	if err := bulkResponseError(resp, len(embeddingList)); err != nil {
+		return err
+	}
 
 	log.Infof("[Elasticsearch] Successfully batch saved %d indices", len(embeddingList))
+	return nil
+}
+
+func bulkResponseError(resp *bulk.Response, expectedItems int) error {
+	if resp == nil {
+		return fmt.Errorf("bulk request returned no response")
+	}
+	if len(resp.Items) != expectedItems {
+		return fmt.Errorf("bulk response item count mismatch: got %d, want %d", len(resp.Items), expectedItems)
+	}
+	for _, item := range resp.Items {
+		if len(item) != 1 {
+			return fmt.Errorf("bulk response contained an invalid item")
+		}
+		for operation, result := range item {
+			if operation != operationtype.Create {
+				return fmt.Errorf("bulk response contained an unexpected operation")
+			}
+			if result.Error == nil {
+				if result.Status < 200 || result.Status >= 300 {
+					return fmt.Errorf("bulk response contained an unsuccessful item status")
+				}
+				continue
+			}
+			id := "unknown"
+			if result.Id_ != nil {
+				id = *result.Id_
+			}
+			return fmt.Errorf("bulk item %s failed with %s", id, result.Error.Type)
+		}
+	}
+	if resp.Errors {
+		return fmt.Errorf("bulk request reported item failures")
+	}
+
 	return nil
 }
 
@@ -227,12 +268,15 @@ func (e *elasticsearchRepository) DeleteByChunkIDList(ctx context.Context, chunk
 
 	log.Infof("[Elasticsearch] Deleting indices by chunk IDs, count: %d", len(chunkIDList))
 	// Use DeleteByQuery to delete all documents matching the chunk IDs
-	_, err := e.client.DeleteByQuery(e.index).Query(&types.Query{
+	response, err := e.client.DeleteByQuery(e.index).Query(&types.Query{
 		Terms: &types.TermsQuery{TermsQuery: map[string]types.TermsQueryField{e.idField("chunk_id"): chunkIDList}},
 	}).Do(ctx)
 	if err != nil {
 		log.Errorf("[Elasticsearch] Failed to delete by chunk IDs: %v", err)
 		return fmt.Errorf("failed to delete by query: %w", err)
+	}
+	if err := deleteByQueryResponseError(response); err != nil {
+		return err
 	}
 
 	log.Infof("[Elasticsearch] Successfully deleted documents by chunk IDs")
@@ -250,12 +294,15 @@ func (e *elasticsearchRepository) DeleteBySourceIDList(ctx context.Context, sour
 
 	log.Infof("[Elasticsearch] Deleting indices by source IDs, count: %d", len(sourceIDList))
 	// Use DeleteByQuery to delete all documents matching the source IDs
-	_, err := e.client.DeleteByQuery(e.index).Query(&types.Query{
+	response, err := e.client.DeleteByQuery(e.index).Query(&types.Query{
 		Terms: &types.TermsQuery{TermsQuery: map[string]types.TermsQueryField{e.idField("source_id"): sourceIDList}},
 	}).Do(ctx)
 	if err != nil {
 		log.Errorf("[Elasticsearch] Failed to delete by source IDs: %v", err)
 		return fmt.Errorf("failed to delete by query: %w", err)
+	}
+	if err := deleteByQueryResponseError(response); err != nil {
+		return err
 	}
 
 	log.Infof("[Elasticsearch] Successfully deleted documents by source IDs")
@@ -275,15 +322,42 @@ func (e *elasticsearchRepository) DeleteByKnowledgeIDList(ctx context.Context,
 
 	log.Infof("[Elasticsearch] Deleting indices by knowledge IDs, count: %d", len(knowledgeIDList))
 	// Use DeleteByQuery to delete all documents matching the knowledge IDs
-	_, err := e.client.DeleteByQuery(e.index).Query(&types.Query{
+	response, err := e.client.DeleteByQuery(e.index).Query(&types.Query{
 		Terms: &types.TermsQuery{TermsQuery: map[string]types.TermsQueryField{e.idField("knowledge_id"): knowledgeIDList}},
 	}).Do(ctx)
 	if err != nil {
 		log.Errorf("[Elasticsearch] Failed to delete by knowledge IDs: %v", err)
 		return fmt.Errorf("failed to delete by query: %w", err)
 	}
+	if err := deleteByQueryResponseError(response); err != nil {
+		return err
+	}
 
 	log.Infof("[Elasticsearch] Successfully deleted documents by knowledge IDs")
+	return nil
+}
+
+func deleteByQueryResponseError(response *deletebyquery.Response) error {
+	if response == nil {
+		return fmt.Errorf("delete by query returned an incomplete response")
+	}
+	if len(response.Failures) > 0 {
+		failure := response.Failures[0]
+		return fmt.Errorf("delete by query failed for document %s with %s", failure.Id, failure.Cause.Type)
+	}
+	if response.TimedOut != nil && *response.TimedOut {
+		return fmt.Errorf("delete by query timed out")
+	}
+	if response.VersionConflicts != nil && *response.VersionConflicts > 0 {
+		return fmt.Errorf("delete by query reported %d version conflicts", *response.VersionConflicts)
+	}
+	if response.Deleted == nil || response.Total == nil || response.TimedOut == nil ||
+		response.VersionConflicts == nil || response.Failures == nil {
+		return fmt.Errorf("delete by query returned an incomplete response")
+	}
+	if *response.Deleted != *response.Total {
+		return fmt.Errorf("delete by query returned inconsistent completion counters")
+	}
 	return nil
 }
 

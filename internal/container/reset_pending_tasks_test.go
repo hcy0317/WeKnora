@@ -295,10 +295,12 @@ func TestStuckKnowledgeParseQuery_ReuseAfterFindDoesNotBreakUpdate(t *testing.T)
 
 type recordingTaskEnqueuer struct {
 	tasks []*asynq.Task
+	opts  [][]asynq.Option
 }
 
-func (r *recordingTaskEnqueuer) Enqueue(task *asynq.Task, _ ...asynq.Option) (*asynq.TaskInfo, error) {
+func (r *recordingTaskEnqueuer) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error) {
 	r.tasks = append(r.tasks, task)
+	r.opts = append(r.opts, append([]asynq.Option(nil), opts...))
 	return &asynq.TaskInfo{ID: "test", Type: task.Type()}, nil
 }
 

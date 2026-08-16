@@ -307,6 +307,8 @@ interface BaseModelTestPayload {
     customHeaders?: Record<string, string>;
     extraConfig?: Record<string, string>;
     interfaceType?: string;
+    /** 远程测试端点需要按真实模型类型装配请求；省略时保持旧版 chat 行为。 */
+    modelType?: 'chat' | 'vllm';
     /** 第二段密钥（如 LKEAP Rerank 的腾讯云 SecretKey） */
     appSecret?: string;
 }

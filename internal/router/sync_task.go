@@ -17,13 +17,15 @@ import (
 // SyncTaskExecutor executes tasks synchronously (in a goroutine) without Redis.
 // Used in Lite mode as a drop-in replacement for *asynq.Client.
 type SyncTaskExecutor struct {
-	mu       sync.RWMutex
-	handlers map[string]func(context.Context, *asynq.Task) error
+	mu            sync.RWMutex
+	handlers      map[string]func(context.Context, *asynq.Task) error
+	activeTaskIDs map[string]struct{}
 }
 
 func NewSyncTaskExecutor() *SyncTaskExecutor {
 	return &SyncTaskExecutor{
-		handlers: make(map[string]func(context.Context, *asynq.Task) error),
+		handlers:      make(map[string]func(context.Context, *asynq.Task) error),
+		activeTaskIDs: make(map[string]struct{}),
 	}
 }
 
@@ -38,17 +40,10 @@ func (e *SyncTaskExecutor) RegisterHandler(pattern string, handler func(context.
 // Instead of queuing to Redis, it dispatches the task to a goroutine.
 // Supports ProcessIn (delay) and MaxRetry options for parity with asynq.
 func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error) {
-	e.mu.RLock()
-	handler, ok := e.handlers[task.Type()]
-	e.mu.RUnlock()
-
-	if !ok {
-		return nil, fmt.Errorf("sync task executor: no handler registered for type %q", task.Type())
-	}
-
 	var delay time.Duration
 	maxRetry := 25 // asynq default
 	maxRetrySet := false
+	taskID := ""
 	for _, opt := range opts {
 		switch opt.Type() {
 		case asynq.ProcessInOpt:
@@ -60,6 +55,10 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 				maxRetry = n
 				maxRetrySet = true
 			}
+		case asynq.TaskIDOpt:
+			if id, ok := opt.Value().(string); ok {
+				taskID = id
+			}
 		}
 	}
 	// Callers that explicitly pass MaxRetry(0) want no retries.
@@ -68,7 +67,21 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 		maxRetry = 0
 	}
 
-	taskID := uuid.New().String()
+	if taskID == "" {
+		taskID = uuid.New().String()
+	}
+	e.mu.Lock()
+	handler, ok := e.handlers[task.Type()]
+	if !ok {
+		e.mu.Unlock()
+		return nil, fmt.Errorf("sync task executor: no handler registered for type %q", task.Type())
+	}
+	if _, exists := e.activeTaskIDs[taskID]; exists {
+		e.mu.Unlock()
+		return nil, asynq.ErrTaskIDConflict
+	}
+	e.activeTaskIDs[taskID] = struct{}{}
+	e.mu.Unlock()
 	info := &asynq.TaskInfo{
 		ID:    taskID,
 		Queue: "sync",
@@ -76,6 +89,11 @@ func (e *SyncTaskExecutor) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asy
 	}
 
 	go func() {
+		defer func() {
+			e.mu.Lock()
+			delete(e.activeTaskIDs, taskID)
+			e.mu.Unlock()
+		}()
 		if delay > 0 {
 			time.Sleep(delay)
 		}

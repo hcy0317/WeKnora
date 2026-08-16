@@ -209,34 +209,13 @@ type volcengineProvider struct{ baseProvider }
 func (volcengineProvider) Name() provider.ProviderName { return provider.ProviderVolcengine }
 func (volcengineProvider) Thinking() ThinkingStrategy  { return thinkingTypeField{} }
 
-// --- Azure OpenAI: api-key auth (reasoning variant also strips sampling params) ---
+// --- Azure OpenAI: api-key auth ---
 
 type azureProvider struct{ baseProvider }
 
 func (azureProvider) Name() provider.ProviderName { return provider.ProviderAzureOpenAI }
 func (azureProvider) Auth(req *http.Request, creds authCreds, _ []byte) {
 	req.Header.Set("api-key", creds.APIKey)
-}
-
-type azureReasoningProvider struct{ azureProvider }
-
-func (azureReasoningProvider) Matches(model string) bool {
-	return provider.IsOpenAIReasoningOrGPT5Model(model)
-}
-func (azureReasoningProvider) ShapeRequest(req *openai.ChatCompletionRequest, _ *ChatOptions, _ bool) {
-	shapeOpenAIReasoning(req)
-}
-
-// --- OpenAI reasoning / GPT-5: no sampling params, must use max_completion_tokens ---
-
-type openAIReasoningProvider struct{ baseProvider }
-
-func (openAIReasoningProvider) Name() provider.ProviderName { return provider.ProviderOpenAI }
-func (openAIReasoningProvider) Matches(model string) bool {
-	return provider.IsOpenAIReasoningOrGPT5Model(model)
-}
-func (openAIReasoningProvider) ShapeRequest(req *openai.ChatCompletionRequest, _ *ChatOptions, _ bool) {
-	shapeOpenAIReasoning(req)
 }
 
 // --- Moonshot: v1 models accept only temperature=1 ---
@@ -256,19 +235,6 @@ func (moonshotProvider) ShapeRequest(req *openai.ChatCompletionRequest, _ *ChatO
 	req.PresencePenalty = 0
 }
 
-// shapeOpenAIReasoning strips sampling params (unsupported by o-series / GPT-5)
-// and migrates max_tokens to max_completion_tokens. See issue #1283.
-func shapeOpenAIReasoning(req *openai.ChatCompletionRequest) {
-	req.Temperature = 0
-	req.TopP = 0
-	req.FrequencyPenalty = 0
-	req.PresencePenalty = 0
-	if req.MaxCompletionTokens == 0 && req.MaxTokens > 0 {
-		req.MaxCompletionTokens = req.MaxTokens
-	}
-	req.MaxTokens = 0
-}
-
 // providerRegistry is ordered: more specific adapters (those with a real
 // Matches predicate) must precede the generic catch-all for the same provider.
 var providerRegistry = []providerAdapter{
@@ -280,9 +246,7 @@ var providerRegistry = []providerAdapter{
 	geminiProvider{},
 	volcengineProvider{},
 	nvidiaProvider{},
-	azureReasoningProvider{},
 	azureProvider{},
-	openAIReasoningProvider{},
 	moonshotProvider{},
 }
 

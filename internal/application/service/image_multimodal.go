@@ -175,14 +175,20 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 	if payload.Attempt > 0 {
 		parent := tracker.LookupStage(ctx, payload.KnowledgeID, payload.Attempt, types.StageMultimodal)
 		if parent != nil {
-			name := fmt.Sprintf("multimodal.image[%d]", payload.ImageIndex)
-			imgSpan = tracker.BeginSubSpan(ctx, parent, name, types.SpanKindGeneration, types.JSONMap{
+			imageSpanName := fmt.Sprintf("multimodal.image[%d]", payload.ImageIndex)
+			imgSpan = tracker.BeginSubSpan(ctx, parent, imageSpanName, types.SpanKindGeneration, types.JSONMap{
 				"image_url":         payload.ImageURL,
 				"image_source_type": payload.ImageSourceType,
 				"enable_ocr":        payload.EnableOCR,
 				"enable_caption":    payload.EnableCaption,
 				"parent_chunk_id":   payload.ChunkID,
 			})
+			if imgSpan != nil {
+				// The task middleware scopes generations to the broad multimodal
+				// stage. Narrow it to this concrete image so vlm.predict records
+				// become children of multimodal.image[i], not its siblings.
+				ctx = langfuse.WithKnowledgeGenerationStage(ctx, imgSpan.Name)
+			}
 		}
 	}
 
@@ -200,13 +206,20 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 	// cause of "stuck parsing" reports. Intermediate retries skip finalize
 	// so we don't double-count and prematurely trigger post-process.
 	var handleErr error
+	imageOutcomeCode := "MULTIMODAL_VLM_FAILED"
+	var imageOutcomeErr error
 	defer func() {
 		// Finalize the image subspan with the actual outcome — not the
 		// finalize-counter outcome. The counter logic counts a "tried"
 		// image regardless of inner success; the span surface tells the
 		// UI whether THIS specific image worked.
 		if imgSpan != nil {
-			if handleErr == nil {
+			if imageOutcomeErr != nil {
+				tracker.FailSpan(ctx, imgSpan,
+					imageOutcomeCode,
+					imageOutcomeErr.Error(),
+					imageOutcomeErr)
+			} else if handleErr == nil {
 				tracker.EndSpan(ctx, imgSpan, imgOut)
 			} else if isFinalAsynqAttempt(ctx) {
 				tracker.FailSpan(ctx, imgSpan,
@@ -248,6 +261,8 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 		logger.Errorf(ctx, "[ImageMultimodal] Skip unreadable image %s: %v", payload.ImageURL, readErr)
 		imgOut["skipped"] = "unreadable_image"
 		imgOut["read_error"] = readErr.Error()
+		imageOutcomeCode = "MULTIMODAL_IMAGE_READ_FAILED"
+		imageOutcomeErr = readErr
 		return nil
 	}
 	imgOut["image_bytes"] = len(imgBytes)
@@ -256,6 +271,7 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 		URL:         payload.ImageURL,
 		OriginalURL: payload.ImageURL,
 	}
+	var vlmErrors []error
 
 	if payload.EnableOCR {
 		prompt := vlmOCRPrompt
@@ -272,6 +288,7 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 		if ocrErr != nil {
 			logger.Warnf(ctx, "[ImageMultimodal] OCR failed for %s: %v", payload.ImageURL, ocrErr)
 			imgOut["ocr_error"] = ocrErr.Error()
+			vlmErrors = append(vlmErrors, fmt.Errorf("OCR: %w", ocrErr))
 		} else {
 			ocrText = sanitizeOCRText(ocrText)
 			if ocrText != "" {
@@ -286,14 +303,17 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 		}
 	}
 
-	caption, capErr := vlmModel.Predict(ctx, [][]byte{imgBytes}, buildVLMCaptionPrompt(ctx, vlmCfg))
-	if capErr != nil {
-		logger.Warnf(ctx, "[ImageMultimodal] Caption failed for %s: %v", payload.ImageURL, capErr)
-		imgOut["caption_error"] = capErr.Error()
-	} else if caption != "" {
-		imageInfo.Caption = caption
-		imgOut["caption_chars"] = len([]rune(caption))
-		imgOut["caption_preview"] = previewText(caption, 200)
+	if payload.EnableCaption {
+		caption, capErr := vlmModel.Predict(ctx, [][]byte{imgBytes}, buildVLMCaptionPrompt(ctx, vlmCfg))
+		if capErr != nil {
+			logger.Warnf(ctx, "[ImageMultimodal] Caption failed for %s: %v", payload.ImageURL, capErr)
+			imgOut["caption_error"] = capErr.Error()
+			vlmErrors = append(vlmErrors, fmt.Errorf("caption: %w", capErr))
+		} else if caption != "" {
+			imageInfo.Caption = caption
+			imgOut["caption_chars"] = len([]rune(caption))
+			imgOut["caption_preview"] = previewText(caption, 200)
+		}
 	}
 
 	// Build child chunks for OCR and caption results
@@ -336,8 +356,16 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 	imgOut["chunks_created"] = len(newChunks)
 
 	if len(newChunks) == 0 {
-		// Deferred finalize will count this image on success.
-		imgOut["skipped"] = "no_extracted_content"
+		// A handler-level nil means the queue item was consumed, not that the
+		// image was recognized. Preserve partial-success semantics, but mark the
+		// image failed when every requested VLM call produced no usable content
+		// and at least one call returned an actual error.
+		if outcomeErr := multimodalImageOutcomeError(len(newChunks), vlmErrors); outcomeErr != nil {
+			imageOutcomeErr = outcomeErr
+			imgOut["skipped"] = "vlm_failed"
+		} else {
+			imgOut["skipped"] = "no_extracted_content"
+		}
 		return nil
 	}
 
@@ -363,6 +391,13 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 	// all images are processed before triggering summary/question generation.
 	// Deferred finalize handles the parent knowledge counter.
 	return nil
+}
+
+func multimodalImageOutcomeError(extractedChunks int, vlmErrors []error) error {
+	if extractedChunks > 0 || len(vlmErrors) == 0 {
+		return nil
+	}
+	return errors.Join(vlmErrors...)
 }
 
 // shouldDropOrphanedMultimodal reports whether the task should exit without

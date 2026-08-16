@@ -45,6 +45,7 @@ func TestAnthropicChat(t *testing.T) {
 		CustomHeaders: map[string]string{
 			"anthropic-beta": "test-beta",
 		},
+		ExtraConfig: map[string]string{"reasoning_effort": "high"},
 	})
 	require.NoError(t, err)
 
@@ -63,6 +64,8 @@ func TestAnthropicChat(t *testing.T) {
 	require.Len(t, capturedRequest.Messages, 1)
 	assert.Equal(t, "user", capturedRequest.Messages[0].Role)
 	assert.Equal(t, "Hi", capturedRequest.Messages[0].Content)
+	require.NotNil(t, capturedRequest.OutputConfig)
+	assert.Equal(t, "high", capturedRequest.OutputConfig.Effort)
 	assert.Equal(t, "hello", resp.Content)
 	assert.Equal(t, "end_turn", resp.FinishReason)
 	assert.Equal(t, 3, resp.Usage.PromptTokens)
