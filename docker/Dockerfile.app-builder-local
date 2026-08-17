@@ -18,7 +18,10 @@ RUN if [ -n "$APK_MIRROR_ARG" ]; then \
     apt-get install -y --no-install-recommends build-essential git libsqlite3-dev && \
     rm -rf /var/lib/apt/lists/*
 
+# go.mod replace-points anydoc at ./third_party/anydoc-go, so the local
+# module declaration must exist before dependency resolution.
 COPY go.mod go.sum ./
+COPY third_party/anydoc-go/go.mod third_party/anydoc-go/go.mod
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 COPY . .

@@ -80,11 +80,12 @@ func callWikiLLM(
 				if content.Len() == 0 {
 					return nil, fmt.Errorf("wiki LLM stream completed without answer content")
 				}
-				if err := validateWikiStreamContent(purpose, content.String()); err != nil {
+				normalizedContent, err := normalizeWikiStreamContent(purpose, content.String())
+				if err != nil {
 					return nil, err
 				}
 				return &types.ChatResponse{
-					Content:      content.String(),
+					Content:      normalizedContent,
 					FinishReason: finishReason,
 					Usage:        usage,
 				}, nil
@@ -119,37 +120,118 @@ func callWikiLLM(
 	}
 }
 
-func validateWikiStreamContent(purpose, content string) error {
+func normalizeWikiStreamContent(purpose, content string) (string, error) {
 	if strings.TrimSpace(content) == "" {
-		return fmt.Errorf("wiki LLM stream completed without answer content")
+		return "", fmt.Errorf("wiki LLM stream completed without answer content")
 	}
 	switch wikiStreamContract(purpose) {
 	case wikiStreamOutputNone:
-		return nil
+		return content, nil
 	case wikiStreamOutputSummaryMarkdown:
 		summary, body := splitSummaryLine(content)
 		if strings.TrimSpace(summary) == "" {
-			return fmt.Errorf("wiki LLM stream content validation failed: missing SUMMARY line")
+			return "", fmt.Errorf("wiki LLM stream content validation failed: missing SUMMARY line")
 		}
 		if strings.TrimSpace(body) == "" {
-			return fmt.Errorf("wiki LLM stream content validation failed: missing Markdown body")
+			return "", fmt.Errorf("wiki LLM stream content validation failed: missing Markdown body")
 		}
-		return nil
+		return content, nil
 	case wikiStreamOutputJSON:
-		// Existing Wiki consumers tolerate fenced JSON and sanitized literal
-		// control characters through cleanLLMJSON; validate against that same
-		// normalized representation, while returning the original content for
-		// the caller's unchanged parsing path.
-		cleaned := cleanLLMJSON(content)
-		if !json.Valid([]byte(cleaned)) {
-			return fmt.Errorf("wiki LLM stream content validation failed: invalid JSON")
+		normalized, err := normalizeWikiJSONContent(purpose, content)
+		if err != nil {
+			return "", fmt.Errorf("wiki LLM stream content validation failed: %w", err)
 		}
-		if err := validateWikiJSONContract(purpose, []byte(cleaned)); err != nil {
-			return fmt.Errorf("wiki LLM stream content validation failed: %w", err)
-		}
-		return nil
+		return normalized, nil
 	default:
-		return fmt.Errorf("wiki LLM stream content validation failed: unknown output contract")
+		return "", fmt.Errorf("wiki LLM stream content validation failed: unknown output contract")
+	}
+}
+
+func normalizeWikiJSONContent(purpose, content string) (string, error) {
+	cleaned := cleanLLMJSON(content)
+	if json.Valid([]byte(cleaned)) {
+		if err := validateWikiJSONContract(purpose, []byte(cleaned)); err != nil {
+			return "", err
+		}
+		return cleaned, nil
+	}
+
+	var contractErr error
+	for start := 0; start < len(content); start++ {
+		if content[start] != '{' {
+			continue
+		}
+		end, ok := findWikiJSONObjectEnd(content, start)
+		if !ok {
+			continue
+		}
+		candidate := sanitizeJSONString(strings.TrimSpace(content[start : end+1]))
+		if !json.Valid([]byte(candidate)) {
+			continue
+		}
+		if err := validateWikiJSONContract(purpose, []byte(candidate)); err != nil {
+			if contractErr == nil {
+				contractErr = err
+			}
+			continue
+		}
+		return candidate, nil
+	}
+	if contractErr != nil {
+		return "", contractErr
+	}
+	return "", fmt.Errorf("invalid JSON")
+}
+
+func findWikiJSONObjectEnd(content string, start int) (int, bool) {
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(content); i++ {
+		ch := content[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch ch {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i, true
+			}
+			if depth < 0 {
+				return 0, false
+			}
+		}
+	}
+	return 0, false
+}
+
+func wikiJSONOutputSchema(purpose string) json.RawMessage {
+	switch purpose {
+	case "wiki_candidate_slug", "wiki_knowledge_extract":
+		return json.RawMessage(`{"type":"object","required":["entities","concepts"],"properties":{"entities":{"type":"array"},"concepts":{"type":"array"}}}`)
+	case "wiki_chunk_citation":
+		return json.RawMessage(`{"type":"object","required":["citations","new_slugs"],"properties":{"citations":{"type":"object"},"new_slugs":{"type":"array"}}}`)
+	case "wiki_taxonomy_plan":
+		return json.RawMessage(`{"type":"object","required":["assignments"],"properties":{"assignments":{"type":"array"}}}`)
+	case "wiki_deduplication":
+		return json.RawMessage(`{"type":"object","required":["merges"],"properties":{"merges":{"type":"object"}}}`)
+	default:
+		return nil
 	}
 }
 
