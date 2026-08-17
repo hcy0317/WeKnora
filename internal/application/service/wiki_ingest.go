@@ -3062,6 +3062,9 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 	}
 	thinking := false
 	opts := &chat.ChatOptions{Temperature: 0.3, Thinking: &thinking, MaxTokens: wikiLLMMaxTokens}
+	if format := wikiJSONOutputSchema(purpose); len(format) > 0 {
+		opts.Format = format
+	}
 	prefixFingerprint := chat.PromptPrefixFingerprint(messages, opts)
 	warmupKey := ""
 	if promptTpl == agent.WikiPageModifyUserPrompt {

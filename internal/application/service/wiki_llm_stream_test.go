@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -45,6 +46,7 @@ type scriptedWikiChat struct {
 	streamErr   error
 	events      []types.StreamResponse
 	streamSteps [][]types.StreamResponse
+	streamOpts  *chat.ChatOptions
 }
 
 func (m *scriptedWikiChat) Chat(
@@ -57,11 +59,12 @@ func (m *scriptedWikiChat) Chat(
 }
 
 func (m *scriptedWikiChat) ChatStream(
-	context.Context,
-	[]chat.Message,
-	*chat.ChatOptions,
+	_ context.Context,
+	_ []chat.Message,
+	opts *chat.ChatOptions,
 ) (<-chan types.StreamResponse, error) {
 	m.streamCalls++
+	m.streamOpts = opts
 	if m.streamErr != nil {
 		return nil, m.streamErr
 	}
@@ -276,6 +279,7 @@ func TestCallWikiLLMRejectsJSONMissingPurposeContract(t *testing.T) {
 
 func TestCallWikiLLMValidatesFencedStructuredJSONLikeExistingConsumers(t *testing.T) {
 	content := "```json\n{\"entities\":[],\"concepts\":[]}\n```"
+	want := `{"entities":[],"concepts":[]}`
 	model := &scriptedWikiChat{events: []types.StreamResponse{{
 		ResponseType: types.ResponseTypeAnswer,
 		Content:      content,
@@ -288,8 +292,53 @@ func TestCallWikiLLMValidatesFencedStructuredJSONLikeExistingConsumers(t *testin
 	if err != nil {
 		t.Fatalf("callWikiLLM() error = %v", err)
 	}
-	if response == nil || response.Content != content {
-		t.Fatalf("response = %#v, want original fenced JSON", response)
+	if response == nil || response.Content != want {
+		t.Fatalf("response = %#v, want normalized JSON %q", response, want)
+	}
+}
+
+func TestCallWikiLLMNormalizesPrefacedStructuredJSON(t *testing.T) {
+	want := `{"entities":[],"concepts":[]}`
+	model := &scriptedWikiChat{events: []types.StreamResponse{{
+		ResponseType: types.ResponseTypeAnswer,
+		Content:      "我会先按科研关联筛选候选实体。\n" + want,
+		Done:         true,
+		FinishReason: "stop",
+	}}}
+
+	response, err := callWikiLLM(
+		context.Background(), model, nil, &chat.ChatOptions{}, "wiki_candidate_slug",
+	)
+	if err != nil {
+		t.Fatalf("callWikiLLM() error = %v", err)
+	}
+	if response == nil || response.Content != want {
+		t.Fatalf("response = %#v, want normalized JSON %q", response, want)
+	}
+}
+
+func TestGenerateWithTemplateEnablesJSONModeForStructuredWikiPurposes(t *testing.T) {
+	model := &scriptedWikiChat{events: []types.StreamResponse{{
+		ResponseType: types.ResponseTypeAnswer,
+		Content:      `{"entities":[],"concepts":[]}`,
+		Done:         true,
+		FinishReason: "stop",
+	}}}
+
+	_, err := (&wikiIngestService{}).generateWithTemplate(
+		context.Background(), model, agent.WikiCandidateSlugPrompt, map[string]string{
+			"Content": "source", "Language": "Chinese",
+		},
+	)
+	if err != nil {
+		t.Fatalf("generateWithTemplate() error = %v", err)
+	}
+	if model.streamOpts == nil || !json.Valid(model.streamOpts.Format) {
+		t.Fatalf("structured Wiki call format = %s, want valid JSON schema", model.streamOpts.Format)
+	}
+	format := string(model.streamOpts.Format)
+	if !strings.Contains(format, `"entities"`) || !strings.Contains(format, `"concepts"`) {
+		t.Fatalf("structured Wiki schema = %s, want entities and concepts", format)
 	}
 }
 
