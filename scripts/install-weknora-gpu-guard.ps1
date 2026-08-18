@@ -2,6 +2,7 @@
 param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'WeKnora\host-guards'),
     [string]$OwnerPath = (Join-Path $env:ProgramData 'WeKnora\engine-ownership\owner.txt'),
+    [switch]$DeferGpuGuardStart,
     [switch]$Uninstall
 )
 
@@ -79,14 +80,15 @@ function Register-HostGuardTask {
     param(
         [Parameter(Mandatory)][string]$TaskName,
         [Parameter(Mandatory)][string]$Launcher,
-        [Parameter(Mandatory)][string]$Description
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][object[]]$Triggers
     )
     $quotedLauncher = '"' + (Join-Path $installDirectory $Launcher) + '"'
     $action = New-ScheduledTaskAction -Execute $wscript -Argument "//B //NoLogo $quotedLauncher"
     Register-ScheduledTask `
         -TaskName $TaskName `
         -Action $action `
-        -Trigger @($logonTrigger, $watchdogTrigger) `
+        -Trigger $Triggers `
         -Settings $settings `
         -Principal $principal `
         -Description $Description `
@@ -97,7 +99,8 @@ function Register-HostGuardTask {
 Register-HostGuardTask `
     -TaskName $ollamaTaskName `
     -Launcher 'launch-weknora-ollama-watchdog-hidden.vbs' `
-    -Description 'WeKnora Ollama availability watchdog. Does not access managed engine containers.'
+    -Description 'WeKnora Ollama availability watchdog. Does not access managed engine containers.' `
+    -Triggers @($logonTrigger, $watchdogTrigger)
 Start-ScheduledTask -TaskName $ollamaTaskName
 
 $existingGpuTask = Get-ScheduledTask -TaskName $gpuTaskName -ErrorAction SilentlyContinue
@@ -110,15 +113,24 @@ if ($existingGpuTask -and $existingGpuTask.State -eq 'Running') {
     } while ($state -eq 'Running' -and [DateTimeOffset]::UtcNow -lt $deadline)
     if ($state -eq 'Running') { throw 'legacy GPU Guard task did not stop; new guarded task was not started' }
 }
-Wait-WeKnoraEngineProcessesExit `
-    -CommandLineNeedles @('\weknora-gpu-guard.ps1', '\launch-weknora-gpu-guard-hidden.vbs') `
-    -TimeoutSeconds 15
+if (-not $DeferGpuGuardStart) {
+    Wait-WeKnoraEngineProcessesExit `
+        -CommandLineNeedles @('\weknora-gpu-guard.ps1', '\launch-weknora-gpu-guard-hidden.vbs') `
+        -TimeoutSeconds 15
+}
 
+$gpuTriggers = if ($DeferGpuGuardStart) { @($logonTrigger) } else { @($logonTrigger, $watchdogTrigger) }
 Register-HostGuardTask `
     -TaskName $gpuTaskName `
     -Launcher 'launch-weknora-gpu-guard-hidden.vbs' `
-    -Description 'WeKnora legacy GPU observer/actuator with explicit mode, named mutex, owner check, and heartbeat.'
-Start-ScheduledTask -TaskName $gpuTaskName
+    -Description 'WeKnora legacy GPU observer/actuator with explicit mode, named mutex, owner check, and heartbeat.' `
+    -Triggers $gpuTriggers
+if ($DeferGpuGuardStart) {
+    Write-Warning 'GPU Guard task was replaced but not started; its next logon trigger avoids overlap with the orphaned legacy process.'
+}
+else {
+    Start-ScheduledTask -TaskName $gpuTaskName
+}
 
 [pscustomobject]@{
     GPUGuardTask = $gpuTaskName
@@ -126,4 +138,5 @@ Start-ScheduledTask -TaskName $gpuTaskName
     InstallRoot = $installDirectory
     Owner = $owner
     Mode = $mode
+    GPUGuardStartDeferred = [bool]$DeferGpuGuardStart
 }
