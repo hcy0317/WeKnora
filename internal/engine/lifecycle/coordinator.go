@@ -479,6 +479,22 @@ func (c *Coordinator) ReconcileGateway(reconcile GatewayReconcile) error {
 		groupState := c.groups[group]
 		groupState.mu.Lock()
 
+		for leaseID, lease := range groupState.active {
+			if lease.GatewayID != reconcile.GatewayID {
+				continue
+			}
+			if _, active := activeIDs[leaseID]; active {
+				continue
+			}
+			if _, shadow := shadowByID[leaseID]; shadow {
+				delete(groupState.active, leaseID)
+				groupState.shadow[leaseID] = lease
+				continue
+			}
+			delete(groupState.active, leaseID)
+			c.leaseGroups.Delete(leaseID)
+		}
+
 		for leaseID, lease := range groupState.suspect {
 			if lease.GatewayID != reconcile.GatewayID {
 				continue

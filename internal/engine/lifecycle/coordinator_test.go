@@ -396,6 +396,31 @@ func TestCoordinatorRestartsFullIdlePeriodAfterGatewayReconcile(t *testing.T) {
 	require.Equal(t, int32(1), runtime.stops.Load())
 }
 
+func TestCoordinatorReconcileRemovesCompletedActiveLeaseMissingFromGatewayLedger(t *testing.T) {
+	t.Parallel()
+
+	clock := &manualClock{now: time.Date(2026, 8, 18, 16, 30, 0, 0, time.UTC)}
+	coordinator, err := NewCoordinator(testConfig(), &countingRuntime{}, WithClock(clock))
+	require.NoError(t, err)
+	_, err = coordinator.Acquire(context.Background(), GroupASR, AcquireRequest{
+		RequestID: "release-lost-during-partition",
+		GatewayID: "gateway-1",
+		Purpose:   "transcribe",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, coordinator.ReconcileGateway(GatewayReconcile{
+		GatewayID:      "gateway-1",
+		GatewayEpoch:   3,
+		ActiveLeaseIDs: nil,
+		ShadowLeases:   nil,
+	}))
+	snapshot, err := coordinator.Snapshot(GroupASR)
+	require.NoError(t, err)
+	require.Equal(t, StateReady, snapshot.State)
+	require.Zero(t, snapshot.Active)
+}
+
 func TestCoordinatorClosesOnlyNewRerankerGPUAdmission(t *testing.T) {
 	t.Parallel()
 
