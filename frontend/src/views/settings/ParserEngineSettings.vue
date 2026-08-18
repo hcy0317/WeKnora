@@ -341,6 +341,7 @@
               <t-checkbox v-model="config.paddleocr_vl_use_chart_recognition">{{ $t('settings.parser.chartRecognition') }}</t-checkbox>
             </div>
           </div>
+          <EngineLifecycleSettings group="paddleocr" />
         </section>
 
         <!-- Section 3 — paddleocr_vl_cloud 云 API 配置 -->
@@ -386,6 +387,7 @@ import { useUIStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
 import { MessagePlugin } from 'tdesign-vue-next'
 import SettingDrawer from '@/components/settings/SettingDrawer.vue'
+import EngineLifecycleSettings from '@/components/settings/EngineLifecycleSettings.vue'
 import {
   getParserEngines,
   getParserEngineConfig,

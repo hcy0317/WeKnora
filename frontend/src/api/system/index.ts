@@ -1,5 +1,24 @@
 import { get, post, put, del } from '@/utils/request'
 import type { CreatedTenantAPIKey, TenantAPIKey, TenantAPIKeyCapability } from '@/api/tenant'
+import type {
+  EngineLifecycleConfig,
+  EngineLifecycleUpdatePayload,
+} from '@/stores/engineLifecyclePolicy'
+
+const ENGINE_LIFECYCLE_ROUTE = '/api/v1/system/admin/engine-lifecycle'
+
+export async function getEngineLifecycle(): Promise<EngineLifecycleConfig> {
+  return await get(ENGINE_LIFECYCLE_ROUTE) as unknown as EngineLifecycleConfig
+}
+
+export async function updateEngineLifecycle(
+  revision: number,
+  payload: EngineLifecycleUpdatePayload,
+): Promise<EngineLifecycleConfig> {
+  return await put(ENGINE_LIFECYCLE_ROUTE, payload, {
+    headers: { 'If-Match': `"${revision}"` },
+  }) as unknown as EngineLifecycleConfig
+}
 
 export interface CreatePlatformAPIKeyPayload {
   name: string
