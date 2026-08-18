@@ -21,6 +21,25 @@ type Application struct {
 	gpuMonitor  *GPUMonitor
 }
 
+type maintenanceCoordinator interface {
+	SweepGPUAdmission(context.Context) error
+	EnsureAlwaysOn(context.Context) error
+	SweepIdle(context.Context) error
+}
+
+func runMaintenanceSweep(ctx context.Context, coordinator maintenanceCoordinator) {
+	if err := coordinator.SweepGPUAdmission(ctx); err != nil {
+		log.Printf("engine GPU backend retirement deferred: %v", err)
+		return
+	}
+	if err := coordinator.EnsureAlwaysOn(ctx); err != nil {
+		log.Printf("engine always-on reconciliation deferred: %v", err)
+	}
+	if err := coordinator.SweepIdle(ctx); err != nil {
+		log.Printf("engine idle shutdown deferred: %v", err)
+	}
+}
+
 func NewApplication(configPath string) (*Application, error) {
 	configStore := lifecycle.NewConfigStore(configPath)
 	config, err := configStore.Load()
@@ -135,16 +154,7 @@ func (a *Application) Run(ctx context.Context) error {
 			}
 			return fmt.Errorf("serve engine controller: %w", err)
 		case <-sweep:
-			if err := a.coordinator.SweepGPUAdmission(ctx); err != nil {
-				log.Printf("engine GPU backend retirement deferred: %v", err)
-				continue
-			}
-			if err := a.coordinator.EnsureAlwaysOn(ctx); err != nil {
-				return err
-			}
-			if err := a.coordinator.SweepIdle(ctx); err != nil {
-				return err
-			}
+			runMaintenanceSweep(ctx, a.coordinator)
 		}
 	}
 }

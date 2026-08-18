@@ -730,6 +730,13 @@ func (c *Coordinator) SweepIdle(ctx context.Context) error {
 
 		groupState := c.groups[group]
 		groupState.mu.Lock()
+		if groupState.state == StateReady && groupState.cooldownUntil != nil {
+			if c.clock.Now().Before(*groupState.cooldownUntil) {
+				groupState.mu.Unlock()
+				continue
+			}
+			groupState.cooldownUntil = nil
+		}
 		if groupState.state != StateReady || groupState.idleSince == nil ||
 			groupState.leaseCountLocked() != 0 || groupState.pending != 0 ||
 			c.clock.Now().Sub(*groupState.idleSince) < policy.IdleTimeout {
@@ -762,7 +769,9 @@ func (c *Coordinator) SweepIdle(ctx context.Context) error {
 
 		if err := c.runtime.Stop(ctx, group); err != nil {
 			groupState.mu.Lock()
-			groupState.state = StateFailed
+			groupState.state = StateReady
+			retryAt := c.clock.Now().Add(policy.FailureCooldown)
+			groupState.cooldownUntil = &retryAt
 			close(groupState.stopDone)
 			groupState.stopDone = nil
 			groupState.mu.Unlock()
@@ -773,6 +782,7 @@ func (c *Coordinator) SweepIdle(ctx context.Context) error {
 		groupState.state = StateStopped
 		groupState.backend = Backend{}
 		groupState.idleSince = nil
+		groupState.cooldownUntil = nil
 		close(groupState.stopDone)
 		groupState.stopDone = nil
 		groupState.mu.Unlock()

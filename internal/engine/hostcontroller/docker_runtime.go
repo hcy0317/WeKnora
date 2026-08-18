@@ -213,6 +213,14 @@ func (r *DockerRuntime) stop(ctx context.Context, group lifecycle.Group) error {
 				continue
 			}
 			seen[container] = struct{}{}
+			state, err := r.inspectState(ctx, container)
+			if err != nil {
+				failures = append(failures, fmt.Errorf("inspect container %s before stop: %w", container, err))
+				continue
+			}
+			if !state.Running {
+				continue
+			}
 			if _, err := r.runner.Run(ctx, "stop", "--time", "20", container); err != nil {
 				failures = append(failures, fmt.Errorf("stop container %s: %w", container, err))
 			}

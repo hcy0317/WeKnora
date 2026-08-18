@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 )
 
@@ -52,6 +53,13 @@ func (g *ownerFileActuationGate) WithOwnership(ctx context.Context, action func(
 		return ctx.Err()
 	default:
 	}
+
+	// Windows mutex ownership is tied to the calling OS thread. Docker start and
+	// stop can block long enough for the Go scheduler to move this goroutine, so
+	// pin it from acquisition through release. This is harmless on other hosts
+	// and keeps the ActuationGate contract platform-independent.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	ownership, err := AcquireOwnership(g.mutexName)
 	if err != nil {

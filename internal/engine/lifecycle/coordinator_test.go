@@ -85,6 +85,17 @@ type failFirstBackendStopRuntime struct {
 	stopAttempts atomic.Int32
 }
 
+type failFirstGroupStopRuntime struct {
+	countingRuntime
+}
+
+func (r *failFirstGroupStopRuntime) Stop(context.Context, Group) error {
+	if r.stops.Add(1) == 1 {
+		return fmt.Errorf("docker stop unavailable")
+	}
+	return nil
+}
+
 func (r *failFirstBackendStopRuntime) StopBackend(
 	ctx context.Context,
 	group Group,
@@ -257,6 +268,41 @@ func TestCoordinatorStopsOnDemandGroupAfterFullIdlePeriod(t *testing.T) {
 	clock.Advance(time.Minute)
 	require.NoError(t, coordinator.SweepIdle(context.Background()))
 	require.Equal(t, int32(1), runtime.stops.Load())
+	snapshot, err = coordinator.Snapshot(GroupASR)
+	require.NoError(t, err)
+	require.Equal(t, StateStopped, snapshot.State)
+}
+
+func TestCoordinatorRetriesFailedIdleStopAfterFailureCooldown(t *testing.T) {
+	t.Parallel()
+
+	clock := &manualClock{now: time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)}
+	runtime := &failFirstGroupStopRuntime{}
+	coordinator, err := NewCoordinator(testConfig(), runtime, WithClock(clock))
+	require.NoError(t, err)
+
+	lease, err := coordinator.Acquire(context.Background(), GroupASR, AcquireRequest{
+		RequestID: "request-stop-retry",
+		GatewayID: "gateway-1",
+		Purpose:   "transcribe",
+	})
+	require.NoError(t, err)
+	require.NoError(t, coordinator.Release(lease.ID, ReleaseCompleted))
+	clock.Advance(10 * time.Minute)
+
+	require.ErrorContains(t, coordinator.SweepIdle(context.Background()), "docker stop unavailable")
+	snapshot, err := coordinator.Snapshot(GroupASR)
+	require.NoError(t, err)
+	require.Equal(t, StateReady, snapshot.State)
+	require.Equal(t, int32(1), runtime.stops.Load())
+
+	clock.Advance(4 * time.Minute)
+	require.NoError(t, coordinator.SweepIdle(context.Background()))
+	require.Equal(t, int32(1), runtime.stops.Load())
+
+	clock.Advance(time.Minute)
+	require.NoError(t, coordinator.SweepIdle(context.Background()))
+	require.Equal(t, int32(2), runtime.stops.Load())
 	snapshot, err = coordinator.Snapshot(GroupASR)
 	require.NoError(t, err)
 	require.Equal(t, StateStopped, snapshot.State)

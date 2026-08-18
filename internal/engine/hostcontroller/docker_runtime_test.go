@@ -46,6 +46,14 @@ func (r *catalogRunner) Run(_ context.Context, arguments ...string) (string, err
 		}
 		return `{"Status":"exited","Running":false}`, nil
 	}
+	if len(arguments) == 4 && arguments[0] == "stop" && arguments[1] == "--time" {
+		container := arguments[3]
+		if !r.started[container] {
+			return "", fmt.Errorf("container %s is not running", container)
+		}
+		r.started[container] = false
+		return container, nil
+	}
 	return "", fmt.Errorf("unexpected docker arguments: %s", strings.Join(arguments, " "))
 }
 
@@ -122,6 +130,25 @@ func TestDockerRuntimeRequiresControllerOwnershipBeforeActuation(t *testing.T) {
 	require.ErrorIs(t, err, ErrOwnerMismatch)
 	require.Equal(t, 1, gate.calls)
 	require.Empty(t, runner.snapshotCalls())
+}
+
+func TestDockerRuntimeStopSkipsContainersThatAreAlreadyStopped(t *testing.T) {
+	t.Parallel()
+
+	runner := &catalogRunner{started: map[string]bool{
+		"WeKnora-qwen-reranker-gpu": false,
+		"WeKnora-qwen-reranker":     true,
+	}}
+	runtime, err := NewDockerRuntime(testCatalog(), runner)
+	require.NoError(t, err)
+
+	require.NoError(t, runtime.Stop(context.Background(), lifecycle.GroupReranker))
+	calls := runner.snapshotCalls()
+	require.Equal(t, [][]string{
+		{"inspect", "--format", "{{json .State}}", "WeKnora-qwen-reranker"},
+		{"stop", "--time", "20", "WeKnora-qwen-reranker"},
+		{"inspect", "--format", "{{json .State}}", "WeKnora-qwen-reranker-gpu"},
+	}, calls)
 }
 
 func testCatalog() lifecycle.CatalogConfig {
