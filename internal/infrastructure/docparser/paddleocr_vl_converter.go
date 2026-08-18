@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/engine/lifecycle"
+	enginerouting "github.com/Tencent/WeKnora/internal/engine/routing"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/utils"
@@ -54,8 +56,9 @@ type PaddleOCRVLReader struct {
 
 // NewPaddleOCRVLReader creates a reader from ParserEngineOverrides.
 func NewPaddleOCRVLReader(overrides map[string]string) *PaddleOCRVLReader {
+	endpoint, _ := enginerouting.Resolve(lifecycle.GroupPaddleOCR, overrides["paddleocr_vl_endpoint"])
 	return &PaddleOCRVLReader{
-		endpoint: strings.TrimRight(overrides["paddleocr_vl_endpoint"], "/"),
+		endpoint: strings.TrimRight(endpoint, "/"),
 		useSeal:  parseBoolOr(overrides["paddleocr_vl_use_seal_recognition"], true),
 		useChart: parseBoolOr(overrides["paddleocr_vl_use_chart_recognition"], false),
 	}
@@ -524,6 +527,7 @@ func (c *PaddleOCRVLReader) processImages(
 
 // PingPaddleOCRVL checks whether a self-hosted PaddleOCR-VL service is reachable.
 func PingPaddleOCRVL(endpoint string) (bool, string) {
+	endpoint, _ = enginerouting.Resolve(lifecycle.GroupPaddleOCR, endpoint)
 	endpoint = strings.TrimRight(endpoint, "/")
 	if endpoint == "" {
 		return false, "未配置 PaddleOCR-VL 端点"

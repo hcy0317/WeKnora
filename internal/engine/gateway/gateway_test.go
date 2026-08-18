@@ -321,3 +321,34 @@ func TestGatewayAcquiresStreamsAndReleasesPaddleLease(t *testing.T) {
 	require.Equal(t, "request-paddle", leaseClient.request.RequestID)
 	require.Equal(t, []string{"lease-1"}, leaseClient.released)
 }
+
+func TestGatewayHealthProbeAcquiresPaddleLeaseAndChecksRealBackend(t *testing.T) {
+	t.Parallel()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		require.Equal(t, http.MethodGet, request.Method)
+		require.Equal(t, "/health", request.URL.Path)
+		response.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(backend.Close)
+	leaseClient := &fakeLeaseClient{lease: lifecycle.Lease{
+		ID:      "lease-health",
+		Group:   lifecycle.GroupPaddleOCR,
+		Backend: lifecycle.Backend{ID: "paddle-gpu", URL: backend.URL},
+	}}
+	gateway, err := New(Config{
+		LeaseClient: leaseClient,
+		Routes:      DefaultRoutes(),
+		AllowedBackends: map[lifecycle.Group]map[string]struct{}{
+			lifecycle.GroupPaddleOCR: {backend.URL: {}},
+		},
+	})
+	require.NoError(t, err)
+
+	response := httptest.NewRecorder()
+	gateway.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/paddleocr/health", nil))
+
+	require.Equal(t, http.StatusOK, response.Code)
+	require.Equal(t, lifecycle.GroupPaddleOCR, leaseClient.group)
+	require.Equal(t, []string{"lease-health"}, leaseClient.released)
+}

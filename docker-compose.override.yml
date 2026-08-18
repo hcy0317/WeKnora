@@ -15,6 +15,7 @@ services:
     image: weknora-app:local-patched
     environment:
       - SSRF_WHITELIST_EXTRA=sub2api.long-antares.ts.net,*.long-antares.ts.net,searxng,accelerator-router,engine-gateway,speaches,paddleocr-vl
+      - WEKNORA_ENGINE_GATEWAY_URL=${WEKNORA_ENGINE_GATEWAY_URL-http://engine-gateway:18084}
       - NEO4J_ENABLE=true
       - VLM_HTTP_TIMEOUT_SECONDS=1200
     dns:

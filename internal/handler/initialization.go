@@ -2122,38 +2122,7 @@ func (h *InitializationHandler) CheckASRModel(c *gin.Context) {
 	}
 
 	res, err := asrInstance.Transcribe(ctx, assets.ASRTestWAV, "asr_test.wav")
-	var text string
-	if res != nil {
-		text = res.Text
-	}
-	available := true
-	message := "ASR连接成功"
-
-	if err != nil {
-		errMsg := err.Error()
-		// Always include the raw upstream error after the hint — see
-		// classifyConnectionError comment for rationale.
-		switch {
-		case strings.Contains(errMsg, "401") || strings.Contains(errMsg, "Unauthorized") || strings.Contains(errMsg, "authentication"):
-			available = false
-			message = fmt.Sprintf("认证失败，请检查API Key：%s", errMsg)
-		case strings.Contains(errMsg, "404") || strings.Contains(errMsg, "Not Found"):
-			available = false
-			message = fmt.Sprintf("API端点不存在，请检查Base URL：%s", errMsg)
-		case strings.Contains(errMsg, "connection refused") || strings.Contains(errMsg, "no such host") || strings.Contains(errMsg, "dial tcp"):
-			available = false
-			message = fmt.Sprintf("无法连接到服务器，请检查Base URL：%s", errMsg)
-		case strings.Contains(errMsg, "model") && strings.Contains(errMsg, "not found"):
-			available = false
-			message = fmt.Sprintf("模型不存在，请检查模型名称：%s", errMsg)
-		default:
-			logger.Infof(ctx, "ASR check got non-fatal error (endpoint reachable): %v", err)
-			available = true
-			message = fmt.Sprintf("ASR端点可达（非致命错误: %s）", errMsg)
-		}
-	} else if text != "" {
-		message = fmt.Sprintf("ASR连接成功，转写结果: %s", text)
-	}
+	available, message := classifyASRTestResult(res, err)
 
 	logger.Infof(ctx, "ASR model check completed, available: %v, message: %s", available, message)
 
@@ -2164,6 +2133,24 @@ func (h *InitializationHandler) CheckASRModel(c *gin.Context) {
 			"message":   message,
 		},
 	})
+}
+
+func classifyASRTestResult(result *asr.TranscriptionResult, err error) (bool, string) {
+	if err != nil {
+		errMessage := err.Error()
+		lowerMessage := strings.ToLower(errMessage)
+		if strings.Contains(lowerMessage, "model") && strings.Contains(lowerMessage, "not found") {
+			return false, fmt.Sprintf("模型不存在，请检查模型名称：%s", errMessage)
+		}
+		return false, fmt.Sprintf("%s：%s", classifyConnectionError(lowerMessage), errMessage)
+	}
+	if result == nil {
+		return false, "ASR接口未返回有效转写响应"
+	}
+	if text := strings.TrimSpace(result.Text); text != "" {
+		return true, fmt.Sprintf("ASR连接成功，转写结果: %s", text)
+	}
+	return true, "ASR连接成功"
 }
 
 // 使用结构体解析表单数据

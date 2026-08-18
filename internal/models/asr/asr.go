@@ -3,6 +3,8 @@ package asr
 import (
 	"context"
 
+	"github.com/Tencent/WeKnora/internal/engine/lifecycle"
+	enginerouting "github.com/Tencent/WeKnora/internal/engine/routing"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
@@ -47,10 +49,11 @@ func ConfigFromModel(m *types.Model) *Config {
 	if m == nil {
 		return nil
 	}
+	baseURL, _ := enginerouting.Resolve(lifecycle.GroupASR, m.Parameters.BaseURL)
 	return &Config{
 		ModelID:       m.ID,
 		APIKey:        m.Parameters.APIKey,
-		BaseURL:       m.Parameters.BaseURL,
+		BaseURL:       baseURL,
 		ModelName:     m.Name,
 		Source:        m.Source,
 		CustomHeaders: m.Parameters.CustomHeaders,

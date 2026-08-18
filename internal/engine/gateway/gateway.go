@@ -39,7 +39,7 @@ func DefaultRoutes() []Route {
 		{
 			Prefix:       "/paddleocr",
 			Group:        lifecycle.GroupPaddleOCR,
-			AllowedPaths: map[string]struct{}{"/layout-parsing": {}},
+			AllowedPaths: map[string]struct{}{"/layout-parsing": {}, "/health": {}},
 		},
 		{
 			Prefix:       "/asr",
@@ -208,8 +208,14 @@ func (g *Gateway) ServeHTTP(response http.ResponseWriter, request *http.Request)
 		writeJSON(response, http.StatusNotFound, map[string]string{"error": "unknown engine gateway path"})
 		return
 	}
-	if request.Method != http.MethodPost {
-		writeJSON(response, http.StatusMethodNotAllowed, map[string]string{"error": "engine gateway path requires POST"})
+	expectedMethod := http.MethodPost
+	if upstreamPath == "/health" {
+		expectedMethod = http.MethodGet
+	}
+	if request.Method != expectedMethod {
+		writeJSON(response, http.StatusMethodNotAllowed, map[string]string{
+			"error": "engine gateway path requires " + expectedMethod,
+		})
 		return
 	}
 

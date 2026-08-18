@@ -34,3 +34,20 @@ func TestConfigFromModel_Nil(t *testing.T) {
 		t.Fatalf("expected nil, got %+v", got)
 	}
 }
+
+func TestConfigFromModelRoutesManagedSpeachesThroughEngineGateway(t *testing.T) {
+	t.Setenv("WEKNORA_ENGINE_GATEWAY_URL", "http://engine-gateway:18084")
+	model := &types.Model{
+		ID:   "local-asr",
+		Name: "Systran/faster-whisper-medium",
+		Type: types.ModelTypeASR,
+		Parameters: types.ModelParameters{
+			BaseURL: "http://speaches:8000/v1",
+		},
+	}
+
+	config := ConfigFromModel(model)
+	if config.BaseURL != "http://engine-gateway:18084/asr/v1" {
+		t.Fatalf("managed ASR base URL = %q", config.BaseURL)
+	}
+}
