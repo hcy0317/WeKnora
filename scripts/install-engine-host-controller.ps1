@@ -53,6 +53,8 @@ $ownershipDirectory = Join-Path $env:ProgramData 'WeKnora\engine-ownership'
 $ownerPath = Join-Path $ownershipDirectory 'owner.txt'
 $temporaryBinary = Join-Path $env:TEMP ("weknora-engine-host-controller-{0}.exe" -f [Guid]::NewGuid().ToString('N'))
 $configCreated = $false
+$serviceWasRunning = $false
+$installSucceeded = $false
 
 try {
     Push-Location $repository
@@ -66,6 +68,7 @@ try {
 
     $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if ($existingService -and $existingService.Status -ne 'Stopped') {
+        $serviceWasRunning = $true
         if ($PSCmdlet.ShouldProcess($ServiceName, 'Stop service for binary replacement')) {
             Stop-Service -Name $ServiceName -ErrorAction Stop
             (Get-Service -Name $ServiceName).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
@@ -162,6 +165,7 @@ try {
         (Get-Service -Name $ServiceName).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
     }
 
+    $installSucceeded = $true
     [pscustomobject]@{
         Service = $ServiceName
         Binary = $binaryPath
@@ -176,6 +180,18 @@ try {
     }
 }
 finally {
+    if (-not $installSucceeded -and $serviceWasRunning) {
+        try {
+            $recoveryService = Get-Service -Name $ServiceName -ErrorAction Stop
+            if ($recoveryService.Status -ne 'Running') {
+                Start-Service -Name $ServiceName -ErrorAction Stop
+                (Get-Service -Name $ServiceName).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+            }
+        }
+        catch {
+            Write-Warning "failed to restore $ServiceName after installer error: $($_.Exception.Message)"
+        }
+    }
     if (Test-Path -LiteralPath $temporaryBinary -PathType Leaf) {
         Remove-Item -LiteralPath $temporaryBinary -Force
     }

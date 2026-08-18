@@ -35,8 +35,12 @@ function Export-WeKnoraEngineClientBundle {
     }
 
     New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
+    $destinationPrefix = $destinationDirectory.TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    ) + [IO.Path]::DirectorySeparatorChar
     $unexpectedFiles = @(Get-ChildItem -LiteralPath $destinationDirectory -File -Recurse | Where-Object {
-            $relativePath = [IO.Path]::GetRelativePath($destinationDirectory, $_.FullName)
+            $relativePath = $_.FullName.Substring($destinationPrefix.Length)
             $clientFiles -notcontains $relativePath
         })
     if ($unexpectedFiles.Count -gt 0) {

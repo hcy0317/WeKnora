@@ -100,6 +100,7 @@ try {
 
     $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     New-Item -ItemType Directory -Path $clientTLSRoot | Out-Null
+    Set-Content -LiteralPath (Join-Path $clientTLSRoot 'ca.crt') -Value 'preexisting-ca' -NoNewline
     $preexistingAcl = Get-Acl -LiteralPath $clientTLSRoot
     $preexistingAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
             [Security.Principal.SecurityIdentifier]::new('S-1-1-0'),
@@ -113,7 +114,7 @@ try {
         -ContainerRuntimeUserSid $currentUserSid | Out-Null
 
     $exportedFiles = @(Get-ChildItem -LiteralPath $clientTLSRoot -File -Recurse | ForEach-Object {
-            [IO.Path]::GetRelativePath($clientTLSRoot, $_.FullName)
+            $_.FullName.Substring($clientTLSRoot.TrimEnd('\').Length + 1)
         } | Sort-Object)
     $expectedExportedFiles = @(
         'backend\client.crt',
@@ -141,6 +142,8 @@ try {
     $controllerInstallerSource = Get-Content -LiteralPath $controllerInstallerPath -Raw
     $composeOverrideSource = Get-Content -LiteralPath $composeOverridePath -Raw
     Assert-True ($controllerInstallerSource -match 'ClientTLSRoot') 'controller installer does not publish the client TLS export path'
+    Assert-True ($controllerInstallerSource -match '\$serviceWasRunning') 'controller installer does not remember a running service before replacement'
+    Assert-True ($controllerInstallerSource -match '(?s)-not \$installSucceeded.+Start-Service.+WaitForStatus') 'controller installer does not restore a previously running service after a failed replacement'
     Assert-True ($composeOverrideSource -match 'C:/ProgramData/WeKnora/engine-client-tls') 'Compose still defaults to the protected controller TLS directory'
 }
 finally {
