@@ -24,15 +24,15 @@ services:
       - VLM_HTTP_TIMEOUT_SECONDS=1200
     volumes:
       - type: bind
-        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-controller/tls}/ca.crt"
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-client-tls}/ca.crt"
         target: /run/weknora-engine-controller/ca.crt
         read_only: true
       - type: bind
-        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-controller/tls}/backend/client.crt"
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-client-tls}/backend/client.crt"
         target: /run/weknora-engine-controller/client.crt
         read_only: true
       - type: bind
-        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-controller/tls}/backend/client.key"
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-client-tls}/backend/client.key"
         target: /run/weknora-engine-controller/client.key
         read_only: true
     dns:
@@ -63,15 +63,15 @@ services:
       - ENGINE_LEASE_RENEW_INTERVAL=10s
     volumes:
       - type: bind
-        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-controller/tls}/ca.crt"
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-client-tls}/ca.crt"
         target: /run/weknora-engine-tls/ca.crt
         read_only: true
       - type: bind
-        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-controller/tls}/gateway/client.crt"
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-client-tls}/gateway/client.crt"
         target: /run/weknora-engine-tls/client.crt
         read_only: true
       - type: bind
-        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-controller/tls}/gateway/client.key"
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-client-tls}/gateway/client.key"
         target: /run/weknora-engine-tls/client.key
         read_only: true
     extra_hosts:

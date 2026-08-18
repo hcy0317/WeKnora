@@ -2,6 +2,8 @@
 param(
     [string]$RepositoryRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$InstallRoot = (Join-Path $env:ProgramData 'WeKnora\engine-controller'),
+    [string]$ClientTLSRoot = (Join-Path $env:ProgramData 'WeKnora\engine-client-tls'),
+    [string]$ContainerRuntimeUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
     [string]$ServiceName = 'WeKnoraEngineHostController',
     [switch]$SkipStart
 )
@@ -19,16 +21,29 @@ $expectedModule = Join-Path $repository 'go.mod'
 $exampleConfig = Join-Path $repository 'config\engine-controller.example.yaml'
 $interlockSource = Join-Path $repository 'scripts\weknora-engine-interlock.ps1'
 $handoffSource = Join-Path $repository 'scripts\weknora-engine-handoff.ps1'
+$clientBundleSource = Join-Path $repository 'scripts\weknora-engine-client-bundle.ps1'
 if (-not (Test-Path -LiteralPath $expectedModule -PathType Leaf) -or
         -not (Test-Path -LiteralPath $exampleConfig -PathType Leaf) -or
         -not (Test-Path -LiteralPath $interlockSource -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $handoffSource -PathType Leaf)) {
+        -not (Test-Path -LiteralPath $handoffSource -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $clientBundleSource -PathType Leaf)) {
     throw "RepositoryRoot is not a WeKnora checkout: $repository"
 }
 
 $installDirectory = [IO.Path]::GetFullPath($InstallRoot)
-if (-not $installDirectory.StartsWith([IO.Path]::GetFullPath($env:ProgramData), [StringComparison]::OrdinalIgnoreCase)) {
+$programDataDirectory = [IO.Path]::GetFullPath($env:ProgramData)
+$programDataPrefix = $programDataDirectory.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+if (-not $installDirectory.StartsWith($programDataPrefix, [StringComparison]::OrdinalIgnoreCase)) {
     throw "InstallRoot must stay under ProgramData: $installDirectory"
+}
+$clientTLSDirectory = [IO.Path]::GetFullPath($ClientTLSRoot)
+if (-not $clientTLSDirectory.StartsWith($programDataPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "ClientTLSRoot must stay under ProgramData: $clientTLSDirectory"
+}
+$installPrefix = $installDirectory.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+if ($clientTLSDirectory.Equals($installDirectory, [StringComparison]::OrdinalIgnoreCase) -or
+        $clientTLSDirectory.StartsWith($installPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'ClientTLSRoot must stay outside the protected controller installation directory'
 }
 
 $binaryPath = Join-Path $installDirectory 'engine-host-controller.exe'
@@ -66,6 +81,7 @@ try {
         }
         Copy-Item -LiteralPath $interlockSource -Destination (Join-Path $installDirectory 'weknora-engine-interlock.ps1') -Force
         Copy-Item -LiteralPath $handoffSource -Destination (Join-Path $installDirectory 'weknora-engine-handoff.ps1') -Force
+        Copy-Item -LiteralPath $clientBundleSource -Destination (Join-Path $installDirectory 'weknora-engine-client-bundle.ps1') -Force
 
         New-Item -ItemType Directory -Path $ownershipDirectory -Force | Out-Null
         . $interlockSource
@@ -96,6 +112,11 @@ try {
         # Language-independent SIDs: LocalSystem and builtin Administrators.
         & icacls.exe $installDirectory /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'failed to restrict controller directory ACLs' }
+        . $clientBundleSource
+        Export-WeKnoraEngineClientBundle `
+            -SourceTLSRoot $tlsRoot `
+            -DestinationRoot $clientTLSDirectory `
+            -ContainerRuntimeUserSid $ContainerRuntimeUserSid | Out-Null
         & icacls.exe $ownershipDirectory /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'failed to restrict engine ownership directory ACLs' }
     }
@@ -146,6 +167,8 @@ try {
         Binary = $binaryPath
         Config = $configPath
         TLSRoot = $tlsRoot
+        ClientTLSRoot = $clientTLSDirectory
+        ContainerRuntimeUserSid = $ContainerRuntimeUserSid
         Owner = (Get-Content -LiteralPath $ownerPath -Raw).Trim()
         OwnerPath = $ownerPath
         ConfigMode = if ($configCreated) { 'observe-only initialized' } else { 'preserved existing config' }
