@@ -16,8 +16,25 @@ services:
     environment:
       - SSRF_WHITELIST_EXTRA=sub2api.long-antares.ts.net,*.long-antares.ts.net,searxng,accelerator-router,engine-gateway,speaches,paddleocr-vl
       - WEKNORA_ENGINE_GATEWAY_URL=${WEKNORA_ENGINE_GATEWAY_URL-http://engine-gateway:18084}
+      - WEKNORA_ENGINE_CONTROLLER_URL=https://host.docker.internal:18443
+      - WEKNORA_ENGINE_CONTROLLER_CA=/run/weknora-engine-controller/ca.crt
+      - WEKNORA_ENGINE_CONTROLLER_CERT=/run/weknora-engine-controller/client.crt
+      - WEKNORA_ENGINE_CONTROLLER_KEY=/run/weknora-engine-controller/client.key
       - NEO4J_ENABLE=true
       - VLM_HTTP_TIMEOUT_SECONDS=1200
+    volumes:
+      - type: bind
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-controller/tls}/ca.crt"
+        target: /run/weknora-engine-controller/ca.crt
+        read_only: true
+      - type: bind
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-controller/tls}/backend/client.crt"
+        target: /run/weknora-engine-controller/client.crt
+        read_only: true
+      - type: bind
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-controller/tls}/backend/client.key"
+        target: /run/weknora-engine-controller/client.key
+        read_only: true
     dns:
       - 100.100.100.100
       - 1.1.1.1
@@ -26,6 +43,8 @@ services:
       hcy-ingress:
         aliases:
           - weknora-app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   engine-gateway:
     build:

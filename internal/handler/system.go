@@ -63,6 +63,9 @@ type SystemHandler struct {
 	// unit tests, in which case only the legacy config is consulted.
 	storageBackendRepo interfaces.StorageBackendRepository
 	sandboxConfigSvc   sandboxConfigService
+	// engineLifecycleClient is injected by focused tests. Production requests
+	// construct the mTLS client from mounted backend-only certificate files.
+	engineLifecycleClient engineLifecycleClient
 	// startup snapshot for GET /system/capabilities; bound in router.NewRouter.
 	deploymentCapabilities DeploymentCapabilitiesData
 }
