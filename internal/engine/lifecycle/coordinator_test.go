@@ -465,6 +465,54 @@ func TestCoordinatorCancelsReversibleDrainForNewAcquire(t *testing.T) {
 	require.Equal(t, 1, snapshot.Active)
 }
 
+func TestCoordinatorAppliesUpdatedPolicyWithoutRestart(t *testing.T) {
+	t.Parallel()
+
+	clock := &manualClock{now: time.Date(2026, 8, 18, 18, 0, 0, 0, time.UTC)}
+	runtime := &countingRuntime{}
+	coordinator, err := NewCoordinator(testConfig(), runtime, WithClock(clock))
+	require.NoError(t, err)
+
+	lease, err := coordinator.Acquire(context.Background(), GroupASR, AcquireRequest{
+		RequestID: "before-config-update",
+		GatewayID: "gateway-1",
+		Purpose:   "transcribe",
+	})
+	require.NoError(t, err)
+	require.NoError(t, coordinator.Release(lease.ID, ReleaseCompleted))
+
+	updated := testConfig()
+	updated.Revision = 2
+	idleMinutes := 1
+	asr := updated.Groups[GroupASR]
+	asr.IdleMinutes = &idleMinutes
+	updated.Groups[GroupASR] = asr
+	require.NoError(t, coordinator.ApplyConfig(updated))
+
+	clock.Advance(time.Minute)
+	require.NoError(t, coordinator.SweepIdle(context.Background()))
+	require.Equal(t, int32(1), runtime.stops.Load())
+}
+
+func TestCoordinatorEnsuresAlwaysOnGroupWithoutHoldingSyntheticLease(t *testing.T) {
+	t.Parallel()
+
+	config := testConfig()
+	asr := config.Groups[GroupASR]
+	asr.Mode = ModeAlwaysOn
+	config.Groups[GroupASR] = asr
+	runtime := &countingRuntime{}
+	coordinator, err := NewCoordinator(config, runtime)
+	require.NoError(t, err)
+
+	require.NoError(t, coordinator.EnsureAlwaysOn(context.Background()))
+	require.Equal(t, int32(1), runtime.starts.Load())
+	snapshot, err := coordinator.Snapshot(GroupASR)
+	require.NoError(t, err)
+	require.Equal(t, StateReady, snapshot.State)
+	require.Zero(t, snapshot.Active)
+}
+
 func testConfig() Config {
 	return Config{
 		SchemaVersion: CurrentSchemaVersion,

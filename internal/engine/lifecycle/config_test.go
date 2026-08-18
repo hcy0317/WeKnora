@@ -1,6 +1,9 @@
 package lifecycle
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -120,4 +123,57 @@ catalog:
 		config.Catalog.Groups[GroupPaddleOCR].Backends[0].Containers,
 	)
 	require.True(t, config.Catalog.Groups[GroupReranker].Backends[0].GPU)
+}
+
+func TestDecodeConfigLoadsReadonlyControllerSettings(t *testing.T) {
+	t.Parallel()
+
+	config, err := DecodeConfig(strings.NewReader(`
+schema_version: 1
+revision: 1
+defaults:
+  idle_minutes: 10
+  startup_timeout_seconds: 120
+  failure_cooldown_minutes: 5
+groups:
+  paddleocr:
+    mode: always_on
+  asr:
+    mode: always_on
+  reranker:
+    mode: always_on
+controller:
+  listen_address: :18443
+  docker_executable: C:\Program Files\Docker\Docker\resources\bin\docker.exe
+  observe_only: true
+  owner_mutex: Global\WeKnoraEngineDockerOwner
+  sweep_interval_seconds: 5
+  tls:
+    certificate: C:\ProgramData\WeKnora\engine-controller\tls\server.crt
+    private_key: C:\ProgramData\WeKnora\engine-controller\tls\server.key
+    client_ca: C:\ProgramData\WeKnora\engine-controller\tls\ca.crt
+`))
+	require.NoError(t, err)
+	require.Equal(t, ":18443", config.Controller.ListenAddress)
+	require.True(t, config.Controller.ObserveOnly)
+	require.Equal(t, `Global\WeKnoraEngineDockerOwner`, config.Controller.OwnerMutex)
+	require.Equal(t, 5, config.Controller.SweepIntervalSeconds)
+	require.Contains(t, config.Controller.TLS.Certificate, `engine-controller\tls\server.crt`)
+}
+
+func TestEngineControllerExampleConfigIsValidAndMigrationSafe(t *testing.T) {
+	t.Parallel()
+
+	_, currentFile, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	path := filepath.Join(filepath.Dir(currentFile), "..", "..", "..", "config", "engine-controller.example.yaml")
+	file, err := os.Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = file.Close() })
+	config, err := DecodeConfig(file)
+	require.NoError(t, err)
+	require.True(t, config.Controller.ObserveOnly)
+	for _, group := range managedGroups {
+		require.Equal(t, ModeAlwaysOn, config.Groups[group].Mode)
+	}
 }

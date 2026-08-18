@@ -1,9 +1,11 @@
 package lifecycle
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,18 +74,18 @@ type AcquireRequest struct {
 }
 
 type ShadowLease struct {
-	ID              string
-	RequestID       string
-	Group           Group
-	Purpose         string
-	ControllerEpoch uint64
+	ID              string `json:"lease_id"`
+	RequestID       string `json:"request_id"`
+	Group           Group  `json:"group"`
+	Purpose         string `json:"purpose"`
+	ControllerEpoch uint64 `json:"controller_epoch"`
 }
 
 type GatewayReconcile struct {
-	GatewayID      string
-	GatewayEpoch   uint64
-	ActiveLeaseIDs []string
-	ShadowLeases   []ShadowLease
+	GatewayID      string        `json:"gateway_id"`
+	GatewayEpoch   uint64        `json:"gateway_epoch"`
+	ActiveLeaseIDs []string      `json:"active_lease_ids"`
+	ShadowLeases   []ShadowLease `json:"shadow_leases"`
 }
 
 type Lease struct {
@@ -100,13 +102,13 @@ type Lease struct {
 }
 
 type GroupSnapshot struct {
-	Group   Group
-	State   State
-	Epoch   uint64
-	Pending int
-	Active  int
-	Suspect int
-	Shadow  int
+	Group   Group  `json:"group"`
+	State   State  `json:"state"`
+	Epoch   uint64 `json:"epoch"`
+	Pending int    `json:"pending"`
+	Active  int    `json:"active"`
+	Suspect int    `json:"suspect"`
+	Shadow  int    `json:"shadow"`
 }
 
 type startAttempt struct {
@@ -149,6 +151,7 @@ func WithClock(clock Clock) CoordinatorOption {
 }
 
 type Coordinator struct {
+	configMu    sync.RWMutex
 	config      Config
 	runtime     Runtime
 	clock       Clock
@@ -165,9 +168,13 @@ func NewCoordinator(config Config, runtime Runtime, options ...CoordinatorOption
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
+	clonedConfig, err := cloneConfig(config)
+	if err != nil {
+		return nil, err
+	}
 
 	coordinator := &Coordinator{
-		config:  config,
+		config:  clonedConfig,
 		runtime: runtime,
 		clock:   realClock{},
 		groups:  make(map[Group]*groupCoordinator, len(managedGroups)),
@@ -192,7 +199,8 @@ func (c *Coordinator) Acquire(ctx context.Context, group Group, request AcquireR
 	if !ok {
 		return Lease{}, fmt.Errorf("unknown engine group %q", group)
 	}
-	policy, err := c.config.PolicyFor(group)
+	config := c.currentConfig()
+	policy, err := config.PolicyFor(group)
 	if err != nil {
 		return Lease{}, err
 	}
@@ -350,7 +358,7 @@ func (c *Coordinator) issueLeaseLocked(
 		Group:           group,
 		Backend:         groupState.backend,
 		ControllerEpoch: groupState.epoch,
-		CatalogRevision: c.config.Revision,
+		CatalogRevision: c.currentConfig().Revision,
 		ColdStart:       coldStart,
 		Waited:          waited,
 	}
@@ -417,6 +425,35 @@ func (c *Coordinator) MarkSuspect(leaseID string) error {
 	groupState.idleSince = nil
 	groupState.state = StateBusy
 	return nil
+}
+
+func (c *Coordinator) Renew(leaseID string) error {
+	value, ok := c.leaseGroups.Load(leaseID)
+	if !ok {
+		return fmt.Errorf("unknown lease %q", leaseID)
+	}
+	group := value.(Group)
+	groupState := c.groups[group]
+	groupState.mu.Lock()
+	defer groupState.mu.Unlock()
+	if _, active := groupState.active[leaseID]; active {
+		return nil
+	}
+	if lease, suspect := groupState.suspect[leaseID]; suspect {
+		delete(groupState.suspect, leaseID)
+		groupState.active[leaseID] = lease
+		groupState.idleSince = nil
+		groupState.state = StateBusy
+		return nil
+	}
+	if lease, shadow := groupState.shadow[leaseID]; shadow {
+		delete(groupState.shadow, leaseID)
+		groupState.active[leaseID] = lease
+		groupState.idleSince = nil
+		groupState.state = StateBusy
+		return nil
+	}
+	return fmt.Errorf("unknown lease %q", leaseID)
 }
 
 func (c *Coordinator) ReconcileGateway(reconcile GatewayReconcile) error {
@@ -494,7 +531,7 @@ func (c *Coordinator) ReconcileGateway(reconcile GatewayReconcile) error {
 				Group:           shadow.Group,
 				Backend:         groupState.backend,
 				ControllerEpoch: shadow.ControllerEpoch,
-				CatalogRevision: c.config.Revision,
+				CatalogRevision: c.currentConfig().Revision,
 			}
 			groupState.shadow[leaseID] = lease
 			c.leaseGroups.Store(leaseID, group)
@@ -521,7 +558,7 @@ func (g *groupCoordinator) leaseCountLocked() int {
 
 func (c *Coordinator) SweepIdle(ctx context.Context) error {
 	for _, group := range managedGroups {
-		policy, err := c.config.PolicyFor(group)
+		policy, err := c.currentConfig().PolicyFor(group)
 		if err != nil {
 			return err
 		}
@@ -579,6 +616,75 @@ func (c *Coordinator) SweepIdle(ctx context.Context) error {
 		groupState.mu.Unlock()
 	}
 	return nil
+}
+
+func (c *Coordinator) ApplyConfig(config Config) error {
+	if err := config.Validate(); err != nil {
+		return err
+	}
+	cloned, err := cloneConfig(config)
+	if err != nil {
+		return err
+	}
+	c.configMu.Lock()
+	defer c.configMu.Unlock()
+	if cloned.Revision <= c.config.Revision {
+		return fmt.Errorf("config revision must increase: current=%d candidate=%d", c.config.Revision, cloned.Revision)
+	}
+	if cloned.SchemaVersion != c.config.SchemaVersion ||
+		!reflect.DeepEqual(cloned.Catalog, c.config.Catalog) ||
+		!reflect.DeepEqual(cloned.Controller, c.config.Controller) {
+		return errors.New("schema_version, catalog, and controller cannot change at runtime")
+	}
+	c.config = cloned
+	return nil
+}
+
+func (c *Coordinator) EnsureAlwaysOn(ctx context.Context) error {
+	config := c.currentConfig()
+	for _, group := range managedGroups {
+		groupConfig := config.Groups[group]
+		if groupConfig.Mode != ModeAlwaysOn {
+			continue
+		}
+		snapshot, err := c.Snapshot(group)
+		if err != nil {
+			return err
+		}
+		if snapshot.State == StateReady || snapshot.State == StateBusy {
+			continue
+		}
+		lease, err := c.Acquire(ctx, group, AcquireRequest{
+			RequestID: "controller-ensure-" + string(group),
+			GatewayID: "controller",
+			Purpose:   "ensure_always_on",
+		})
+		if err != nil {
+			return fmt.Errorf("ensure always-on engine group %s: %w", group, err)
+		}
+		if err := c.Release(lease.ID, ReleaseCompleted); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Coordinator) currentConfig() Config {
+	c.configMu.RLock()
+	defer c.configMu.RUnlock()
+	return c.config
+}
+
+func cloneConfig(config Config) (Config, error) {
+	encoded, err := encodeConfig(config)
+	if err != nil {
+		return Config{}, err
+	}
+	cloned, err := DecodeConfig(bytes.NewReader(encoded))
+	if err != nil {
+		return Config{}, err
+	}
+	return *cloned, nil
 }
 
 func (c *Coordinator) Snapshot(group Group) (GroupSnapshot, error) {

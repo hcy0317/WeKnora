@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -61,12 +63,28 @@ type CatalogConfig struct {
 	Groups     map[Group]CatalogGroup `yaml:"groups" json:"groups"`
 }
 
+type TLSFilesConfig struct {
+	Certificate string `yaml:"certificate" json:"certificate"`
+	PrivateKey  string `yaml:"private_key" json:"private_key"`
+	ClientCA    string `yaml:"client_ca" json:"client_ca"`
+}
+
+type ControllerConfig struct {
+	ListenAddress        string         `yaml:"listen_address" json:"listen_address"`
+	DockerExecutable     string         `yaml:"docker_executable" json:"docker_executable"`
+	ObserveOnly          bool           `yaml:"observe_only" json:"observe_only"`
+	OwnerMutex           string         `yaml:"owner_mutex" json:"owner_mutex"`
+	SweepIntervalSeconds int            `yaml:"sweep_interval_seconds" json:"sweep_interval_seconds"`
+	TLS                  TLSFilesConfig `yaml:"tls" json:"tls"`
+}
+
 type Config struct {
 	SchemaVersion int                   `yaml:"schema_version" json:"schema_version"`
 	Revision      uint64                `yaml:"revision" json:"revision"`
 	Defaults      DefaultsConfig        `yaml:"defaults" json:"defaults"`
 	Groups        map[Group]GroupConfig `yaml:"groups" json:"groups"`
 	Catalog       CatalogConfig         `yaml:"catalog,omitempty" json:"catalog,omitempty"`
+	Controller    ControllerConfig      `yaml:"controller,omitempty" json:"controller,omitempty"`
 }
 
 type Policy struct {
@@ -136,8 +154,48 @@ func (c Config) Validate() error {
 	if err := c.Catalog.Validate(); err != nil {
 		return err
 	}
+	if err := c.Controller.Validate(); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+func (c ControllerConfig) Validate() error {
+	if c.ListenAddress == "" && c.DockerExecutable == "" && c.OwnerMutex == "" &&
+		c.SweepIntervalSeconds == 0 && c.TLS == (TLSFilesConfig{}) {
+		return nil
+	}
+	if _, _, err := net.SplitHostPort(c.ListenAddress); err != nil {
+		return fmt.Errorf("controller.listen_address is invalid: %w", err)
+	}
+	normalizedExecutable := strings.ReplaceAll(c.DockerExecutable, `\`, "/")
+	if (!filepath.IsAbs(c.DockerExecutable) && !isWindowsAbsolutePath(normalizedExecutable)) ||
+		!strings.EqualFold(path.Base(normalizedExecutable), "docker.exe") {
+		return errors.New("controller.docker_executable must be an absolute path to docker.exe")
+	}
+	if !strings.HasPrefix(c.OwnerMutex, `Global\`) {
+		return errors.New(`controller.owner_mutex must use the Global\ namespace`)
+	}
+	if c.SweepIntervalSeconds < 1 {
+		return errors.New("controller.sweep_interval_seconds must be at least 1")
+	}
+	for field, value := range map[string]string{
+		"certificate": c.TLS.Certificate,
+		"private_key": c.TLS.PrivateKey,
+		"client_ca":   c.TLS.ClientCA,
+	} {
+		normalized := strings.ReplaceAll(value, `\`, "/")
+		if !filepath.IsAbs(value) && !isWindowsAbsolutePath(normalized) {
+			return fmt.Errorf("controller.tls.%s must be an absolute path", field)
+		}
+	}
+	return nil
+}
+
+func isWindowsAbsolutePath(value string) bool {
+	return len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) &&
+		value[1] == ':' && value[2] == '/'
 }
 
 var containerNamePattern = regexp.MustCompile(`^WeKnora-[A-Za-z0-9][A-Za-z0-9_.-]*$`)

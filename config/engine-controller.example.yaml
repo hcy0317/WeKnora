@@ -1,0 +1,66 @@
+schema_version: 1
+revision: 1
+
+# Migration starts in observe-only and keeps every group warm. After the
+# legacy GPU Guard engine ownership is disabled and the controller owner mutex
+# is verified, set observe_only to false. Group modes can then be changed from
+# the SystemAdmin UI.
+defaults:
+  idle_minutes: 10
+  startup_timeout_seconds: 120
+  failure_cooldown_minutes: 5
+
+groups:
+  paddleocr:
+    mode: always_on
+  asr:
+    mode: always_on
+  reranker:
+    mode: always_on
+
+controller:
+  listen_address: ":18443"
+  docker_executable: 'C:\Program Files\Docker\Docker\resources\bin\docker.exe'
+  observe_only: true
+  owner_mutex: 'Global\WeKnoraEngineDockerOwner'
+  sweep_interval_seconds: 5
+  tls:
+    certificate: 'C:\ProgramData\WeKnora\engine-controller\tls\server.crt'
+    private_key: 'C:\ProgramData\WeKnora\engine-controller\tls\server.key'
+    client_ca: 'C:\ProgramData\WeKnora\engine-controller\tls\ca.crt'
+
+# Readonly at the API/UI boundary. Runtime Docker commands are derived only
+# from this catalog; request payloads can never supply a container or upstream.
+catalog:
+  docker_host: npipe:////./pipe/dockerDesktopLinuxEngine
+  groups:
+    paddleocr:
+      paths:
+        - /layout-parsing
+      backends:
+        - id: paddle-gpu
+          upstream: http://paddleocr-vl:8080
+          containers:
+            - WeKnora-paddleocr-vlm-server
+            - WeKnora-paddleocr-vl
+    asr:
+      paths:
+        - /v1/audio/transcriptions
+      backends:
+        - id: speaches-cpu
+          upstream: http://speaches:8000
+          containers:
+            - WeKnora-speaches
+    reranker:
+      paths:
+        - /rerank
+      backends:
+        - id: qwen-gpu
+          upstream: http://qwen-reranker-gpu:8000
+          gpu: true
+          containers:
+            - WeKnora-qwen-reranker-gpu
+        - id: jina-cpu
+          upstream: http://qwen-reranker:8000
+          containers:
+            - WeKnora-qwen-reranker
