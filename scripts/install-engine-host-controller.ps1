@@ -17,8 +17,12 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 $repository = (Resolve-Path -LiteralPath $RepositoryRoot).Path
 $expectedModule = Join-Path $repository 'go.mod'
 $exampleConfig = Join-Path $repository 'config\engine-controller.example.yaml'
+$interlockSource = Join-Path $repository 'scripts\weknora-engine-interlock.ps1'
+$handoffSource = Join-Path $repository 'scripts\weknora-engine-handoff.ps1'
 if (-not (Test-Path -LiteralPath $expectedModule -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $exampleConfig -PathType Leaf)) {
+        -not (Test-Path -LiteralPath $exampleConfig -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $interlockSource -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $handoffSource -PathType Leaf)) {
     throw "RepositoryRoot is not a WeKnora checkout: $repository"
 }
 
@@ -30,7 +34,10 @@ if (-not $installDirectory.StartsWith([IO.Path]::GetFullPath($env:ProgramData), 
 $binaryPath = Join-Path $installDirectory 'engine-host-controller.exe'
 $configPath = Join-Path $installDirectory 'config.yaml'
 $tlsRoot = Join-Path $installDirectory 'tls'
+$ownershipDirectory = Join-Path $env:ProgramData 'WeKnora\engine-ownership'
+$ownerPath = Join-Path $ownershipDirectory 'owner.txt'
 $temporaryBinary = Join-Path $env:TEMP ("weknora-engine-host-controller-{0}.exe" -f [Guid]::NewGuid().ToString('N'))
+$configCreated = $false
 
 try {
     Push-Location $repository
@@ -55,6 +62,15 @@ try {
         Copy-Item -LiteralPath $temporaryBinary -Destination $binaryPath -Force
         if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
             Copy-Item -LiteralPath $exampleConfig -Destination $configPath
+            $configCreated = $true
+        }
+        Copy-Item -LiteralPath $interlockSource -Destination (Join-Path $installDirectory 'weknora-engine-interlock.ps1') -Force
+        Copy-Item -LiteralPath $handoffSource -Destination (Join-Path $installDirectory 'weknora-engine-handoff.ps1') -Force
+
+        New-Item -ItemType Directory -Path $ownershipDirectory -Force | Out-Null
+        . $interlockSource
+        if (-not (Test-Path -LiteralPath $ownerPath -PathType Leaf)) {
+            Set-WeKnoraEngineOwner -Path $ownerPath -Owner legacy
         }
 
         $requiredTLSFiles = @(
@@ -80,6 +96,8 @@ try {
         # Language-independent SIDs: LocalSystem and builtin Administrators.
         & icacls.exe $installDirectory /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'failed to restrict controller directory ACLs' }
+        & icacls.exe $ownershipDirectory /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'failed to restrict engine ownership directory ACLs' }
     }
 
     $binaryCommand = ('"{0}" -config "{1}"' -f $binaryPath, $configPath)
@@ -128,7 +146,9 @@ try {
         Binary = $binaryPath
         Config = $configPath
         TLSRoot = $tlsRoot
-        ObserveOnly = $true
+        Owner = (Get-Content -LiteralPath $ownerPath -Raw).Trim()
+        OwnerPath = $ownerPath
+        ConfigMode = if ($configCreated) { 'observe-only initialized' } else { 'preserved existing config' }
         LegacyGpuGuardChanged = $false
     }
 }

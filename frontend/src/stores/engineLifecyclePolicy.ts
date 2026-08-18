@@ -9,6 +9,7 @@ export interface EngineLifecycleSnapshot {
   active?: number
   suspect?: number
   shadow?: number
+  gpu_admission_allowed?: boolean
 }
 
 export interface EngineLifecycleDefaults {
@@ -41,6 +42,13 @@ export type EngineLifecycleErrorState =
   | { kind: 'conflict'; revision?: number }
   | { kind: 'offline' }
   | { kind: 'other' }
+
+export function shouldShowGPUAdmission(
+  group: EngineLifecycleGroup,
+  allowed: boolean | undefined,
+): boolean {
+  return group !== 'asr' && allowed != null
+}
 
 export function classifyEngineLifecycleError(error: unknown): EngineLifecycleErrorState {
   if (typeof error !== 'object' || error === null) return { kind: 'other' }

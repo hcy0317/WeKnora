@@ -204,6 +204,7 @@ func testEngineLifecycleConfig() *lifecycle.Config {
 			DockerExecutable:     `C:\Program Files\Docker\Docker\resources\bin\docker.exe`,
 			ObserveOnly:          true,
 			OwnerMutex:           `Global\WeKnoraEngineDockerOwner`,
+			OwnerStatePath:       `C:\ProgramData\WeKnora\engine-ownership\owner.txt`,
 			SweepIntervalSeconds: 5,
 			TLS: lifecycle.TLSFilesConfig{
 				Certificate: `C:\ProgramData\WeKnora\engine-controller\tls\server.crt`,

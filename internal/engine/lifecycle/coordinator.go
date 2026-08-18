@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,9 +27,10 @@ const (
 type FailureKind string
 
 const (
-	FailureStartTimeout   FailureKind = "start_timeout"
-	FailureStartFailed    FailureKind = "start_failed"
-	FailureCooldownActive FailureKind = "cooldown_active"
+	FailureStartTimeout       FailureKind = "start_timeout"
+	FailureStartFailed        FailureKind = "start_failed"
+	FailureCooldownActive     FailureKind = "cooldown_active"
+	FailureGPUAdmissionClosed FailureKind = "gpu_admission_closed"
 )
 
 type Failure struct {
@@ -67,6 +69,10 @@ type DrainingRuntime interface {
 	Drain(ctx context.Context, group Group) error
 }
 
+type BackendRuntime interface {
+	StopBackend(ctx context.Context, group Group, backendID string) error
+}
+
 type AcquireRequest struct {
 	RequestID string `json:"request_id"`
 	GatewayID string `json:"gateway_id"`
@@ -102,13 +108,14 @@ type Lease struct {
 }
 
 type GroupSnapshot struct {
-	Group   Group  `json:"group"`
-	State   State  `json:"state"`
-	Epoch   uint64 `json:"epoch"`
-	Pending int    `json:"pending"`
-	Active  int    `json:"active"`
-	Suspect int    `json:"suspect"`
-	Shadow  int    `json:"shadow"`
+	Group               Group  `json:"group"`
+	State               State  `json:"state"`
+	Epoch               uint64 `json:"epoch"`
+	Pending             int    `json:"pending"`
+	Active              int    `json:"active"`
+	Suspect             int    `json:"suspect"`
+	Shadow              int    `json:"shadow"`
+	GPUAdmissionAllowed bool   `json:"gpu_admission_allowed"`
 }
 
 type startAttempt struct {
@@ -118,18 +125,21 @@ type startAttempt struct {
 }
 
 type groupCoordinator struct {
-	mu            sync.Mutex
-	state         State
-	epoch         uint64
-	pending       int
-	active        map[string]Lease
-	suspect       map[string]Lease
-	shadow        map[string]Lease
-	backend       Backend
-	start         *startAttempt
-	stopDone      chan struct{}
-	idleSince     *time.Time
-	cooldownUntil *time.Time
+	mu                  sync.Mutex
+	state               State
+	epoch               uint64
+	pending             int
+	active              map[string]Lease
+	suspect             map[string]Lease
+	shadow              map[string]Lease
+	backend             Backend
+	retiring            map[string]Backend
+	retiringRetryAfter  map[string]time.Time
+	recoverPreferredGPU bool
+	start               *startAttempt
+	stopDone            chan struct{}
+	idleSince           *time.Time
+	cooldownUntil       *time.Time
 }
 
 type Clock interface {
@@ -151,14 +161,15 @@ func WithClock(clock Clock) CoordinatorOption {
 }
 
 type Coordinator struct {
-	configMu    sync.RWMutex
-	config      Config
-	runtime     Runtime
-	clock       Clock
-	groups      map[Group]*groupCoordinator
-	leaseGroups sync.Map
-	nextID      atomic.Uint64
-	gpuAllowed  atomic.Bool
+	configMu           sync.RWMutex
+	config             Config
+	runtime            Runtime
+	clock              Clock
+	groups             map[Group]*groupCoordinator
+	leaseGroups        sync.Map
+	nextID             atomic.Uint64
+	paddleGPUAllowed   atomic.Bool
+	rerankerGPUAllowed atomic.Bool
 }
 
 func NewCoordinator(config Config, runtime Runtime, options ...CoordinatorOption) (*Coordinator, error) {
@@ -179,16 +190,19 @@ func NewCoordinator(config Config, runtime Runtime, options ...CoordinatorOption
 		clock:   realClock{},
 		groups:  make(map[Group]*groupCoordinator, len(managedGroups)),
 	}
-	coordinator.gpuAllowed.Store(true)
+	coordinator.paddleGPUAllowed.Store(true)
+	coordinator.rerankerGPUAllowed.Store(true)
 	for _, option := range options {
 		option(coordinator)
 	}
 	for _, group := range managedGroups {
 		coordinator.groups[group] = &groupCoordinator{
-			state:   StateStopped,
-			active:  make(map[string]Lease),
-			suspect: make(map[string]Lease),
-			shadow:  make(map[string]Lease),
+			state:              StateStopped,
+			active:             make(map[string]Lease),
+			suspect:            make(map[string]Lease),
+			shadow:             make(map[string]Lease),
+			retiring:           make(map[string]Backend),
+			retiringRetryAfter: make(map[string]time.Time),
 		}
 	}
 	return coordinator, nil
@@ -204,11 +218,19 @@ func (c *Coordinator) Acquire(ctx context.Context, group Group, request AcquireR
 	if err != nil {
 		return Lease{}, err
 	}
+	if group == GroupPaddleOCR && !c.gpuAdmissionAllowed(group) {
+		return Lease{}, &Failure{
+			Kind:  FailureGPUAdmissionClosed,
+			Group: group,
+			Err:   errors.New("GPU pressure closed Paddle admission"),
+		}
+	}
 	startedAt := c.clock.Now()
 	coldStart := false
 
 	for {
 		groupState.mu.Lock()
+		c.retireDisallowedBackendLocked(group, groupState)
 		if groupState.state == StateFailed && groupState.cooldownUntil != nil {
 			retryAfter := groupState.cooldownUntil.Sub(c.clock.Now())
 			if retryAfter > 0 {
@@ -333,14 +355,138 @@ func (c *Coordinator) startRuntime(ctx context.Context, group Group) (Backend, e
 	if runtime, ok := c.runtime.(AdmissionRuntime); ok {
 		return runtime.StartWithAdmission(ctx, StartRequest{
 			Group:      group,
-			GPUAllowed: group != GroupReranker || c.gpuAllowed.Load(),
+			GPUAllowed: c.gpuAdmissionAllowed(group),
 		})
 	}
 	return c.runtime.Start(ctx, group)
 }
 
 func (c *Coordinator) SetGPUAdmission(allowed bool) {
-	c.gpuAllowed.Store(allowed)
+	c.SetGroupGPUAdmission(GroupReranker, allowed)
+}
+
+func (c *Coordinator) SetGroupGPUAdmission(group Group, allowed bool) {
+	var wasAllowed bool
+	switch group {
+	case GroupPaddleOCR:
+		wasAllowed = c.paddleGPUAllowed.Swap(allowed)
+	case GroupReranker:
+		wasAllowed = c.rerankerGPUAllowed.Swap(allowed)
+	default:
+		return
+	}
+	groupState := c.groups[group]
+	groupState.mu.Lock()
+	if group == GroupReranker && allowed && !wasAllowed {
+		groupState.recoverPreferredGPU = true
+	}
+	c.retireDisallowedBackendLocked(group, groupState)
+	groupState.mu.Unlock()
+}
+
+func (c *Coordinator) gpuAdmissionAllowed(group Group) bool {
+	switch group {
+	case GroupPaddleOCR:
+		return c.paddleGPUAllowed.Load()
+	case GroupReranker:
+		return c.rerankerGPUAllowed.Load()
+	default:
+		return true
+	}
+}
+
+func (c *Coordinator) retireDisallowedBackendLocked(group Group, state *groupCoordinator) {
+	if c.gpuAdmissionAllowed(group) || state.backend.ID == "" || !c.backendUsesGPU(group, state.backend.ID) ||
+		state.state == StateStarting || state.state == StateStopping {
+		return
+	}
+	if group == GroupReranker {
+		state.retiring[state.backend.ID] = state.backend
+		state.backend = Backend{}
+		state.state = StateStopped
+		state.idleSince = nil
+	}
+}
+
+func (c *Coordinator) backendUsesGPU(group Group, backendID string) bool {
+	for _, backend := range c.currentConfig().Catalog.Groups[group].Backends {
+		if backend.ID == backendID {
+			return backend.GPU
+		}
+	}
+	return strings.Contains(strings.ToLower(backendID), "gpu")
+}
+
+func (c *Coordinator) SweepGPUAdmission(ctx context.Context) error {
+	runtime, ok := c.runtime.(BackendRuntime)
+	if !ok {
+		return nil
+	}
+	for _, group := range []Group{GroupPaddleOCR, GroupReranker} {
+		state := c.groups[group]
+		groupConfig := c.currentConfig().Groups[group]
+		state.mu.Lock()
+
+		var stopBackends []Backend
+		for backendID, backend := range state.retiring {
+			if retryAfter, waiting := state.retiringRetryAfter[backendID]; waiting && c.clock.Now().Before(retryAfter) {
+				continue
+			}
+			if !state.hasLeaseForBackendLocked(backendID) {
+				stopBackends = append(stopBackends, backend)
+				delete(state.retiring, backendID)
+				delete(state.retiringRetryAfter, backendID)
+			}
+		}
+		if group == GroupPaddleOCR && !c.gpuAdmissionAllowed(group) && state.backend.ID != "" &&
+			c.backendUsesGPU(group, state.backend.ID) && state.leaseCountLocked() == 0 && state.pending == 0 &&
+			state.state != StateStarting && state.state != StateStopping {
+			stopBackends = append(stopBackends, state.backend)
+			state.backend = Backend{}
+			state.state = StateStopped
+			state.idleSince = nil
+		}
+		if group == GroupReranker && c.gpuAdmissionAllowed(group) && state.recoverPreferredGPU {
+			switch {
+			case state.backend.ID == "" || c.backendUsesGPU(group, state.backend.ID) || groupConfig.Mode != ModeAlwaysOn:
+				state.recoverPreferredGPU = false
+			case state.leaseCountLocked() == 0 && state.pending == 0 &&
+				state.state != StateStarting && state.state != StateStopping:
+				stopBackends = append(stopBackends, state.backend)
+				state.backend = Backend{}
+				state.state = StateStopped
+				state.idleSince = nil
+				state.recoverPreferredGPU = false
+			}
+		}
+		state.mu.Unlock()
+
+		for _, backend := range stopBackends {
+			if err := runtime.StopBackend(ctx, group, backend.ID); err != nil {
+				policy, policyErr := c.currentConfig().PolicyFor(group)
+				if policyErr != nil {
+					return policyErr
+				}
+				state.mu.Lock()
+				state.retiring[backend.ID] = backend
+				state.retiringRetryAfter[backend.ID] = c.clock.Now().Add(policy.FailureCooldown)
+				state.mu.Unlock()
+				return fmt.Errorf("stop retired GPU backend %s/%s: %w", group, backend.ID, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (g *groupCoordinator) hasLeaseForBackendLocked(backendID string) bool {
+	for _, leases := range []map[string]Lease{g.active, g.suspect, g.shadow} {
+		for _, lease := range leases {
+			if lease.Backend.ID == backendID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *Coordinator) issueLeaseLocked(
@@ -676,6 +822,10 @@ func (c *Coordinator) EnsureAlwaysOn(ctx context.Context) error {
 			Purpose:   "ensure_always_on",
 		})
 		if err != nil {
+			var failure *Failure
+			if errors.As(err, &failure) && failure.Kind == FailureGPUAdmissionClosed {
+				continue
+			}
 			return fmt.Errorf("ensure always-on engine group %s: %w", group, err)
 		}
 		if err := c.Release(lease.ID, ReleaseCompleted); err != nil {
@@ -711,12 +861,13 @@ func (c *Coordinator) Snapshot(group Group) (GroupSnapshot, error) {
 	groupState.mu.Lock()
 	defer groupState.mu.Unlock()
 	return GroupSnapshot{
-		Group:   group,
-		State:   groupState.state,
-		Epoch:   groupState.epoch,
-		Pending: groupState.pending,
-		Active:  len(groupState.active),
-		Suspect: len(groupState.suspect),
-		Shadow:  len(groupState.shadow),
+		Group:               group,
+		State:               groupState.state,
+		Epoch:               groupState.epoch,
+		Pending:             groupState.pending,
+		Active:              len(groupState.active),
+		Suspect:             len(groupState.suspect),
+		Shadow:              len(groupState.shadow),
+		GPUAdmissionAllowed: c.gpuAdmissionAllowed(group),
 	}, nil
 }

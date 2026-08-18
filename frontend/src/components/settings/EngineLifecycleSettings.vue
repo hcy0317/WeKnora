@@ -36,6 +36,12 @@
       <div v-if="status" class="engine-lifecycle__metrics">
         <span>{{ t('settings.engineLifecycle.active') }}: {{ status.active ?? 0 }}</span>
         <span>{{ t('settings.engineLifecycle.pending') }}: {{ status.pending ?? 0 }}</span>
+        <span v-if="showGPUAdmission">
+          {{ t('settings.engineLifecycle.gpuAdmission') }}:
+          {{ t(status.gpu_admission_allowed
+            ? 'settings.engineLifecycle.admissionOpen'
+            : 'settings.engineLifecycle.admissionClosed') }}
+        </span>
         <span>{{ t('settings.engineLifecycle.revision') }}: {{ lifecycleStore.config?.revision }}</span>
       </div>
 
@@ -132,6 +138,7 @@ import type {
   EngineLifecycleGroup,
   EngineLifecycleMode,
 } from '@/stores/engineLifecyclePolicy'
+import { shouldShowGPUAdmission } from '@/stores/engineLifecyclePolicy'
 
 const props = defineProps<{ group: EngineLifecycleGroup }>()
 const { t } = useI18n()
@@ -149,6 +156,9 @@ const conflictRefreshed = ref(false)
 
 const policy = computed(() => lifecycleStore.config?.groups[props.group])
 const status = computed(() => policy.value?.status)
+const showGPUAdmission = computed(() =>
+  shouldShowGPUAdmission(props.group, status.value?.gpu_admission_allowed),
+)
 const statusTheme = computed(() => {
   if (status.value?.state === 'ready' || status.value?.state === 'busy') return 'success'
   if (status.value?.state === 'failed') return 'danger'

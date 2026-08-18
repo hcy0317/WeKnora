@@ -125,7 +125,7 @@ catalog:
 	require.True(t, config.Catalog.Groups[GroupReranker].Backends[0].GPU)
 }
 
-func TestDecodeConfigLoadsReadonlyControllerSettings(t *testing.T) {
+func TestDecodeConfigUpgradesLegacyControllerSettings(t *testing.T) {
 	t.Parallel()
 
 	config, err := DecodeConfig(strings.NewReader(`
@@ -157,6 +157,9 @@ controller:
 	require.Equal(t, ":18443", config.Controller.ListenAddress)
 	require.True(t, config.Controller.ObserveOnly)
 	require.Equal(t, `Global\WeKnoraEngineDockerOwner`, config.Controller.OwnerMutex)
+	require.Equal(t, `C:\ProgramData\WeKnora\engine-ownership\owner.txt`, config.Controller.OwnerStatePath)
+	require.True(t, config.Controller.GPUAdmission.Enabled)
+	require.Equal(t, 20, config.Controller.GPUAdmission.PollSeconds)
 	require.Equal(t, 5, config.Controller.SweepIntervalSeconds)
 	require.Contains(t, config.Controller.TLS.Certificate, `engine-controller\tls\server.crt`)
 }

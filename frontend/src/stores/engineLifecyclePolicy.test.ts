@@ -5,6 +5,7 @@ import {
   buildEngineLifecycleUpdate,
   classifyEngineLifecycleError,
   managedEngineGroup,
+  shouldShowGPUAdmission,
   type EngineLifecycleConfig,
 } from './engineLifecyclePolicy'
 
@@ -61,4 +62,11 @@ test('classifyEngineLifecycleError distinguishes CAS conflicts from controller o
   assert.deepEqual(classifyEngineLifecycleError(new Error('bad request')), {
     kind: 'other',
   })
+})
+
+test('shouldShowGPUAdmission hides the GPU-only signal from ASR', () => {
+  assert.equal(shouldShowGPUAdmission('paddleocr', false), true)
+  assert.equal(shouldShowGPUAdmission('reranker', true), true)
+  assert.equal(shouldShowGPUAdmission('asr', true), false)
+  assert.equal(shouldShowGPUAdmission('reranker', undefined), false)
 })

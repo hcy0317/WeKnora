@@ -1,38 +1,63 @@
-[CmdletBinding()]
-param([switch]$Uninstall)
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'WeKnora\host-guards'),
+    [string]$OwnerPath = (Join-Path $env:ProgramData 'WeKnora\engine-ownership\owner.txt'),
+    [switch]$Uninstall
+)
 
 $ErrorActionPreference = 'Stop'
-$taskName = 'WeKnora-GPU-Guard'
+$gpuTaskName = 'WeKnora-GPU-Guard'
+$ollamaTaskName = 'WeKnora-Ollama-Watchdog'
+$modePath = Join-Path $env:LOCALAPPDATA 'WeKnora\gpu-guard-mode.txt'
 
 if ($Uninstall) {
-    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    foreach ($taskName in @($gpuTaskName, $ollamaTaskName)) {
+        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+        }
     }
-    Write-Output "$taskName uninstalled"
+    Write-Output 'WeKnora host guard tasks uninstalled; installed files and state were preserved'
     exit 0
 }
 
-$guardPath = Join-Path $PSScriptRoot 'weknora-gpu-guard.ps1'
-if (-not (Test-Path -LiteralPath $guardPath -PathType Leaf)) {
-    throw "GPU guard not found: $guardPath"
+$sourceFiles = @(
+    'weknora-gpu-guard.ps1',
+    'weknora-ollama-watchdog.ps1',
+    'weknora-engine-interlock.ps1',
+    'weknora-process.ps1',
+    'launch-weknora-gpu-guard-hidden.vbs',
+    'launch-weknora-ollama-watchdog-hidden.vbs'
+)
+foreach ($name in $sourceFiles) {
+    $source = Join-Path $PSScriptRoot $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "host guard asset not found: $source" }
+}
+if (-not (Test-Path -LiteralPath $OwnerPath -PathType Leaf)) {
+    throw "engine owner state must be initialized by install-engine-host-controller.ps1 first: $OwnerPath"
 }
 
-$launcherPath = Join-Path $PSScriptRoot 'launch-weknora-gpu-guard-hidden.vbs'
-if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
-    throw "GPU guard launcher not found: $launcherPath"
+$installDirectory = [IO.Path]::GetFullPath($InstallRoot)
+$localRoot = [IO.Path]::GetFullPath($env:LOCALAPPDATA)
+if (-not $installDirectory.StartsWith($localRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "InstallRoot must stay under LOCALAPPDATA: $installDirectory"
+}
+if ($PSCmdlet.ShouldProcess($installDirectory, 'Install stable host guard scripts')) {
+    New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
+    foreach ($name in $sourceFiles) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $installDirectory $name) -Force
+    }
 }
 
-# pwsh allocates a terminal before it can process -WindowStyle Hidden, which
-# leaves a Windows Terminal taskbar entry on systems where Terminal is the
-# default console host. wscript is a GUI-subsystem host; the launcher starts
-# pwsh with SW_HIDE and waits so Task Scheduler still monitors the real guard.
+. (Join-Path $installDirectory 'weknora-engine-interlock.ps1')
+$owner = Get-WeKnoraEngineOwner -Path $OwnerPath
+if (-not (Test-Path -LiteralPath $modePath -PathType Leaf)) {
+    Set-WeKnoraAtomicText -Path $modePath -Value legacy
+}
+$mode = (Get-Content -LiteralPath $modePath -Raw).Trim()
+if ($mode -notin @('legacy', 'observe', 'disabled')) { throw "invalid GPU Guard mode: $mode" }
+
 $wscript = Join-Path $env:WINDIR 'System32\wscript.exe'
-$quotedLauncherPath = '"' + $launcherPath + '"'
-$action = New-ScheduledTaskAction -Execute $wscript -Argument "//B //NoLogo $quotedLauncherPath"
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-# The long-running guard can receive 0xC000013A when an interactive PowerShell
-# host/session is torn down. Re-arm it every five minutes; IgnoreNew keeps this
-# watchdog trigger a no-op while the normal guard process is still running.
 $watchdogTrigger = New-ScheduledTaskTrigger `
     -Once `
     -At ((Get-Date).AddMinutes(5)) `
@@ -50,14 +75,55 @@ $principal = New-ScheduledTaskPrincipal `
     -LogonType Interactive `
     -RunLevel Limited
 
-Register-ScheduledTask `
-    -TaskName $taskName `
-    -Action $action `
-    -Trigger @($logonTrigger, $watchdogTrigger) `
-    -Settings $settings `
-    -Principal $principal `
-    -Description 'WeKnora runtime guard: Ollama embedding watchdog, PaddleOCR-VL vLLM 20%, OCR critical pause, and GPU/CPU rerank hysteresis.' `
-    -Force | Out-Null
+function Register-HostGuardTask {
+    param(
+        [Parameter(Mandatory)][string]$TaskName,
+        [Parameter(Mandatory)][string]$Launcher,
+        [Parameter(Mandatory)][string]$Description
+    )
+    $quotedLauncher = '"' + (Join-Path $installDirectory $Launcher) + '"'
+    $action = New-ScheduledTaskAction -Execute $wscript -Argument "//B //NoLogo $quotedLauncher"
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $action `
+        -Trigger @($logonTrigger, $watchdogTrigger) `
+        -Settings $settings `
+        -Principal $principal `
+        -Description $Description `
+        -Force | Out-Null
+}
 
-Start-ScheduledTask -TaskName $taskName
-Write-Output "$taskName installed and started"
+# Preserve the Ollama behavior before replacing the legacy combined task.
+Register-HostGuardTask `
+    -TaskName $ollamaTaskName `
+    -Launcher 'launch-weknora-ollama-watchdog-hidden.vbs' `
+    -Description 'WeKnora Ollama availability watchdog. Does not access managed engine containers.'
+Start-ScheduledTask -TaskName $ollamaTaskName
+
+$existingGpuTask = Get-ScheduledTask -TaskName $gpuTaskName -ErrorAction SilentlyContinue
+if ($existingGpuTask -and $existingGpuTask.State -eq 'Running') {
+    Stop-ScheduledTask -TaskName $gpuTaskName
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(15)
+    do {
+        Start-Sleep -Milliseconds 250
+        $state = (Get-ScheduledTask -TaskName $gpuTaskName).State
+    } while ($state -eq 'Running' -and [DateTimeOffset]::UtcNow -lt $deadline)
+    if ($state -eq 'Running') { throw 'legacy GPU Guard task did not stop; new guarded task was not started' }
+}
+Wait-WeKnoraEngineProcessesExit `
+    -CommandLineNeedles @('\weknora-gpu-guard.ps1', '\launch-weknora-gpu-guard-hidden.vbs') `
+    -TimeoutSeconds 15
+
+Register-HostGuardTask `
+    -TaskName $gpuTaskName `
+    -Launcher 'launch-weknora-gpu-guard-hidden.vbs' `
+    -Description 'WeKnora legacy GPU observer/actuator with explicit mode, named mutex, owner check, and heartbeat.'
+Start-ScheduledTask -TaskName $gpuTaskName
+
+[pscustomobject]@{
+    GPUGuardTask = $gpuTaskName
+    OllamaWatchdogTask = $ollamaTaskName
+    InstallRoot = $installDirectory
+    Owner = $owner
+    Mode = $mode
+}

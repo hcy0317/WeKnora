@@ -69,13 +69,31 @@ type TLSFilesConfig struct {
 	ClientCA    string `yaml:"client_ca" json:"client_ca"`
 }
 
+type GPUAdmissionConfig struct {
+	Enabled                    bool   `yaml:"enabled" json:"enabled"`
+	NvidiaSMIExecutable        string `yaml:"nvidia_smi_executable" json:"nvidia_smi_executable"`
+	PollSeconds                int    `yaml:"poll_seconds" json:"poll_seconds"`
+	SustainSeconds             int    `yaml:"sustain_seconds" json:"sustain_seconds"`
+	CooldownSeconds            int    `yaml:"cooldown_seconds" json:"cooldown_seconds"`
+	RerankerEnableBelowPercent int    `yaml:"reranker_enable_below_percent" json:"reranker_enable_below_percent"`
+	RerankerDisableAtPercent   int    `yaml:"reranker_disable_at_percent" json:"reranker_disable_at_percent"`
+	RerankerMinimumFreeMiB     int    `yaml:"reranker_minimum_free_mib" json:"reranker_minimum_free_mib"`
+	RerankerCriticalFreeMiB    int    `yaml:"reranker_critical_free_mib" json:"reranker_critical_free_mib"`
+	PaddleEnableBelowPercent   int    `yaml:"paddle_enable_below_percent" json:"paddle_enable_below_percent"`
+	PaddleDisableAtPercent     int    `yaml:"paddle_disable_at_percent" json:"paddle_disable_at_percent"`
+	PaddleMinimumFreeMiB       int    `yaml:"paddle_minimum_free_mib" json:"paddle_minimum_free_mib"`
+	PaddleCriticalFreeMiB      int    `yaml:"paddle_critical_free_mib" json:"paddle_critical_free_mib"`
+}
+
 type ControllerConfig struct {
-	ListenAddress        string         `yaml:"listen_address" json:"listen_address"`
-	DockerExecutable     string         `yaml:"docker_executable" json:"docker_executable"`
-	ObserveOnly          bool           `yaml:"observe_only" json:"observe_only"`
-	OwnerMutex           string         `yaml:"owner_mutex" json:"owner_mutex"`
-	SweepIntervalSeconds int            `yaml:"sweep_interval_seconds" json:"sweep_interval_seconds"`
-	TLS                  TLSFilesConfig `yaml:"tls" json:"tls"`
+	ListenAddress        string             `yaml:"listen_address" json:"listen_address"`
+	DockerExecutable     string             `yaml:"docker_executable" json:"docker_executable"`
+	ObserveOnly          bool               `yaml:"observe_only" json:"observe_only"`
+	OwnerMutex           string             `yaml:"owner_mutex" json:"owner_mutex"`
+	OwnerStatePath       string             `yaml:"owner_state_path" json:"owner_state_path"`
+	SweepIntervalSeconds int                `yaml:"sweep_interval_seconds" json:"sweep_interval_seconds"`
+	TLS                  TLSFilesConfig     `yaml:"tls" json:"tls"`
+	GPUAdmission         GPUAdmissionConfig `yaml:"gpu_admission" json:"gpu_admission"`
 }
 
 type Config struct {
@@ -102,6 +120,7 @@ func DecodeConfig(reader io.Reader) (*Config, error) {
 	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("decode engine lifecycle config: %w", err)
 	}
+	config.applyCompatibilityDefaults()
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -115,6 +134,40 @@ func DecodeConfig(reader io.Reader) (*Config, error) {
 	}
 
 	return &config, nil
+}
+
+func (c *Config) applyCompatibilityDefaults() {
+	controllerConfigured := c.Controller.ListenAddress != "" || c.Controller.DockerExecutable != "" ||
+		c.Controller.OwnerMutex != "" || c.Controller.OwnerStatePath != "" ||
+		c.Controller.SweepIntervalSeconds != 0 || c.Controller.TLS != (TLSFilesConfig{}) ||
+		c.Controller.GPUAdmission != (GPUAdmissionConfig{})
+	if !controllerConfigured {
+		return
+	}
+	if c.Controller.OwnerStatePath == "" {
+		c.Controller.OwnerStatePath = `C:\ProgramData\WeKnora\engine-ownership\owner.txt`
+	}
+	if c.Controller.GPUAdmission == (GPUAdmissionConfig{}) {
+		c.Controller.GPUAdmission = defaultGPUAdmissionConfig()
+	}
+}
+
+func defaultGPUAdmissionConfig() GPUAdmissionConfig {
+	return GPUAdmissionConfig{
+		Enabled:                    true,
+		NvidiaSMIExecutable:        `C:\Windows\System32\nvidia-smi.exe`,
+		PollSeconds:                20,
+		SustainSeconds:             20,
+		CooldownSeconds:            300,
+		RerankerEnableBelowPercent: 70,
+		RerankerDisableAtPercent:   85,
+		RerankerMinimumFreeMiB:     3500,
+		RerankerCriticalFreeMiB:    2048,
+		PaddleEnableBelowPercent:   60,
+		PaddleDisableAtPercent:     92,
+		PaddleMinimumFreeMiB:       7000,
+		PaddleCriticalFreeMiB:      1024,
+	}
 }
 
 func (c Config) Validate() error {
@@ -162,8 +215,8 @@ func (c Config) Validate() error {
 }
 
 func (c ControllerConfig) Validate() error {
-	if c.ListenAddress == "" && c.DockerExecutable == "" && c.OwnerMutex == "" &&
-		c.SweepIntervalSeconds == 0 && c.TLS == (TLSFilesConfig{}) {
+	if c.ListenAddress == "" && c.DockerExecutable == "" && c.OwnerMutex == "" && c.OwnerStatePath == "" &&
+		c.SweepIntervalSeconds == 0 && c.TLS == (TLSFilesConfig{}) && c.GPUAdmission == (GPUAdmissionConfig{}) {
 		return nil
 	}
 	if _, _, err := net.SplitHostPort(c.ListenAddress); err != nil {
@@ -177,8 +230,16 @@ func (c ControllerConfig) Validate() error {
 	if !strings.HasPrefix(c.OwnerMutex, `Global\`) {
 		return errors.New(`controller.owner_mutex must use the Global\ namespace`)
 	}
+	normalizedOwnerStatePath := strings.ReplaceAll(c.OwnerStatePath, `\`, "/")
+	if (!filepath.IsAbs(c.OwnerStatePath) && !isWindowsAbsolutePath(normalizedOwnerStatePath)) ||
+		!strings.EqualFold(path.Base(normalizedOwnerStatePath), "owner.txt") {
+		return errors.New("controller.owner_state_path must be an absolute path ending in owner.txt")
+	}
 	if c.SweepIntervalSeconds < 1 {
 		return errors.New("controller.sweep_interval_seconds must be at least 1")
+	}
+	if err := c.GPUAdmission.Validate(); err != nil {
+		return err
 	}
 	for field, value := range map[string]string{
 		"certificate": c.TLS.Certificate,
@@ -189,6 +250,43 @@ func (c ControllerConfig) Validate() error {
 		if !filepath.IsAbs(value) && !isWindowsAbsolutePath(normalized) {
 			return fmt.Errorf("controller.tls.%s must be an absolute path", field)
 		}
+	}
+	return nil
+}
+
+func (c GPUAdmissionConfig) Validate() error {
+	if !c.Enabled && c == (GPUAdmissionConfig{}) {
+		return nil
+	}
+	if !c.Enabled {
+		return errors.New("controller.gpu_admission fields require enabled: true")
+	}
+	normalizedExecutable := strings.ReplaceAll(c.NvidiaSMIExecutable, `\`, "/")
+	if (!filepath.IsAbs(c.NvidiaSMIExecutable) && !isWindowsAbsolutePath(normalizedExecutable)) ||
+		!strings.EqualFold(path.Base(normalizedExecutable), "nvidia-smi.exe") {
+		return errors.New("controller.gpu_admission.nvidia_smi_executable must be an absolute path to nvidia-smi.exe")
+	}
+	if c.PollSeconds < 1 || c.SustainSeconds < 1 || c.CooldownSeconds < 1 {
+		return errors.New("controller.gpu_admission poll, sustain, and cooldown seconds must be at least 1")
+	}
+	for name, value := range map[string]int{
+		"reranker_enable_below_percent": c.RerankerEnableBelowPercent,
+		"reranker_disable_at_percent":   c.RerankerDisableAtPercent,
+		"paddle_enable_below_percent":   c.PaddleEnableBelowPercent,
+		"paddle_disable_at_percent":     c.PaddleDisableAtPercent,
+	} {
+		if value < 0 || value > 100 {
+			return fmt.Errorf("controller.gpu_admission.%s must be between 0 and 100", name)
+		}
+	}
+	if c.RerankerEnableBelowPercent >= c.RerankerDisableAtPercent ||
+		c.PaddleEnableBelowPercent >= c.PaddleDisableAtPercent {
+		return errors.New("controller.gpu_admission enable thresholds must be below disable thresholds")
+	}
+	if c.RerankerMinimumFreeMiB < 1 || c.RerankerCriticalFreeMiB < 1 ||
+		c.RerankerCriticalFreeMiB >= c.RerankerMinimumFreeMiB || c.PaddleMinimumFreeMiB < 1 ||
+		c.PaddleCriticalFreeMiB < 1 || c.PaddleCriticalFreeMiB >= c.PaddleMinimumFreeMiB {
+		return errors.New("controller.gpu_admission free-memory thresholds are invalid")
 	}
 	return nil
 }
@@ -238,7 +336,7 @@ func (c CatalogConfig) Validate() error {
 				return fmt.Errorf("catalog.groups.%s backend id %q is duplicated", group, backend.ID)
 			}
 			backendIDs[backend.ID] = struct{}{}
-			if backend.GPU && group != GroupReranker {
+			if backend.GPU && group != GroupReranker && group != GroupPaddleOCR {
 				return fmt.Errorf("catalog.groups.%s backend %q cannot request GPU admission", group, backend.ID)
 			}
 			upstream, err := url.Parse(backend.Upstream)

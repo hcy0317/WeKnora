@@ -75,7 +75,25 @@ func (r *failOnceRuntime) Start(context.Context, Group) (Backend, error) {
 func (r *failOnceRuntime) Stop(context.Context, Group) error { return nil }
 
 type admissionRuntime struct {
-	request StartRequest
+	mu              sync.Mutex
+	request         StartRequest
+	stoppedBackends []string
+}
+
+type failFirstBackendStopRuntime struct {
+	admissionRuntime
+	stopAttempts atomic.Int32
+}
+
+func (r *failFirstBackendStopRuntime) StopBackend(
+	ctx context.Context,
+	group Group,
+	backendID string,
+) error {
+	if r.stopAttempts.Add(1) == 1 {
+		return fmt.Errorf("docker stop unavailable")
+	}
+	return r.admissionRuntime.StopBackend(ctx, group, backendID)
 }
 
 func (r *admissionRuntime) Start(context.Context, Group) (Backend, error) {
@@ -83,6 +101,8 @@ func (r *admissionRuntime) Start(context.Context, Group) (Backend, error) {
 }
 
 func (r *admissionRuntime) StartWithAdmission(_ context.Context, request StartRequest) (Backend, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.request = request
 	if request.GPUAllowed {
 		return Backend{ID: "gpu", URL: "http://reranker-gpu:8000"}, nil
@@ -91,6 +111,13 @@ func (r *admissionRuntime) StartWithAdmission(_ context.Context, request StartRe
 }
 
 func (r *admissionRuntime) Stop(context.Context, Group) error { return nil }
+
+func (r *admissionRuntime) StopBackend(_ context.Context, _ Group, backendID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stoppedBackends = append(r.stoppedBackends, backendID)
+	return nil
+}
 
 type blockingDrainRuntime struct {
 	starts       atomic.Int32
@@ -439,6 +466,115 @@ func TestCoordinatorClosesOnlyNewRerankerGPUAdmission(t *testing.T) {
 	require.Equal(t, GroupReranker, runtime.request.Group)
 	require.Equal(t, "cpu", lease.Backend.ID)
 	require.True(t, lease.ColdStart)
+}
+
+func TestCoordinatorDrainsExistingGPULeaseAndRoutesNewRerankerLeaseToCPU(t *testing.T) {
+	t.Parallel()
+
+	runtime := &admissionRuntime{}
+	coordinator, err := NewCoordinator(testConfig(), runtime)
+	require.NoError(t, err)
+
+	gpuLease, err := coordinator.Acquire(context.Background(), GroupReranker, AcquireRequest{
+		RequestID: "gpu-before-pressure", GatewayID: "gateway-1", Purpose: "rerank",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "gpu", gpuLease.Backend.ID)
+
+	coordinator.SetGPUAdmission(false)
+	cpuLease, err := coordinator.Acquire(context.Background(), GroupReranker, AcquireRequest{
+		RequestID: "cpu-during-pressure", GatewayID: "gateway-1", Purpose: "rerank",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "cpu", cpuLease.Backend.ID)
+	require.NotEqual(t, gpuLease.ID, cpuLease.ID)
+
+	require.NoError(t, coordinator.Release(gpuLease.ID, ReleaseCompleted))
+	require.NoError(t, coordinator.SweepGPUAdmission(context.Background()))
+	require.Equal(t, []string{"gpu"}, runtime.stoppedBackends)
+
+	snapshot, err := coordinator.Snapshot(GroupReranker)
+	require.NoError(t, err)
+	require.Equal(t, StateBusy, snapshot.State)
+	require.Equal(t, 1, snapshot.Active)
+}
+
+func TestCoordinatorRestoresAlwaysOnRerankerToGPUAfterPressureRecovery(t *testing.T) {
+	t.Parallel()
+
+	config := testConfig()
+	reranker := config.Groups[GroupReranker]
+	reranker.Mode = ModeAlwaysOn
+	config.Groups[GroupReranker] = reranker
+	runtime := &admissionRuntime{}
+	coordinator, err := NewCoordinator(config, runtime)
+	require.NoError(t, err)
+
+	coordinator.SetGPUAdmission(false)
+	require.NoError(t, coordinator.EnsureAlwaysOn(context.Background()))
+
+	coordinator.SetGPUAdmission(true)
+	require.NoError(t, coordinator.SweepGPUAdmission(context.Background()))
+	require.Equal(t, []string{"cpu"}, runtime.stoppedBackends)
+	require.NoError(t, coordinator.EnsureAlwaysOn(context.Background()))
+
+	lease, err := coordinator.Acquire(context.Background(), GroupReranker, AcquireRequest{
+		RequestID: "gpu-after-recovery", GatewayID: "gateway-1", Purpose: "rerank",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "gpu", lease.Backend.ID)
+	require.False(t, lease.ColdStart)
+}
+
+func TestCoordinatorKeepsFailedGPUStopForCooldownBoundedRetry(t *testing.T) {
+	t.Parallel()
+
+	clock := &manualClock{now: time.Date(2026, 8, 18, 18, 0, 0, 0, time.UTC)}
+	runtime := &failFirstBackendStopRuntime{}
+	coordinator, err := NewCoordinator(testConfig(), runtime, WithClock(clock))
+	require.NoError(t, err)
+
+	lease, err := coordinator.Acquire(context.Background(), GroupReranker, AcquireRequest{
+		RequestID: "gpu-before-stop-failure", GatewayID: "gateway-1", Purpose: "rerank",
+	})
+	require.NoError(t, err)
+	coordinator.SetGPUAdmission(false)
+	require.NoError(t, coordinator.Release(lease.ID, ReleaseCompleted))
+	require.ErrorContains(t, coordinator.SweepGPUAdmission(context.Background()), "docker stop unavailable")
+
+	require.NoError(t, coordinator.SweepGPUAdmission(context.Background()))
+	require.Equal(t, int32(1), runtime.stopAttempts.Load(), "retry must respect failure cooldown")
+	clock.Advance(5 * time.Minute)
+	require.NoError(t, coordinator.SweepGPUAdmission(context.Background()))
+	require.Equal(t, int32(2), runtime.stopAttempts.Load())
+	require.Equal(t, []string{"gpu"}, runtime.stoppedBackends)
+}
+
+func TestCoordinatorRejectsNewPaddleLeaseUnderPressureWithoutInterruptingActiveLease(t *testing.T) {
+	t.Parallel()
+
+	runtime := &admissionRuntime{}
+	coordinator, err := NewCoordinator(testConfig(), runtime)
+	require.NoError(t, err)
+	lease, err := coordinator.Acquire(context.Background(), GroupPaddleOCR, AcquireRequest{
+		RequestID: "paddle-before-pressure", GatewayID: "gateway-1", Purpose: "parse",
+	})
+	require.NoError(t, err)
+
+	coordinator.SetGroupGPUAdmission(GroupPaddleOCR, false)
+	_, err = coordinator.Acquire(context.Background(), GroupPaddleOCR, AcquireRequest{
+		RequestID: "paddle-during-pressure", GatewayID: "gateway-1", Purpose: "parse",
+	})
+	var failure *Failure
+	require.ErrorAs(t, err, &failure)
+	require.Equal(t, FailureGPUAdmissionClosed, failure.Kind)
+
+	snapshot, snapshotErr := coordinator.Snapshot(GroupPaddleOCR)
+	require.NoError(t, snapshotErr)
+	require.Equal(t, 1, snapshot.Active)
+	require.NoError(t, coordinator.Release(lease.ID, ReleaseCompleted))
+	require.NoError(t, coordinator.SweepGPUAdmission(context.Background()))
+	require.Equal(t, []string{"gpu"}, runtime.stoppedBackends)
 }
 
 func TestCoordinatorCancelsReversibleDrainForNewAcquire(t *testing.T) {

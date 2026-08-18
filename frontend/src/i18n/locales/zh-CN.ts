@@ -4910,6 +4910,9 @@ export default {
       revision: '修订',
       active: '活动请求',
       pending: '等待请求',
+      gpuAdmission: 'GPU 准入',
+      admissionOpen: '开放',
+      admissionClosed: '压力保护',
     },
     sandbox: {
       title: '沙箱后端',

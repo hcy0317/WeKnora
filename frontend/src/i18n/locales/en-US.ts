@@ -1144,6 +1144,9 @@ export default {
       revision: 'Revision',
       active: 'Active requests',
       pending: 'Pending requests',
+      gpuAdmission: 'GPU admission',
+      admissionOpen: 'Open',
+      admissionClosed: 'Pressure protected',
     },
     sandbox: {
       title: 'Sandbox Backend',

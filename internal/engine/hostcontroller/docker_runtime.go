@@ -32,11 +32,18 @@ func WithObserveOnly(observeOnly bool) DockerRuntimeOption {
 	}
 }
 
+func WithActuationGate(gate ActuationGate) DockerRuntimeOption {
+	return func(runtime *DockerRuntime) {
+		runtime.actuationGate = gate
+	}
+}
+
 type DockerRuntime struct {
 	catalog            lifecycle.CatalogConfig
 	runner             CommandRunner
 	healthPollInterval time.Duration
 	observeOnly        bool
+	actuationGate      ActuationGate
 }
 
 func NewDockerRuntime(
@@ -66,6 +73,22 @@ func (r *DockerRuntime) Start(ctx context.Context, group lifecycle.Group) (lifec
 }
 
 func (r *DockerRuntime) StartWithAdmission(
+	ctx context.Context,
+	request lifecycle.StartRequest,
+) (lifecycle.Backend, error) {
+	if r.observeOnly || r.actuationGate == nil {
+		return r.startWithAdmission(ctx, request)
+	}
+	var backend lifecycle.Backend
+	err := r.actuationGate.WithOwnership(ctx, func() error {
+		var err error
+		backend, err = r.startWithAdmission(ctx, request)
+		return err
+	})
+	return backend, err
+}
+
+func (r *DockerRuntime) startWithAdmission(
 	ctx context.Context,
 	request lifecycle.StartRequest,
 ) (lifecycle.Backend, error) {
@@ -167,6 +190,15 @@ func (r *DockerRuntime) Stop(ctx context.Context, group lifecycle.Group) error {
 	if r.observeOnly {
 		return ErrObserveOnly
 	}
+	if r.actuationGate != nil {
+		return r.actuationGate.WithOwnership(ctx, func() error {
+			return r.stop(ctx, group)
+		})
+	}
+	return r.stop(ctx, group)
+}
+
+func (r *DockerRuntime) stop(ctx context.Context, group lifecycle.Group) error {
 	catalogGroup, ok := r.catalog.Groups[group]
 	if !ok {
 		return fmt.Errorf("unknown engine group %q", group)
@@ -187,4 +219,36 @@ func (r *DockerRuntime) Stop(ctx context.Context, group lifecycle.Group) error {
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func (r *DockerRuntime) StopBackend(ctx context.Context, group lifecycle.Group, backendID string) error {
+	if r.observeOnly {
+		return ErrObserveOnly
+	}
+	action := func() error { return r.stopBackend(ctx, group, backendID) }
+	if r.actuationGate != nil {
+		return r.actuationGate.WithOwnership(ctx, action)
+	}
+	return action()
+}
+
+func (r *DockerRuntime) stopBackend(ctx context.Context, group lifecycle.Group, backendID string) error {
+	catalogGroup, ok := r.catalog.Groups[group]
+	if !ok {
+		return fmt.Errorf("unknown engine group %q", group)
+	}
+	for _, backend := range catalogGroup.Backends {
+		if backend.ID != backendID {
+			continue
+		}
+		var failures []error
+		for index := len(backend.Containers) - 1; index >= 0; index-- {
+			container := backend.Containers[index]
+			if _, err := r.runner.Run(ctx, "stop", "--time", "20", container); err != nil {
+				failures = append(failures, fmt.Errorf("stop container %s: %w", container, err))
+			}
+		}
+		return errors.Join(failures...)
+	}
+	return fmt.Errorf("unknown engine backend %q for group %s", backendID, group)
 }

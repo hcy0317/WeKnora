@@ -4908,6 +4908,9 @@ export default {
       revision: '리비전',
       active: '활성 요청',
       pending: '대기 요청',
+      gpuAdmission: 'GPU 허용',
+      admissionOpen: '허용',
+      admissionClosed: '압력 보호',
     },
     sandbox: {
       title: 'Sandbox Backend',

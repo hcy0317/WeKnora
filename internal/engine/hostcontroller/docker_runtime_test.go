@@ -18,6 +18,19 @@ type catalogRunner struct {
 	calls   [][]string
 }
 
+type recordingActuationGate struct {
+	err   error
+	calls int
+}
+
+func (g *recordingActuationGate) WithOwnership(_ context.Context, action func() error) error {
+	g.calls++
+	if g.err != nil {
+		return g.err
+	}
+	return action()
+}
+
 func (r *catalogRunner) Run(_ context.Context, arguments ...string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -92,6 +105,25 @@ func TestDockerRuntimeObserveOnlyNeverActuatesContainers(t *testing.T) {
 	require.ErrorIs(t, runtime.Stop(context.Background(), lifecycle.GroupASR), ErrObserveOnly)
 }
 
+func TestDockerRuntimeRequiresControllerOwnershipBeforeActuation(t *testing.T) {
+	t.Parallel()
+
+	runner := &catalogRunner{started: make(map[string]bool)}
+	gate := &recordingActuationGate{err: ErrOwnerMismatch}
+	runtime, err := NewDockerRuntime(
+		testCatalog(),
+		runner,
+		WithActuationGate(gate),
+		WithHealthPollInterval(time.Millisecond),
+	)
+	require.NoError(t, err)
+
+	_, err = runtime.Start(context.Background(), lifecycle.GroupASR)
+	require.ErrorIs(t, err, ErrOwnerMismatch)
+	require.Equal(t, 1, gate.calls)
+	require.Empty(t, runner.snapshotCalls())
+}
+
 func testCatalog() lifecycle.CatalogConfig {
 	return lifecycle.CatalogConfig{
 		DockerHost: "npipe:////./pipe/dockerDesktopLinuxEngine",
@@ -101,6 +133,7 @@ func testCatalog() lifecycle.CatalogConfig {
 				Backends: []lifecycle.CatalogBackend{{
 					ID:         "paddle-gpu",
 					Upstream:   "http://paddleocr-vl:8080",
+					GPU:        true,
 					Containers: []string{"WeKnora-paddleocr-vlm-server", "WeKnora-paddleocr-vl"},
 				}},
 			},

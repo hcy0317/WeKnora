@@ -4908,6 +4908,9 @@ export default {
       revision: 'Редакция',
       active: 'Активные запросы',
       pending: 'Ожидающие запросы',
+      gpuAdmission: 'Допуск GPU',
+      admissionOpen: 'Открыт',
+      admissionClosed: 'Защита от нагрузки',
     },
     sandbox: {
       title: 'Sandbox Backend',

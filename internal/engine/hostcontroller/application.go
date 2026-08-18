@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"time"
@@ -17,6 +18,7 @@ type Application struct {
 	coordinator *lifecycle.Coordinator
 	httpServer  *http.Server
 	tlsConfig   *tls.Config
+	gpuMonitor  *GPUMonitor
 }
 
 func NewApplication(configPath string) (*Application, error) {
@@ -35,15 +37,32 @@ func NewApplication(configPath string) (*Application, error) {
 	if err != nil {
 		return nil, err
 	}
+	var actuationOptions []DockerRuntimeOption
+	actuationOptions = append(actuationOptions, WithObserveOnly(config.Controller.ObserveOnly))
+	if !config.Controller.ObserveOnly {
+		gate, gateErr := NewOwnerFileActuationGate(
+			config.Controller.OwnerMutex,
+			config.Controller.OwnerStatePath,
+			"controller",
+		)
+		if gateErr != nil {
+			return nil, gateErr
+		}
+		actuationOptions = append(actuationOptions, WithActuationGate(gate))
+	}
 	dockerRuntime, err := NewDockerRuntime(
 		config.Catalog,
 		dockerCLI,
-		WithObserveOnly(config.Controller.ObserveOnly),
+		actuationOptions...,
 	)
 	if err != nil {
 		return nil, err
 	}
 	coordinator, err := lifecycle.NewCoordinator(*config, dockerRuntime)
+	if err != nil {
+		return nil, err
+	}
+	gpuMonitor, err := NewGPUMonitor(config.Controller.GPUAdmission, coordinator)
 	if err != nil {
 		return nil, err
 	}
@@ -55,6 +74,7 @@ func NewApplication(configPath string) (*Application, error) {
 	return &Application{
 		config:      *config,
 		coordinator: coordinator,
+		gpuMonitor:  gpuMonitor,
 		tlsConfig:   tlsConfig,
 		httpServer: &http.Server{
 			Addr:              config.Controller.ListenAddress,
@@ -68,16 +88,12 @@ func NewApplication(configPath string) (*Application, error) {
 }
 
 func (a *Application) Run(ctx context.Context) error {
-	var ownership Ownership
-	var err error
-	if !a.config.Controller.ObserveOnly {
-		ownership, err = AcquireOwnership(a.config.Controller.OwnerMutex)
-		if err != nil {
-			return err
+	if a.gpuMonitor != nil {
+		if err := a.gpuMonitor.Refresh(ctx); err != nil {
+			log.Printf("engine GPU admission failed closed: %v", err)
 		}
-		defer ownership.Close()
+		go a.gpuMonitor.Run(ctx)
 	}
-
 	listener, err := net.Listen("tcp", a.httpServer.Addr)
 	if err != nil {
 		return fmt.Errorf("listen for engine controller: %w", err)
@@ -89,9 +105,11 @@ func (a *Application) Run(ctx context.Context) error {
 		serverDone <- a.httpServer.Serve(tlsListener)
 	}()
 
-	if err := a.coordinator.EnsureAlwaysOn(ctx); err != nil {
-		_ = a.httpServer.Close()
-		return err
+	if !a.config.Controller.ObserveOnly {
+		if err := a.coordinator.EnsureAlwaysOn(ctx); err != nil {
+			_ = a.httpServer.Close()
+			return err
+		}
 	}
 
 	var sweep <-chan time.Time
@@ -117,6 +135,10 @@ func (a *Application) Run(ctx context.Context) error {
 			}
 			return fmt.Errorf("serve engine controller: %w", err)
 		case <-sweep:
+			if err := a.coordinator.SweepGPUAdmission(ctx); err != nil {
+				log.Printf("engine GPU backend retirement deferred: %v", err)
+				continue
+			}
 			if err := a.coordinator.EnsureAlwaysOn(ctx); err != nil {
 				return err
 			}

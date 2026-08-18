@@ -23,11 +23,26 @@ controller:
   docker_executable: 'C:\Program Files\Docker\Docker\resources\bin\docker.exe'
   observe_only: true
   owner_mutex: 'Global\WeKnoraEngineDockerOwner'
+  owner_state_path: 'C:\ProgramData\WeKnora\engine-ownership\owner.txt'
   sweep_interval_seconds: 5
   tls:
     certificate: 'C:\ProgramData\WeKnora\engine-controller\tls\server.crt'
     private_key: 'C:\ProgramData\WeKnora\engine-controller\tls\server.key'
     client_ca: 'C:\ProgramData\WeKnora\engine-controller\tls\ca.crt'
+  gpu_admission:
+    enabled: true
+    nvidia_smi_executable: 'C:\Windows\System32\nvidia-smi.exe'
+    poll_seconds: 20
+    sustain_seconds: 20
+    cooldown_seconds: 300
+    reranker_enable_below_percent: 70
+    reranker_disable_at_percent: 85
+    reranker_minimum_free_mib: 3500
+    reranker_critical_free_mib: 2048
+    paddle_enable_below_percent: 60
+    paddle_disable_at_percent: 92
+    paddle_minimum_free_mib: 7000
+    paddle_critical_free_mib: 1024
 
 # Readonly at the API/UI boundary. Runtime Docker commands are derived only
 # from this catalog; request payloads can never supply a container or upstream.
@@ -40,6 +55,7 @@ catalog:
       backends:
         - id: paddle-gpu
           upstream: http://paddleocr-vl:8080
+          gpu: true
           containers:
             - WeKnora-paddleocr-vlm-server
             - WeKnora-paddleocr-vl
