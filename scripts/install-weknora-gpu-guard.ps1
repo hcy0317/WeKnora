@@ -93,6 +93,9 @@ function Register-HostGuardTask {
         -Principal $principal `
         -Description $Description `
         -Force | Out-Null
+    # Register-ScheduledTask -Force may preserve the disabled state of an
+    # existing task. Deferred migration still needs its next-logon trigger.
+    Enable-ScheduledTask -TaskName $TaskName | Out-Null
 }
 
 # Preserve the Ollama behavior before replacing the legacy combined task.

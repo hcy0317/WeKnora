@@ -77,6 +77,7 @@ try {
     Assert-True ($guardInstallerSource -match 'DeferGpuGuardStart') 'GPU Guard installer cannot defer orphan migration'
     Assert-True ($guardInstallerSource -match 'GPUGuardStartDeferred') 'deferred Guard state is not reported'
     Assert-True ($guardInstallerSource -match '\$gpuTriggers\s*=\s*if\s*\(\$DeferGpuGuardStart\)') 'deferred Guard is not isolated to a future trigger'
+    Assert-True ($guardInstallerSource -match 'Enable-ScheduledTask\s+-TaskName\s+\$TaskName') 'replacement tasks can inherit a disabled state'
 
     . $clientBundlePath
     $sourceTLSRoot = Join-Path $testRoot 'controller-tls'
