@@ -2217,6 +2217,19 @@ func (r *knowledgeSpanRepository) settleProcessingOutcomeTx(
 	if err := tx.Table("knowledges").Where("id = ?", knowledgeID).Updates(updates).Error; err != nil {
 		return fmt.Errorf("settle knowledge processing outcome: %w", err)
 	}
+	if parseStatus == types.ParseStatusCompleted {
+		completion := &types.KnowledgeCompletionOutbox{
+			KnowledgeID: knowledgeID,
+			Attempt:     attempt,
+			State:       types.KnowledgeCompletionOutboxPending,
+		}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "knowledge_id"}, {Name: "attempt"}},
+			DoNothing: true,
+		}).Create(completion).Error; err != nil {
+			return fmt.Errorf("persist knowledge completion event: %w", err)
+		}
+	}
 	return nil
 }
 

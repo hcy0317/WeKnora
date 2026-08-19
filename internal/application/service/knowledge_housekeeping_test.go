@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -68,12 +69,29 @@ CREATE TABLE IF NOT EXISTS knowledge_processing_spans (
 );
 `
 
+const housekeepingCompletionOutboxDDL = `
+CREATE TABLE IF NOT EXISTS knowledge_completion_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    knowledge_id VARCHAR(64) NOT NULL,
+    attempt INTEGER NOT NULL,
+    state VARCHAR(16) NOT NULL DEFAULT 'pending',
+    deleted_archived INTEGER NOT NULL DEFAULT 0,
+    classified_legacy INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    UNIQUE (knowledge_id, attempt)
+);
+`
+
 func setupHousekeepingDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(knowledgeTestDDL).Error)
 	require.NoError(t, db.Exec(housekeepingSpansDDL).Error)
+	require.NoError(t, db.Exec(housekeepingCompletionOutboxDDL).Error)
 	return db
 }
 
@@ -101,8 +119,22 @@ func insertSpan(t *testing.T, db *gorm.DB, kid string, attempt int, spanID, stat
 // suite. queued maps knowledge_id → "still has a queued task"; err forces
 // the probe to fail so the fail-safe branch can be exercised.
 type fakeTaskInspector struct {
-	queued map[string]bool
-	err    error
+	queued              map[string]bool
+	err                 error
+	completionSupported bool
+	completionErr       error
+	completionDeleted   int
+	completionLegacy    int
+	completionCalls     *[]string
+}
+
+func (f fakeTaskInspector) ReconcileCompletedKnowledgeTasks(
+	_ context.Context, knowledgeID string, completedAttempt int,
+) (int, int, bool, error) {
+	if f.completionCalls != nil {
+		*f.completionCalls = append(*f.completionCalls, fmt.Sprintf("%s:%d", knowledgeID, completedAttempt))
+	}
+	return f.completionDeleted, f.completionLegacy, f.completionSupported, f.completionErr
 }
 
 func (f fakeTaskInspector) CancelTasksForKnowledge(
@@ -144,6 +176,62 @@ func newHousekeepingSvcWithInspector(db *gorm.DB, inspector interfaces.TaskInspe
 		DocumentProcessTimeout: 1 * time.Hour,
 	}}
 	return NewHousekeepingService(db, cfg, inspector)
+}
+
+func insertCompletionOutbox(t *testing.T, db *gorm.DB, knowledgeID string, attempt int) {
+	t.Helper()
+	require.NoError(t, db.Exec(
+		`INSERT INTO knowledge_completion_outbox (knowledge_id, attempt, state) VALUES (?, ?, ?)`,
+		knowledgeID, attempt, types.KnowledgeCompletionOutboxPending,
+	).Error)
+}
+
+func TestHousekeeping_ReconcilesCompletionOutboxAndPersistsCounters(t *testing.T) {
+	db := setupHousekeepingDB(t)
+	insertCompletionOutbox(t, db, "kid-complete", 2)
+	calls := []string{}
+	svc := newHousekeepingSvcWithInspector(db, fakeTaskInspector{
+		completionSupported: true, completionDeleted: 4, completionLegacy: 3, completionCalls: &calls,
+	})
+
+	svc.runSweep(context.Background())
+
+	assert.Equal(t, []string{"kid-complete:2"}, calls)
+	var row types.KnowledgeCompletionOutbox
+	require.NoError(t, db.Table(row.TableName()).Where("knowledge_id = ? AND attempt = ?", "kid-complete", 2).Take(&row).Error)
+	assert.Equal(t, types.KnowledgeCompletionOutboxCompleted, row.State)
+	assert.Equal(t, 4, row.DeletedArchived)
+	assert.Equal(t, 3, row.ClassifiedLegacy)
+	assert.NotNil(t, row.CompletedAt)
+}
+
+func TestHousekeeping_RedisFailureRetainsPendingCompletionOutbox(t *testing.T) {
+	db := setupHousekeepingDB(t)
+	insertCompletionOutbox(t, db, "kid-retry", 1)
+	svc := newHousekeepingSvcWithInspector(db, fakeTaskInspector{
+		completionSupported: true, completionErr: errors.New("redis unavailable"),
+	})
+
+	svc.runSweep(context.Background())
+
+	var row types.KnowledgeCompletionOutbox
+	require.NoError(t, db.Table(row.TableName()).Where("knowledge_id = ?", "kid-retry").Take(&row).Error)
+	assert.Equal(t, types.KnowledgeCompletionOutboxPending, row.State)
+	assert.Contains(t, row.LastError, "redis unavailable")
+	assert.Nil(t, row.CompletedAt)
+}
+
+func TestHousekeeping_StartPerformsBoundedCompletionDrain(t *testing.T) {
+	db := setupHousekeepingDB(t)
+	insertCompletionOutbox(t, db, "kid-startup", 5)
+	calls := []string{}
+	svc := newHousekeepingSvcWithInspector(db, fakeTaskInspector{
+		completionSupported: true, completionCalls: &calls,
+	})
+	require.NoError(t, svc.Start(context.Background()))
+	t.Cleanup(svc.Stop)
+
+	assert.Equal(t, []string{"kid-startup:5"}, calls)
 }
 
 // TestHousekeeping_RecoversAbandoned exercises the happy path: a

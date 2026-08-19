@@ -50,6 +50,8 @@ type HousekeepingService struct {
 	started bool
 }
 
+const knowledgeCompletionDrainLimit = 100
+
 // NewHousekeepingService constructs a HousekeepingService. It does NOT start
 // the cron — call Start in the application bootstrap so a misconfigured
 // cron schedule cannot prevent the rest of the service from coming up.
@@ -75,6 +77,10 @@ func (h *HousekeepingService) Start(ctx context.Context) error {
 	if h.started {
 		return nil
 	}
+	// A bounded startup pass closes the crash window between the atomic DB
+	// completion commit and Redis archive reconciliation. Failures remain in
+	// the outbox and never prevent the application from starting.
+	h.drainCompletionOutbox(ctx, knowledgeCompletionDrainLimit)
 	if !housekeepingEnabled() {
 		logger.Infof(ctx, "[Housekeeping] disabled via WEKNORA_HOUSEKEEPING_ENABLED=false")
 		return nil
@@ -109,6 +115,8 @@ func (h *HousekeepingService) Stop() {
 // runSweep is exported on the type for testability — tests can drive a
 // single sweep without waiting for the cron tick.
 func (h *HousekeepingService) runSweep(ctx context.Context) {
+	h.drainCompletionOutbox(ctx, knowledgeCompletionDrainLimit)
+
 	threshold := h.staleThreshold()
 	cutoff := time.Now().Add(-threshold)
 
@@ -216,6 +224,85 @@ func (h *HousekeepingService) runSweep(ctx context.Context) {
 		logger.Warnf(ctx, "[Housekeeping] summary sweep failed: %v", resSummary.Error)
 	} else if resSummary.RowsAffected > 0 {
 		logger.Infof(ctx, "[Housekeeping] recovered %d stuck summary rows", resSummary.RowsAffected)
+	}
+}
+
+// drainCompletionOutbox reconciles a bounded batch of successful attempts
+// against archived runtime task records. Each outbox row is idempotent: Redis
+// failures leave it pending, while Lite mode (no inspectable queue) completes
+// it as a supported no-op. Concurrent replicas may observe the same row, but
+// exact task deletion is safe and the conditional DB updates never regress a
+// row that another replica already completed.
+func (h *HousekeepingService) drainCompletionOutbox(ctx context.Context, limit int) {
+	if h == nil || h.db == nil || limit <= 0 {
+		return
+	}
+	var rows []types.KnowledgeCompletionOutbox
+	if err := h.db.WithContext(ctx).
+		Where("state = ?", types.KnowledgeCompletionOutboxPending).
+		Order("id ASC").
+		Limit(limit).
+		Find(&rows).Error; err != nil {
+		logger.Warnf(ctx, "[Housekeeping] completion outbox query failed: %v", err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+
+	reconciler, hasReconciler := h.inspector.(interfaces.KnowledgeCompletionTaskReconciler)
+	for i := range rows {
+		row := &rows[i]
+		deleted, legacy, supported := 0, 0, false
+		var reconcileErr error
+		if hasReconciler {
+			deleted, legacy, supported, reconcileErr = reconciler.ReconcileCompletedKnowledgeTasks(
+				ctx, row.KnowledgeID, row.Attempt,
+			)
+		}
+		if reconcileErr != nil {
+			result := h.db.WithContext(ctx).Table(row.TableName()).
+				Where("id = ? AND state = ?", row.ID, types.KnowledgeCompletionOutboxPending).
+				Updates(map[string]any{
+					"last_error": reconcileErr.Error(),
+					"updated_at": time.Now(),
+				})
+			if result.Error != nil {
+				logger.Warnf(ctx, "[Housekeeping] completion outbox error persistence failed id=%d: %v", row.ID, result.Error)
+			}
+			logger.Warnf(ctx,
+				"[Housekeeping] completion archive reconciliation deferred knowledge=%s attempt=%d: %v",
+				row.KnowledgeID, row.Attempt, reconcileErr,
+			)
+			continue
+		}
+
+		// unsupported means this deployment has no inspectable Redis queue;
+		// there is no archived runtime state to reconcile.
+		if !supported {
+			deleted, legacy = 0, 0
+		}
+		now := time.Now()
+		result := h.db.WithContext(ctx).Table(row.TableName()).
+			Where("id = ? AND state = ?", row.ID, types.KnowledgeCompletionOutboxPending).
+			Updates(map[string]any{
+				"state":             types.KnowledgeCompletionOutboxCompleted,
+				"deleted_archived":  deleted,
+				"classified_legacy": legacy,
+				"last_error":        "",
+				"updated_at":        now,
+				"completed_at":      now,
+			})
+		if result.Error != nil {
+			logger.Warnf(ctx, "[Housekeeping] completion outbox finalize failed id=%d: %v", row.ID, result.Error)
+			continue
+		}
+		if result.RowsAffected > 0 {
+			logger.Infof(ctx,
+				"[Housekeeping] reconciled completed knowledge=%s attempt=%d archived_deleted=%d legacy_retained=%d",
+				row.KnowledgeID, row.Attempt, deleted, legacy,
+			)
+		}
 	}
 }
 

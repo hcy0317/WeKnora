@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -57,6 +58,46 @@ func NewAsynqTaskInspector(inspector *asynq.Inspector, redisClient *redis.Client
 // Question / Summary / Extract / Manual.
 type knowledgeIDProbe struct {
 	KnowledgeID string `json:"knowledge_id,omitempty"`
+}
+
+type completionAttemptPresence uint8
+
+const (
+	completionAttemptAbsent completionAttemptPresence = iota
+	completionAttemptNull
+	completionAttemptZero
+	completionAttemptPositive
+)
+
+func parseKnowledgeCompletionPayload(payload []byte) (
+	knowledgeID string, attempt int, presence completionAttemptPresence, ok bool,
+) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return "", 0, completionAttemptAbsent, false
+	}
+	if rawID, exists := fields["knowledge_id"]; exists {
+		if err := json.Unmarshal(rawID, &knowledgeID); err != nil || knowledgeID == "" {
+			return "", 0, completionAttemptAbsent, false
+		}
+	} else {
+		return "", 0, completionAttemptAbsent, false
+	}
+	rawAttempt, exists := fields["attempt"]
+	if !exists {
+		return knowledgeID, 0, completionAttemptAbsent, true
+	}
+	trimmed := bytes.TrimSpace(rawAttempt)
+	if bytes.Equal(trimmed, []byte("null")) {
+		return knowledgeID, 0, completionAttemptNull, true
+	}
+	if err := json.Unmarshal(trimmed, &attempt); err != nil || attempt < 0 {
+		return knowledgeID, 0, completionAttemptAbsent, false
+	}
+	if attempt == 0 {
+		return knowledgeID, 0, completionAttemptZero, true
+	}
+	return knowledgeID, attempt, completionAttemptPositive, true
 }
 
 type runtimeTaskPayloadProbe struct {
@@ -130,6 +171,79 @@ func (a *asynqTaskInspector) CancelTasksForKnowledge(
 		knowledgeID, deleted, cancelled,
 	)
 	return deleted, cancelled, nil
+}
+
+// ReconcileCompletedKnowledgeTasks removes only archived runtime records that
+// are provably obsolete after one knowledge attempt succeeds. Missing/null/0
+// attempts predate the durable attempt contract; they remain visible history
+// and are counted instead of guessed. Live queue states, DB dead letters and
+// processing spans are never touched here.
+func (a *asynqTaskInspector) ReconcileCompletedKnowledgeTasks(
+	ctx context.Context, knowledgeID string, completedAttempt int,
+) (deleted int, classifiedLegacy int, supported bool, err error) {
+	if a == nil || a.inspector == nil {
+		return 0, 0, false, nil
+	}
+	if knowledgeID == "" || completedAttempt <= 0 {
+		return 0, 0, true, nil
+	}
+
+	toDelete := make([]queueTask, 0)
+	for _, queue := range queuesScanned {
+		for page := 1; page <= maxQueueMutationPasses; page++ {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return deleted, classifiedLegacy, true, ctxErr
+			}
+			tasks, listErr := a.inspector.ListArchivedTasks(
+				queue, asynq.PageSize(listPageSize), asynq.Page(page),
+			)
+			if listErr != nil {
+				if isAsynqQueueNotFound(listErr) {
+					break
+				}
+				return deleted, classifiedLegacy, true,
+					fmt.Errorf("list archived completion tasks queue=%s page=%d: %w", queue, page, listErr)
+			}
+			for _, task := range tasks {
+				if task == nil {
+					continue
+				}
+				if _, relevant := taskTypesForKnowledgeCancel[task.Type]; !relevant {
+					continue
+				}
+				taskKnowledgeID, attempt, presence, valid := parseKnowledgeCompletionPayload(task.Payload)
+				if !valid || taskKnowledgeID != knowledgeID {
+					continue
+				}
+				switch presence {
+				case completionAttemptAbsent, completionAttemptNull, completionAttemptZero:
+					classifiedLegacy++
+				case completionAttemptPositive:
+					if attempt <= completedAttempt {
+						toDelete = append(toDelete, queueTask{queue: queue, id: task.ID})
+					}
+				}
+			}
+			if len(tasks) < listPageSize {
+				break
+			}
+		}
+	}
+
+	for _, task := range toDelete {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return deleted, classifiedLegacy, true, ctxErr
+		}
+		if deleteErr := a.inspector.DeleteTask(task.queue, task.id); deleteErr != nil {
+			if errors.Is(deleteErr, asynq.ErrTaskNotFound) || isAsynqQueueNotFound(deleteErr) {
+				continue
+			}
+			return deleted, classifiedLegacy, true,
+				fmt.Errorf("delete archived completion task queue=%s id=%s: %w", task.queue, task.id, deleteErr)
+		}
+		deleted++
+	}
+	return deleted, classifiedLegacy, true, nil
 }
 
 // CancelTasksForKnowledgeBase removes tasks that still reference a knowledge

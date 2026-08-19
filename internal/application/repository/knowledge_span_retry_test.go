@@ -20,6 +20,7 @@ func setupKnowledgeSpanRetryRepo(t *testing.T) (KnowledgeSpanRepository, *gorm.D
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(spansTestDDL).Error)
+	require.NoError(t, db.Exec(knowledgeCompletionOutboxTestDDL).Error)
 	require.NoError(t, db.Exec(`CREATE TABLE knowledges (
 		id VARCHAR(64) PRIMARY KEY, tenant_id INTEGER NOT NULL,
 		knowledge_base_id VARCHAR(64) NOT NULL, parse_status VARCHAR(32) NOT NULL,
