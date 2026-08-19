@@ -312,6 +312,10 @@
         </section>
       </template>
 
+      <section v-if="lifecycleGroup" class="setting-drawer__section">
+        <EngineLifecycleSettings :group="lifecycleGroup" />
+      </section>
+
       <!-- Section 3 — 高级选项（仅在有内容时渲染，避免空 section 出现底部分隔线） -->
       <section v-if="['embedding', 'chat', 'vllm'].includes(activeModelType)" class="setting-drawer__section">
         <h4 class="setting-drawer__section-title">{{ $t('model.editor.sectionAdvanced') }}</h4>
@@ -425,11 +429,13 @@ import {
   type ThinkingControlValue,
 } from '@/utils/thinkingControl'
 import SettingDrawer from '@/components/settings/SettingDrawer.vue'
+import EngineLifecycleSettings from '@/components/settings/EngineLifecycleSettings.vue'
 import CredentialResource, {
   type CredentialFieldDef,
   type CredentialResourceApi,
 } from '@/components/credentials/CredentialResource.vue'
 import { shouldShowOllamaUnavailableTip } from '@/components/modelEditorSourceState'
+import { managedEngineGroup } from '@/stores/engineLifecyclePolicy'
 
 interface CustomHeaderItem {
   key: string
@@ -491,6 +497,10 @@ const isEdit = computed(() => !!props.modelData)
 
 const activeModelType = computed(() => (
   isEdit.value ? props.modelType : draftModelType.value
+))
+
+const lifecycleGroup = computed(() => (
+  managedEngineGroup(activeModelType.value, formData.value.baseUrl)
 ))
 
 const modelTypeChoices = computed(() => ([

@@ -25,6 +25,16 @@ func allowPaddleOCRVLLoopbackTest(t *testing.T) {
 	t.Cleanup(utils.ResetSSRFWhitelistForTest)
 }
 
+func TestNewPaddleOCRVLReaderRoutesManagedLocalEndpointThroughEngineGateway(t *testing.T) {
+	t.Setenv("WEKNORA_ENGINE_GATEWAY_URL", "http://engine-gateway:18084")
+	reader := NewPaddleOCRVLReader(map[string]string{
+		"paddleocr_vl_endpoint": "http://paddleocr-vl:8080",
+	})
+	if reader.endpoint != "http://engine-gateway:18084/paddleocr" {
+		t.Fatalf("managed Paddle endpoint = %q", reader.endpoint)
+	}
+}
+
 func TestPaddleOCRVLReaderReadRejectsEmptyLayoutParsingResults(t *testing.T) {
 	allowPaddleOCRVLLoopbackTest(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

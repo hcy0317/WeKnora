@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
@@ -35,8 +36,6 @@ import (
 // one releases. Standard (Redis) mode no longer takes an exclusive per-KB
 // lock (Phase 3) and never returns this.
 var ErrWikiIngestConcurrent = errors.New("concurrent wiki task active")
-
-var errWikiLLMEmptyContent = errors.New("wiki LLM returned empty response content")
 
 const (
 	// maxContentForWiki limits the document content sent to LLM for wiki generation
@@ -2545,6 +2544,15 @@ func (s *wikiIngestService) rebuildIndexPage(ctx context.Context, chatModel chat
 	if idx := strings.Index(existingIntro, "\n## "); idx >= 0 {
 		existingIntro = strings.TrimSpace(existingIntro[:idx])
 	}
+	indexWorkRevision := wikiCheckpointDigest(
+		"index", indexPage.ID, strconv.Itoa(indexPage.Version), existingIntro,
+		changeDesc, lang, customInstructions,
+	)
+	ctx = withWikiGenerationScope(ctx, wikiGenerationScope{
+		TenantID: payload.TenantID, KnowledgeBaseID: payload.KnowledgeBaseID,
+		WorkRevision:    indexWorkRevision,
+		RuntimeSnapshot: wikiRuntimeSnapshotDigest(chatModel, lang),
+	})
 
 	var intro string
 	switch {
@@ -2623,8 +2631,13 @@ func (s *wikiIngestService) rebuildIndexPage(ctx context.Context, chatModel chat
 
 	indexPage.Content = intro
 	indexPage.Summary = intro
-	_, err := s.wikiService.UpdatePage(ctx, indexPage)
-	return err
+	if _, err := s.wikiService.UpdatePage(ctx, indexPage); err != nil {
+		return err
+	}
+	if err := s.markWikiGenerationFragmentsSucceeded(ctx, indexWorkRevision); err != nil {
+		return fmt.Errorf("settle wiki index generation: %w", err)
+	}
+	return nil
 }
 
 // splitSummaryLine extracts the "SUMMARY: ..." line from LLM output.
@@ -3080,14 +3093,21 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 	ctx = types.WithLLMCallMetadata(ctx, purpose, prefixFingerprint)
 
 	tenantID, tenantScoped := types.TenantIDFromContext(ctx)
-	requestJSON, _ := json.Marshal(struct {
+	requestJSON, err := json.Marshal(struct {
 		Messages []chat.Message    `json:"messages"`
 		Options  *chat.ChatOptions `json:"options"`
 	}{Messages: messages, Options: opts})
+	if err != nil {
+		return "", fmt.Errorf("encode wiki generation request: %w", err)
+	}
 	requestKey := chat.BuildPromptCacheKey(
 		tenantID, chatModel.GetModelID(), "wiki_exact_request",
 		chat.FingerprintPromptPrefix(string(requestJSON)),
 	)
+	ledger, err := s.prepareWikiGenerationLedger(ctx, purpose, requestJSON, chatModel)
+	if err != nil {
+		return "", err
+	}
 
 	execute := func() (interface{}, error) {
 		releaseWarmup := func() {}
@@ -3106,24 +3126,55 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 			if budgetErr != nil {
 				return "", budgetErr
 			}
+			var reserved *types.WikiGenerationFragment
+			if ledger != nil {
+				var granted bool
+				reserved, granted, budgetErr = ledger.reserve(ctx, attemptTimeout)
+				if budgetErr != nil {
+					return "", budgetErr
+				}
+				if !granted {
+					return reserved.Output, nil
+				}
+			}
 			attemptCtx, cancelAttempt := context.WithTimeout(ctx, attemptTimeout)
-			response, callErr := callWikiLLM(attemptCtx, chatModel, messages, opts, purpose)
+			response, callErr := callWikiLLMWithFallbacks(
+				attemptCtx, chatModel, messages, opts, purpose,
+				maskedData["ExistingSummary"], maskedData["PageTitle"],
+			)
 			attemptTimedOut := errors.Is(callErr, context.DeadlineExceeded) && ctx.Err() == nil
 			cancelAttempt()
 			if attemptTimedOut {
-				callErr = fmt.Errorf("wiki LLM attempt timed out after %s: %w", attemptTimeout, callErr)
+				callErr = &WikiGenerationError{
+					Class: WikiGenerationErrorTransientTransport,
+					Err:   fmt.Errorf("wiki LLM attempt timed out after %s: %w", attemptTimeout, callErr),
+				}
 			}
 			if callErr == nil && response != nil {
 				if strings.TrimSpace(response.Content) == "" {
-					callErr = errWikiLLMEmptyContent
+					callErr = newWikiGenerationError(
+						WikiGenerationErrorDeterministicOutput,
+						errors.New("wiki LLM returned empty response content"),
+					)
 				} else {
+					if ledgerErr := ledger.complete(ctx, reserved, response.Content); ledgerErr != nil {
+						return "", ledgerErr
+					}
 					return response.Content, nil
 				}
 			}
 			if callErr == nil {
-				callErr = errors.New("LLM returned nil response")
+				callErr = newWikiGenerationError(
+					WikiGenerationErrorDeterministicOutput,
+					errors.New("LLM returned nil response"),
+				)
 			}
 			lastErr = callErr
+			if ledger != nil {
+				if settleErr := ledger.settleFailure(ctx, reserved, callErr); settleErr != nil {
+					return "", settleErr
+				}
+			}
 
 			if !isTransientLLMError(ctx, callErr) {
 				return "", fmt.Errorf("LLM call failed: %w", callErr)
@@ -3241,73 +3292,10 @@ func (s *wikiIngestService) awaitWikiPromptWarmup(ctx context.Context, key strin
 	}
 }
 
-// isTransientLLMError reports whether an error from the chat provider
-// looks like an infrastructure hiccup worth retrying. Classification is
-// intentionally conservative: the truthful "could not tell, assume
-// permanent" choice keeps retries cheap and avoids masking real bugs.
-//
-// We treat the following as transient:
-//   - HTTP 408 (client request timeout — upstream usually didn't process),
-//     429 (rate-limited — retry after backoff may succeed), 5xx (any
-//     server-side fault, including the 504 "Remote error, timeout with
-//     60" we see from the gateway in front of several LLM providers).
-//   - Wrapped context.DeadlineExceeded when the parent ctx is still alive
-//     (nested per-call timeouts).
-//   - Substring matches on the error text for common transport failures
-//     ("timeout", "connection reset", "EOF") that providers surface
-//     without a structured status code.
+// isTransientLLMError retries only errors backed by typed transport facts.
+// Ambiguous provider text fails closed so a possibly-paid call is not repeated.
 func isTransientLLMError(ctx context.Context, err error) bool {
-	if err == nil {
-		return false
-	}
-	// Never retry after the parent ctx itself expired — the task is
-	// being cancelled and the next attempt would just fail again.
-	if ctx.Err() != nil {
-		return false
-	}
-	if errors.Is(err, errWikiLLMEmptyContent) {
-		return true
-	}
-
-	msg := err.Error()
-	// Providers that bubble HTTP status up formatted as
-	// "API request failed with status NNN: ..." — match that first.
-	for _, s := range []string{
-		"status 408", "status 429",
-		"status 500", "status 501", "status 502", "status 503", "status 504",
-		"status 520", "status 521", "status 522", "status 523", "status 524",
-	} {
-		if strings.Contains(msg, s) {
-			return true
-		}
-	}
-
-	lower := strings.ToLower(msg)
-	for _, s := range []string{
-		"timeout",
-		"timed out",
-		"upstream request failed",
-		"upstream_error",
-		"bad_gateway",
-		"stream closed before completion",
-		"stream_read_error",
-		"http/2 stream failed",
-		"http2: stream closed",
-		"http2: client connection lost",
-		"connection reset",
-		"connection refused",
-		"broken pipe",
-		"no such host", // DNS hiccup
-		"i/o timeout",
-		"unexpected eof",
-		"tls handshake",
-		"context deadline exceeded", // nested per-call deadline
-	} {
-		if strings.Contains(lower, s) {
-			return true
-		}
-	}
-	return false
+	return wikiGenerationErrorClassOf(classifyWikiGenerationError(ctx, err)) == WikiGenerationErrorTransientTransport
 }
 
 // --- Helpers ---

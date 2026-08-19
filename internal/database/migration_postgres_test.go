@@ -89,7 +89,7 @@ func setMigrationVersion(t *testing.T, db *sql.DB, version uint, dirty bool) {
 	require.NoError(t, err)
 }
 
-func TestPostgresMigration80To89AndIdempotentSQL(t *testing.T) {
+func TestPostgresMigration80To91AndIdempotentSQL(t *testing.T) {
 	useRepositoryRoot(t)
 	dsn, db := newEphemeralPostgresSchema(t)
 	m, err := migrate.New("file://migrations/versioned", dsn)
@@ -101,7 +101,7 @@ func TestPostgresMigration80To89AndIdempotentSQL(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	assert.Equal(t, uint(89), version)
+	assert.Equal(t, uint(91), version)
 	assert.False(t, dirty)
 	var definition string
 	require.NoError(t, db.QueryRow(`SELECT indexdef FROM pg_indexes
@@ -120,6 +120,14 @@ func TestPostgresMigration80To89AndIdempotentSQL(t *testing.T) {
 		WHERE table_schema = current_schema() AND table_name IN
 		('wiki_ingest_work_units', 'wiki_taxonomy_plans', 'wiki_slug_applications', 'wiki_slug_contribution_markers')`).Scan(&checkpointTables))
 	assert.Equal(t, 4, checkpointTables)
+	var fragmentTables int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = current_schema() AND table_name = 'wiki_generation_fragments'`).Scan(&fragmentTables))
+	assert.Equal(t, 1, fragmentTables)
+	var completionOutboxTables int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = current_schema() AND table_name = 'knowledge_completion_outbox'`).Scan(&completionOutboxTables))
+	assert.Equal(t, 1, completionOutboxTables)
 	require.NoError(t, RunMigrationsWithOptions(dsn, MigrationOptions{}), "second migration run must be a no-op")
 
 	up, err := os.ReadFile("migrations/versioned/000085_knowledge_processing_root_attempt_unique.up.sql")

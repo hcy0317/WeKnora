@@ -146,6 +146,9 @@ func (s *wikiIngestService) planBatchTaxonomy(
 		if err := json.Unmarshal(mapped.ResolvedOutput, &restored); err != nil {
 			return nil, fmt.Errorf("restore taxonomy checkpoint: %w", err)
 		}
+		if err := s.markWikiGenerationFragmentsSucceeded(ctx, mapped.PlanID); err != nil {
+			return nil, fmt.Errorf("settle restored taxonomy generations: %w", err)
+		}
 		return restored, nil
 	}
 
@@ -180,8 +183,15 @@ func (s *wikiIngestService) planBatchTaxonomy(
 		if err := json.Unmarshal(plan.ResolvedOutput, &restored); err != nil {
 			return nil, fmt.Errorf("restore taxonomy checkpoint: %w", err)
 		}
+		if err := s.markWikiGenerationFragmentsSucceeded(ctx, plan.PlanID); err != nil {
+			return nil, fmt.Errorf("settle mapped taxonomy generations: %w", err)
+		}
 		return restored, nil
 	}
+	ctx = withWikiGenerationScope(ctx, wikiGenerationScope{
+		TenantID: kb.TenantID, KnowledgeBaseID: kb.ID, WorkRevision: plan.PlanID,
+		RuntimeSnapshot: wikiRuntimeSnapshotDigest(chatModel, lang),
+	})
 	ledger := wikiTaxonomyChunkLedger{Chunks: make(map[string]map[string][]string)}
 	progressOutput := append(types.JSON(nil), plan.ResolvedOutput...)
 	if len(progressOutput) == 0 {
@@ -249,6 +259,9 @@ func (s *wikiIngestService) planBatchTaxonomy(
 		if err := store.SaveWikiTaxonomyPlanProgress(ctx, plan.PlanID, progressOutput, types.JSON(encodedProgress)); err != nil {
 			return nil, fmt.Errorf("persist taxonomy chunk %d checkpoint: %w", ordinal, err)
 		}
+		if err := s.markWikiGenerationFragmentsSucceeded(ctx, plan.PlanID); err != nil {
+			return nil, fmt.Errorf("settle taxonomy chunk %d generation: %w", ordinal, err)
+		}
 		progressOutput = types.JSON(encodedProgress)
 		for _, item := range chunk {
 			path := assignments[item.slug]
@@ -264,6 +277,9 @@ func (s *wikiIngestService) planBatchTaxonomy(
 	}
 	if err := store.MarkWikiTaxonomyPlanMapped(ctx, plan.PlanID, types.JSON(encoded)); err != nil {
 		return nil, fmt.Errorf("persist taxonomy checkpoint: %w", err)
+	}
+	if err := s.markWikiGenerationFragmentsSucceeded(ctx, plan.PlanID); err != nil {
+		return nil, fmt.Errorf("settle taxonomy generations: %w", err)
 	}
 	return result, nil
 }

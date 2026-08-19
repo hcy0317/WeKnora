@@ -1,5 +1,24 @@
 import { get, post, put, del } from '@/utils/request'
 import type { CreatedTenantAPIKey, TenantAPIKey, TenantAPIKeyCapability } from '@/api/tenant'
+import type {
+  EngineLifecycleConfig,
+  EngineLifecycleUpdatePayload,
+} from '@/stores/engineLifecyclePolicy'
+
+const ENGINE_LIFECYCLE_ROUTE = '/api/v1/system/admin/engine-lifecycle'
+
+export async function getEngineLifecycle(): Promise<EngineLifecycleConfig> {
+  return await get(ENGINE_LIFECYCLE_ROUTE) as unknown as EngineLifecycleConfig
+}
+
+export async function updateEngineLifecycle(
+  revision: number,
+  payload: EngineLifecycleUpdatePayload,
+): Promise<EngineLifecycleConfig> {
+  return await put(ENGINE_LIFECYCLE_ROUTE, payload, {
+    headers: { 'If-Match': `"${revision}"` },
+  }) as unknown as EngineLifecycleConfig
+}
 
 export interface CreatePlatformAPIKeyPayload {
   name: string
@@ -107,6 +126,7 @@ export interface ParserEngineInfo {
   FileTypes: string[]
   Available?: boolean
   UnavailableReason?: string
+  State?: 'ready' | 'standby' | 'starting' | 'unavailable' | 'unknown'
 }
 
 /** 解析引擎配置（引擎连接参数存空间；聊天附件解析策略在智能体中配置） */

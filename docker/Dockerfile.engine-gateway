@@ -1,0 +1,21 @@
+FROM golang:1.26-bookworm AS builder
+
+ARG GOPROXY_ARG=https://goproxy.cn,direct
+ARG GOSUMDB_ARG=off
+ENV GOPROXY=${GOPROXY_ARG}
+ENV GOSUMDB=${GOSUMDB_ARG}
+
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY third_party/anydoc-go/go.mod ./third_party/anydoc-go/go.mod
+RUN --mount=type=cache,target=/go/pkg/mod go mod download gopkg.in/yaml.v3
+COPY cmd/engine-gateway ./cmd/engine-gateway
+COPY internal/engine ./internal/engine
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o /out/engine-gateway ./cmd/engine-gateway
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /out/engine-gateway /engine-gateway
+EXPOSE 18084
+ENTRYPOINT ["/engine-gateway"]

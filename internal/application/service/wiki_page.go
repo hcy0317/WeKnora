@@ -95,6 +95,74 @@ func (s *wikiPageService) wikiIngestCheckpointStore() (interfaces.WikiIngestChec
 	return store, nil
 }
 
+func (s *wikiPageService) wikiGenerationFragmentStore() (interfaces.WikiGenerationFragmentStore, error) {
+	store, ok := s.repo.(interfaces.WikiGenerationFragmentStore)
+	if !ok || store == nil {
+		return nil, errors.New("wiki generation fragment repository is unavailable")
+	}
+	return store, nil
+}
+
+func (s *wikiPageService) ReserveWikiGenerationFragment(
+	ctx context.Context,
+	candidate *types.WikiGenerationFragment,
+	callID string,
+	leaseUntil time.Time,
+	maxAttempts int,
+) (*types.WikiGenerationFragment, bool, error) {
+	store, err := s.wikiGenerationFragmentStore()
+	if err != nil {
+		return nil, false, err
+	}
+	return store.ReserveWikiGenerationFragment(ctx, candidate, callID, leaseUntil, maxAttempts)
+}
+
+func (s *wikiPageService) CompleteWikiGenerationFragment(ctx context.Context, fragmentID, callID, output string) error {
+	store, err := s.wikiGenerationFragmentStore()
+	if err != nil {
+		return err
+	}
+	return store.CompleteWikiGenerationFragment(ctx, fragmentID, callID, output)
+}
+
+func (s *wikiPageService) ReleaseWikiGenerationFragment(
+	ctx context.Context, fragmentID, callID, lastError string, terminal bool,
+) error {
+	store, err := s.wikiGenerationFragmentStore()
+	if err != nil {
+		return err
+	}
+	return store.ReleaseWikiGenerationFragment(ctx, fragmentID, callID, lastError, terminal)
+}
+
+func (s *wikiPageService) MarkWikiGenerationFragmentAmbiguous(
+	ctx context.Context, fragmentID, callID, lastError string,
+) error {
+	store, err := s.wikiGenerationFragmentStore()
+	if err != nil {
+		return err
+	}
+	return store.MarkWikiGenerationFragmentAmbiguous(ctx, fragmentID, callID, lastError)
+}
+
+func (s *wikiPageService) ListWikiGenerationFragments(
+	ctx context.Context, workRevision string,
+) ([]types.WikiGenerationFragment, error) {
+	store, err := s.wikiGenerationFragmentStore()
+	if err != nil {
+		return nil, err
+	}
+	return store.ListWikiGenerationFragments(ctx, workRevision)
+}
+
+func (s *wikiPageService) MarkWikiGenerationFragmentsSucceeded(ctx context.Context, workRevision string) error {
+	store, err := s.wikiGenerationFragmentStore()
+	if err != nil {
+		return err
+	}
+	return store.MarkWikiGenerationFragmentsSucceeded(ctx, workRevision)
+}
+
 func (s *wikiPageService) PrepareWikiIngestWorkUnit(
 	ctx context.Context, unit *types.WikiIngestWorkUnit,
 ) (*types.WikiIngestWorkUnit, error) {

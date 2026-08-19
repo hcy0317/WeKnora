@@ -100,6 +100,23 @@ func remoteReader(deps ReaderDeps) (interfaces.DocReader, error) {
 func ListAllEngines(
 	docreaderConnected bool, overrides map[string]string, remoteEngines []types.ParserEngineInfo,
 ) []types.ParserEngineInfo {
+	return ListAllEnginesWithOptions(docreaderConnected, overrides, remoteEngines, EngineListOptions{})
+}
+
+// EngineListOptions supplies authoritative availability facts for managed
+// engines. A supplied entry skips CheckAvailable, which is important for
+// passive list requests: probing a gateway-backed engine would otherwise
+// acquire a lease and cold-start its containers merely to render settings.
+type EngineListOptions struct {
+	PassiveAvailability map[string]types.ParserEngineInfo
+}
+
+func ListAllEnginesWithOptions(
+	docreaderConnected bool,
+	overrides map[string]string,
+	remoteEngines []types.ParserEngineInfo,
+	options EngineListOptions,
+) []types.ParserEngineInfo {
 	remoteMap := make(map[string]types.ParserEngineInfo, len(remoteEngines))
 	for _, re := range remoteEngines {
 		remoteMap[re.Name] = re
@@ -124,13 +141,27 @@ func ListAllEngines(
 			}
 		}
 
-		available, reason := e.CheckAvailable(docreaderConnected, overrides)
+		available, reason := false, ""
+		state := types.ParserEngineState("")
+		if passive, ok := options.PassiveAvailability[name]; ok {
+			available = passive.Available
+			reason = passive.UnavailableReason
+			state = passive.State
+		} else {
+			available, reason = e.CheckAvailable(docreaderConnected, overrides)
+			if available {
+				state = types.ParserEngineStateReady
+			} else {
+				state = types.ParserEngineStateUnavailable
+			}
+		}
 		result = append(result, types.ParserEngineInfo{
 			Name:              name,
 			Description:       description,
 			FileTypes:         fileTypes,
 			Available:         available,
 			UnavailableReason: reason,
+			State:             state,
 		})
 	}
 

@@ -211,7 +211,7 @@ func TestSQLiteLegacyLocalVersion6ReplaysUpstreamMemory(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	require.Equal(t, uint(7), version)
+	require.Equal(t, uint(9), version)
 	require.False(t, dirty)
 
 	for _, table := range []string{
@@ -219,6 +219,8 @@ func TestSQLiteLegacyLocalVersion6ReplaysUpstreamMemory(t *testing.T) {
 		"question_generation_manifests",
 		"wiki_ingest_work_units",
 		"wiki_canonical_identities",
+		"wiki_generation_fragments",
+		"knowledge_completion_outbox",
 	} {
 		var count int
 		require.NoError(t, db.QueryRow(

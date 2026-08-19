@@ -82,6 +82,19 @@ type KnowledgeBaseTaskCanceller interface {
 	) (deleted int, cancelled int, err error)
 }
 
+// KnowledgeCompletionTaskReconciler is the optional, Redis-backed cleanup
+// capability used after a knowledge attempt has durably completed. It only
+// removes archived queue records that carry the exact knowledge ID and a
+// positive attempt no newer than completedAttempt. Legacy records without a
+// trustworthy attempt are classified for operators and retained.
+type KnowledgeCompletionTaskReconciler interface {
+	ReconcileCompletedKnowledgeTasks(
+		ctx context.Context,
+		knowledgeID string,
+		completedAttempt int,
+	) (deleted int, classifiedLegacy int, supported bool, err error)
+}
+
 // RuntimeTaskInspector is the optional operator surface implemented by queue
 // backends that retain inspectable task state. It is separate from
 // TaskInspector so Lite mode and light-weight tests do not need to implement

@@ -14,9 +14,27 @@ services:
   app:
     image: weknora-app:local-patched
     environment:
-      - SSRF_WHITELIST_EXTRA=sub2api.long-antares.ts.net,*.long-antares.ts.net,searxng,accelerator-router,speaches,paddleocr-vl
+      - SSRF_WHITELIST_EXTRA=sub2api.long-antares.ts.net,*.long-antares.ts.net,searxng,accelerator-router,engine-gateway,speaches,paddleocr-vl
+      - WEKNORA_ENGINE_GATEWAY_URL=${WEKNORA_ENGINE_GATEWAY_URL-http://engine-gateway:18084}
+      - WEKNORA_ENGINE_CONTROLLER_URL=https://host.docker.internal:18443
+      - WEKNORA_ENGINE_CONTROLLER_CA=/run/weknora-engine-controller/ca.crt
+      - WEKNORA_ENGINE_CONTROLLER_CERT=/run/weknora-engine-controller/client.crt
+      - WEKNORA_ENGINE_CONTROLLER_KEY=/run/weknora-engine-controller/client.key
       - NEO4J_ENABLE=true
       - VLM_HTTP_TIMEOUT_SECONDS=1200
+    volumes:
+      - type: bind
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-client-tls}/ca.crt"
+        target: /run/weknora-engine-controller/ca.crt
+        read_only: true
+      - type: bind
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-client-tls}/backend/client.crt"
+        target: /run/weknora-engine-controller/client.crt
+        read_only: true
+      - type: bind
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-client-tls}/backend/client.key"
+        target: /run/weknora-engine-controller/client.key
+        read_only: true
     dns:
       - 100.100.100.100
       - 1.1.1.1
@@ -25,6 +43,50 @@ services:
       hcy-ingress:
         aliases:
           - weknora-app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  engine-gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.engine-gateway
+    image: weknora-engine-gateway:local
+    container_name: WeKnora-engine-gateway
+    environment:
+      - ENGINE_CONTROLLER_URL=https://host.docker.internal:18443
+      - ENGINE_CONTROLLER_CA=/run/weknora-engine-tls/ca.crt
+      - ENGINE_CONTROLLER_CERT=/run/weknora-engine-tls/client.crt
+      - ENGINE_CONTROLLER_KEY=/run/weknora-engine-tls/client.key
+      - ENGINE_GATEWAY_ID=engine-gateway
+      - ENGINE_GATEWAY_LISTEN=:18084
+      - ENGINE_CONTROLLER_TIMEOUT=130s
+      - ENGINE_LEASE_RENEW_INTERVAL=10s
+    volumes:
+      - type: bind
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-client-tls}/ca.crt"
+        target: /run/weknora-engine-tls/ca.crt
+        read_only: true
+      - type: bind
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-client-tls}/gateway/client.crt"
+        target: /run/weknora-engine-tls/client.crt
+        read_only: true
+      - type: bind
+        source: "${ENGINE_CONTROLLER_TLS_ROOT:-C:/ProgramData/WeKnora/engine-client-tls}/gateway/client.key"
+        target: /run/weknora-engine-tls/client.key
+        read_only: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    expose:
+      - "18084"
+    healthcheck:
+      test: ["CMD", "/engine-gateway", "-healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - WeKnora-network
+    restart: unless-stopped
 
   langfuse-web:
     ports: !reset []

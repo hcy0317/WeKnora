@@ -67,7 +67,31 @@
           <div class="engine-card__body">
             <div class="engine-card__header">
               <h3 class="engine-card__title">{{ getEngineDisplayName(engine.Name) }}</h3>
-              <span v-if="engine.Available" class="engine-card__status engine-card__status--on">
+              <span
+                v-if="engine.State === 'standby'"
+                class="engine-card__status engine-card__status--standby"
+              >
+                <span class="engine-card__status-dot" />
+                {{ $t('settings.parser.standby') }}
+              </span>
+              <span
+                v-else-if="engine.State === 'starting'"
+                class="engine-card__status engine-card__status--starting"
+              >
+                <span class="engine-card__status-dot" />
+                {{ $t('settings.parser.starting') }}
+              </span>
+              <t-tooltip
+                v-else-if="engine.State === 'unknown' && engine.UnavailableReason"
+                :content="engine.UnavailableReason"
+                placement="top"
+              >
+                <span class="engine-card__status engine-card__status--unknown engine-card__status--help">
+                  <span class="engine-card__status-dot" />
+                  {{ $t('settings.parser.unknown') }}
+                </span>
+              </t-tooltip>
+              <span v-else-if="engine.Available" class="engine-card__status engine-card__status--on">
                 <span class="engine-card__status-dot" />
                 {{ $t('settings.parser.available') }}
               </span>
@@ -341,6 +365,7 @@
               <t-checkbox v-model="config.paddleocr_vl_use_chart_recognition">{{ $t('settings.parser.chartRecognition') }}</t-checkbox>
             </div>
           </div>
+          <EngineLifecycleSettings group="paddleocr" />
         </section>
 
         <!-- Section 3 — paddleocr_vl_cloud 云 API 配置 -->
@@ -386,6 +411,7 @@ import { useUIStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
 import { MessagePlugin } from 'tdesign-vue-next'
 import SettingDrawer from '@/components/settings/SettingDrawer.vue'
+import EngineLifecycleSettings from '@/components/settings/EngineLifecycleSettings.vue'
 import {
   getParserEngines,
   getParserEngineConfig,
@@ -891,6 +917,19 @@ onMounted(loadAll)
     color: var(--td-error-color-7, #C93E3E);
 
     .engine-card__status-dot { background: var(--td-error-color, #C93E3E); }
+  }
+
+  &--standby,
+  &--starting {
+    color: var(--td-warning-color-7, #8a5a00);
+
+    .engine-card__status-dot { background: var(--td-warning-color, #d89b00); }
+  }
+
+  &--unknown {
+    color: var(--td-text-color-secondary);
+
+    .engine-card__status-dot { background: var(--td-text-color-placeholder); }
   }
 
   &--help {

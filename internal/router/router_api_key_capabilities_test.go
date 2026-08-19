@@ -2,6 +2,7 @@ package router
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/handler"
@@ -10,6 +11,25 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/gin-gonic/gin"
 )
+
+func TestEngineLifecycleRoutesRequireSystemAdmin(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	g := &rbacGuards{}
+	engine := gin.New()
+	RegisterSystemAdminRoutes(engine.Group("/api/v1"), &handler.SystemHandler{}, nil, g)
+
+	for _, method := range []string{http.MethodGet, http.MethodPut} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(method, "/api/v1/system/admin/engine-lifecycle", nil)
+		engine.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusForbidden {
+			t.Fatalf("%s lifecycle route returned %d, want 403", method, recorder.Code)
+		}
+	}
+	if _, ok := g.ensureAPIKeyAuthorizer().Lookup(http.MethodPut, "/api/v1/system/admin/engine-lifecycle"); ok {
+		t.Fatal("platform API keys must not update the host lifecycle config")
+	}
+}
 
 func TestConversationRoutesDeclareChatCapability(t *testing.T) {
 	gin.SetMode(gin.TestMode)

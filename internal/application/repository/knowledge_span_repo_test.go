@@ -59,6 +59,22 @@ CREATE TABLE IF NOT EXISTS knowledges (
 );
 `
 
+const knowledgeCompletionOutboxTestDDL = `
+CREATE TABLE IF NOT EXISTS knowledge_completion_outbox (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    knowledge_id      VARCHAR(64) NOT NULL,
+    attempt           INTEGER NOT NULL,
+    state             VARCHAR(16) NOT NULL DEFAULT 'pending',
+    deleted_archived  INTEGER NOT NULL DEFAULT 0,
+    classified_legacy INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT NOT NULL DEFAULT '',
+    created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at      DATETIME,
+    UNIQUE (knowledge_id, attempt)
+);
+`
+
 const wikiPendingSettlementTestDDL = `
 CREATE TABLE IF NOT EXISTS task_pending_ops (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +112,7 @@ func setupSpanTestRepo(t *testing.T) (KnowledgeSpanRepository, *gorm.DB) {
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(spansTestDDL).Error)
 	require.NoError(t, db.Exec(knowledgeSettlementTestDDL).Error)
+	require.NoError(t, db.Exec(knowledgeCompletionOutboxTestDDL).Error)
 	require.NoError(t, db.Exec(wikiPendingSettlementTestDDL).Error)
 	return NewKnowledgeSpanRepository(db), db
 }
@@ -163,6 +180,36 @@ func TestKnowledgeSpanRepo_SettleProcessingOutcomeUsesStableLogicalRetryIdentity
 	require.NoError(t, db.Table("knowledges").Where("id = ?", kid).Take(&knowledge).Error)
 	assert.Equal(t, types.ParseStatusCompleted, knowledge.ParseStatus)
 	assert.Zero(t, knowledge.PendingSubtasksCount)
+	var completionRows int64
+	require.NoError(t, db.Table("knowledge_completion_outbox").
+		Where("knowledge_id = ? AND attempt = ? AND state = ?", kid, 1, types.KnowledgeCompletionOutboxPending).
+		Count(&completionRows).Error)
+	assert.EqualValues(t, 1, completionRows, "duplicate terminal delivery must create one durable completion event")
+}
+
+func TestKnowledgeSpanRepo_CompletionOutboxFailureRollsBackBusinessCompletion(t *testing.T) {
+	repo, db := setupSpanTestRepo(t)
+	kid := "completion-outbox-rollback"
+	seedSettlementKnowledge(t, db, kid, 1)
+	for _, row := range []*types.KnowledgeProcessingSpan{
+		{KnowledgeID: kid, Attempt: 1, SpanID: "root", Name: "knowledge_processing", Kind: types.SpanKindRoot, Status: types.SpanStatusRunning},
+		{KnowledgeID: kid, Attempt: 1, SpanID: "post", ParentSpanID: "root", Name: types.StagePostProcess, Kind: types.SpanKindStage, Status: types.SpanStatusRunning, Input: types.JSONMap{
+			"expected_branches": []any{"postprocess.summary"}, "fanout_complete": true,
+		}},
+		{KnowledgeID: kid, Attempt: 1, SpanID: "summary", ParentSpanID: "post", Name: "postprocess.summary", Kind: types.SpanKindSubSpan, Status: types.SpanStatusDone},
+	} {
+		seedSettlementSpan(t, repo, row)
+	}
+	require.NoError(t, db.Exec("DROP TABLE knowledge_completion_outbox").Error)
+
+	err := repo.SettleProcessingOutcome(context.Background(), kid, 1)
+	require.ErrorContains(t, err, "persist knowledge completion event")
+
+	var parseStatus string
+	require.NoError(t, db.Table("knowledges").Select("parse_status").Where("id = ?", kid).Scan(&parseStatus).Error)
+	assert.Equal(t, types.ParseStatusFinalizing, parseStatus)
+	assert.Equal(t, types.SpanStatusRunning, settlementStatus(t, db, kid, "post"))
+	assert.Equal(t, types.SpanStatusRunning, settlementStatus(t, db, kid, "root"))
 }
 
 func TestKnowledgeSpanRepo_SettleProcessingOutcomeRejectsMissingLogicalBatch(t *testing.T) {

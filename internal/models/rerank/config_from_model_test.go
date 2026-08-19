@@ -30,3 +30,23 @@ func TestConfigFromModel(t *testing.T) {
 		t.Errorf("cloud creds mismatch: %+v", cfg)
 	}
 }
+
+func TestConfigFromModelRoutesManagedLocalRerankerThroughEngineGateway(t *testing.T) {
+	t.Setenv("WEKNORA_ENGINE_GATEWAY_URL", "http://engine-gateway:18084")
+	model := &types.Model{
+		ID:   "local-reranker",
+		Name: "Qwen/Qwen3-Reranker-0.6B",
+		Type: types.ModelTypeRerank,
+		Parameters: types.ModelParameters{
+			BaseURL: "http://accelerator-router:18083/v1",
+		},
+	}
+
+	config := ConfigFromModel(model, "", "")
+	if config.BaseURL != "http://engine-gateway:18084/reranker" {
+		t.Fatalf("managed reranker base URL = %q", config.BaseURL)
+	}
+	if !config.LifecycleManaged {
+		t.Fatal("managed reranker was not marked as lifecycle managed")
+	}
+}

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/Tencent/WeKnora/internal/engine/lifecycle"
+	enginerouting "github.com/Tencent/WeKnora/internal/engine/routing"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/provider"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -21,6 +23,23 @@ type Reranker interface {
 	// GetModelID returns the model ID
 	GetModelID() string
 }
+
+type lifecycleManagedReranker interface {
+	LifecycleManaged() bool
+}
+
+// IsLifecycleManaged reports whether failures must remain explicit because
+// backend fallback is owned by the engine lifecycle gateway itself.
+func IsLifecycleManaged(reranker Reranker) bool {
+	managed, ok := reranker.(lifecycleManagedReranker)
+	return ok && managed.LifecycleManaged()
+}
+
+type managedReranker struct {
+	Reranker
+}
+
+func (managedReranker) LifecycleManaged() bool { return true }
 
 type RankResult struct {
 	Index          int          `json:"index"`
@@ -87,9 +106,10 @@ type RerankerConfig struct {
 	Provider    string // Provider identifier: openai, aliyun, zhipu, siliconflow, jina, generic
 	ExtraConfig map[string]string
 	// CustomHeaders 允许在调用远程 API 时附加自定义 HTTP 请求头（类似 OpenAI Python SDK 的 extra_headers）。
-	CustomHeaders map[string]string
-	AppID         string
-	AppSecret     string // 加密值，工厂函数调用方传入，使用前已解密
+	CustomHeaders    map[string]string
+	AppID            string
+	AppSecret        string // 加密值，工厂函数调用方传入，使用前已解密
+	LifecycleManaged bool
 }
 
 // ConfigFromModel 根据 types.Model 构造 RerankerConfig。
@@ -99,17 +119,19 @@ func ConfigFromModel(m *types.Model, appID, appSecret string) *RerankerConfig {
 	if m == nil {
 		return nil
 	}
+	baseURL, lifecycleManaged := enginerouting.Resolve(lifecycle.GroupReranker, m.Parameters.BaseURL)
 	return &RerankerConfig{
-		ModelID:       m.ID,
-		APIKey:        m.Parameters.APIKey,
-		BaseURL:       m.Parameters.BaseURL,
-		ModelName:     m.Name,
-		Source:        m.Source,
-		Provider:      m.Parameters.Provider,
-		ExtraConfig:   m.Parameters.ExtraConfig,
-		CustomHeaders: m.Parameters.CustomHeaders,
-		AppID:         appID,
-		AppSecret:     appSecret,
+		ModelID:          m.ID,
+		APIKey:           m.Parameters.APIKey,
+		BaseURL:          baseURL,
+		ModelName:        m.Name,
+		Source:           m.Source,
+		Provider:         m.Parameters.Provider,
+		ExtraConfig:      m.Parameters.ExtraConfig,
+		CustomHeaders:    m.Parameters.CustomHeaders,
+		AppID:            appID,
+		AppSecret:        appSecret,
+		LifecycleManaged: lifecycleManaged,
 	}
 }
 
@@ -122,7 +144,14 @@ func NewReranker(config *RerankerConfig) (Reranker, error) {
 	if logger.LLMDebugEnabled() {
 		r = &debugReranker{inner: r}
 	}
-	return wrapRerankerLangfuse(r, nil)
+	r, err = wrapRerankerLangfuse(r, nil)
+	if err != nil {
+		return r, err
+	}
+	if config.LifecycleManaged {
+		r = &managedReranker{Reranker: r}
+	}
+	return r, nil
 }
 
 // customHeaderSetter 表示支持注入自定义 HTTP header 的 reranker 实现。

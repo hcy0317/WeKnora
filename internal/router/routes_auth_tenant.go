@@ -267,6 +267,12 @@ func RegisterSystemAdminRoutes(
 		adminRoutes.POST("/api-keys", handler.CreatePlatformAPIKey)
 		adminRoutes.DELETE("/api-keys/:key_id", handler.DeletePlatformAPIKey)
 
+		// Host engine lifecycle policy. These routes intentionally do not
+		// register an API-key capability: only an authenticated SystemAdmin
+		// browser session may view or mutate the host-owned YAML policy.
+		adminRoutes.GET("/engine-lifecycle", handler.GetEngineLifecycle)
+		adminRoutes.PUT("/engine-lifecycle", handler.UpdateEngineLifecycle)
+
 		// P1: platform-wide system settings (DB-backed runtime tunables).
 		// Reads return raw model rows / arrays (no `gin.H{"data":...}`
 		// wrapping), matching the project's axios interceptor convention
