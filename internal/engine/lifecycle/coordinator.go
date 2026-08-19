@@ -242,8 +242,7 @@ func (c *Coordinator) Acquire(ctx context.Context, group Group, request AcquireR
 					RetryAfter: retryAfter,
 				}
 			}
-			groupState.cooldownUntil = nil
-			groupState.state = StateStopped
+			c.normalizeExpiredFailureLocked(groupState)
 		}
 		if groupState.state == StateReady || groupState.state == StateBusy || groupState.state == StateDraining {
 			waited := time.Duration(0)
@@ -870,6 +869,7 @@ func (c *Coordinator) Snapshot(group Group) (GroupSnapshot, error) {
 	}
 	groupState.mu.Lock()
 	defer groupState.mu.Unlock()
+	c.normalizeExpiredFailureLocked(groupState)
 	return GroupSnapshot{
 		Group:               group,
 		State:               groupState.state,
@@ -880,4 +880,13 @@ func (c *Coordinator) Snapshot(group Group) (GroupSnapshot, error) {
 		Shadow:              len(groupState.shadow),
 		GPUAdmissionAllowed: c.gpuAdmissionAllowed(group),
 	}, nil
+}
+
+func (c *Coordinator) normalizeExpiredFailureLocked(groupState *groupCoordinator) {
+	if groupState.state != StateFailed || groupState.cooldownUntil == nil ||
+		c.clock.Now().Before(*groupState.cooldownUntil) {
+		return
+	}
+	groupState.cooldownUntil = nil
+	groupState.state = StateStopped
 }

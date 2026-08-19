@@ -396,6 +396,10 @@ func TestCoordinatorAppliesCooldownOnlyAfterRealStartFailure(t *testing.T) {
 	require.Equal(t, int32(1), runtime.starts.Load())
 
 	clock.Advance(5 * time.Minute)
+	snapshot, err := coordinator.Snapshot(GroupPaddleOCR)
+	require.NoError(t, err)
+	require.Equal(t, StateStopped, snapshot.State, "expired failures must not remain unavailable on passive reads")
+
 	lease, err := coordinator.Acquire(context.Background(), GroupPaddleOCR, AcquireRequest{
 		RequestID: "after-cooldown",
 		GatewayID: "gateway-1",
