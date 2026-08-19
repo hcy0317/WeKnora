@@ -294,6 +294,11 @@ func (c *Coordinator) Acquire(ctx context.Context, group Group, request AcquireR
 		case <-attempt.done:
 			groupState.mu.Lock()
 			groupState.pending--
+			if acquireErr := ctx.Err(); acquireErr != nil {
+				c.markIdleIfUnusedLocked(groupState)
+				groupState.mu.Unlock()
+				return Lease{}, acquireErr
+			}
 			if attempt.err != nil {
 				groupState.mu.Unlock()
 				return Lease{}, attempt.err
@@ -310,6 +315,7 @@ func (c *Coordinator) Acquire(ctx context.Context, group Group, request AcquireR
 		case <-ctx.Done():
 			groupState.mu.Lock()
 			groupState.pending--
+			c.markIdleIfUnusedLocked(groupState)
 			groupState.mu.Unlock()
 			return Lease{}, ctx.Err()
 		}
@@ -512,6 +518,15 @@ func (c *Coordinator) issueLeaseLocked(
 	groupState.state = StateBusy
 	c.leaseGroups.Store(lease.ID, group)
 	return lease
+}
+
+func (c *Coordinator) markIdleIfUnusedLocked(groupState *groupCoordinator) {
+	if groupState.state != StateReady || groupState.idleSince != nil ||
+		groupState.leaseCountLocked() != 0 || groupState.pending != 0 {
+		return
+	}
+	now := c.clock.Now()
+	groupState.idleSince = &now
 }
 
 type ReleaseReason string

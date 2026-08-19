@@ -13,6 +13,7 @@ import (
 
 type blockingRuntime struct {
 	starts       atomic.Int32
+	stops        atomic.Int32
 	startEntered chan struct{}
 	allowReady   chan struct{}
 	enteredOnce  sync.Once
@@ -29,7 +30,10 @@ func (r *blockingRuntime) Start(ctx context.Context, _ Group) (Backend, error) {
 	}
 }
 
-func (r *blockingRuntime) Stop(context.Context, Group) error { return nil }
+func (r *blockingRuntime) Stop(context.Context, Group) error {
+	r.stops.Add(1)
+	return nil
+}
 
 type manualClock struct {
 	mu  sync.Mutex
@@ -269,6 +273,53 @@ func TestCoordinatorStopsOnDemandGroupAfterFullIdlePeriod(t *testing.T) {
 	require.NoError(t, coordinator.SweepIdle(context.Background()))
 	require.Equal(t, int32(1), runtime.stops.Load())
 	snapshot, err = coordinator.Snapshot(GroupASR)
+	require.NoError(t, err)
+	require.Equal(t, StateStopped, snapshot.State)
+}
+
+func TestCoordinatorStartsIdleClockWhenColdStartCallerCancels(t *testing.T) {
+	t.Parallel()
+
+	clock := &manualClock{now: time.Date(2026, 8, 18, 12, 30, 0, 0, time.UTC)}
+	runtime := &blockingRuntime{
+		startEntered: make(chan struct{}),
+		allowReady:   make(chan struct{}),
+	}
+	coordinator, err := NewCoordinator(testConfig(), runtime, WithClock(clock))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan struct {
+		lease Lease
+		err   error
+	}, 1)
+	go func() {
+		lease, acquireErr := coordinator.Acquire(ctx, GroupASR, AcquireRequest{
+			RequestID: "canceled-cold-start",
+			GatewayID: "gateway-1",
+			Purpose:   "transcribe",
+		})
+		result <- struct {
+			lease Lease
+			err   error
+		}{lease: lease, err: acquireErr}
+	}()
+
+	select {
+	case <-runtime.startEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime start was not called")
+	}
+	cancel()
+	close(runtime.allowReady)
+	acquireResult := <-result
+	require.ErrorIs(t, acquireResult.err, context.Canceled)
+	require.Empty(t, acquireResult.lease.ID)
+
+	clock.Advance(10 * time.Minute)
+	require.NoError(t, coordinator.SweepIdle(context.Background()))
+	require.Equal(t, int32(1), runtime.stops.Load())
+	snapshot, err := coordinator.Snapshot(GroupASR)
 	require.NoError(t, err)
 	require.Equal(t, StateStopped, snapshot.State)
 }
