@@ -1591,8 +1591,17 @@ func (s *wikiIngestService) mapOneDocument(
 		if restoreErr != nil {
 			return nil, nil, restoreErr
 		}
+		if err := s.markWikiGenerationFragmentsSucceeded(ctx, workUnit.WorkID); err != nil {
+			return nil, nil, fmt.Errorf("settle restored wiki generation fragments: %w", err)
+		}
 		logger.Infof(ctx, "wiki ingest: reusing mapped work unit %s for knowledge %s", workUnit.WorkID, knowledgeID)
 		return result, updates, nil
+	}
+	if workUnit != nil {
+		ctx = withWikiGenerationScope(ctx, wikiGenerationScope{
+			TenantID: payload.TenantID, KnowledgeBaseID: payload.KnowledgeBaseID,
+			WorkRevision: workUnit.WorkID, RuntimeSnapshot: workUnit.RuntimeSnapshotKey,
+		})
 	}
 
 	content := reconstructEnrichedContent(ctx, s.chunkRepo, payload.TenantID, chunks)
@@ -2016,6 +2025,9 @@ func (s *wikiIngestService) mapOneDocument(
 	if workUnit != nil {
 		if err := s.persistWikiMappedCheckpoint(ctx, workUnit, result, updates); err != nil {
 			return nil, nil, fmt.Errorf("persist wiki mapped checkpoint: %w", err)
+		}
+		if err := s.markWikiGenerationFragmentsSucceeded(ctx, workUnit.WorkID); err != nil {
+			return nil, nil, fmt.Errorf("settle wiki generation fragments: %w", err)
 		}
 	}
 	return result, updates, nil
@@ -2479,6 +2491,13 @@ func (s *wikiIngestService) reduceSlugUpdates(
 
 		var updatedContent string
 		pageCtx := withWikiGenerationSpan(ctx, pageSpan)
+		if application != nil {
+			pageCtx = withWikiGenerationScope(pageCtx, wikiGenerationScope{
+				TenantID: tenantID, KnowledgeBaseID: kbID,
+				WorkRevision:    application.PlanID,
+				RuntimeSnapshot: wikiRuntimeSnapshotDigest(chatModel, language),
+			})
+		}
 		updatedContent, err = s.generateWithTemplate(pageCtx, chatModel, agent.WikiPageModifyUserPrompt, map[string]string{
 			"HasAdditions":            hasAdditionsStr,
 			"HasRetractions":          hasRetractionsStr,
@@ -2581,7 +2600,16 @@ func (s *wikiIngestService) persistReducedWikiPageApplication(
 	if err != nil {
 		return nil, fmt.Errorf("checkpoint wiki page %s before persist: %w", page.Slug, err)
 	}
-	return s.persistReducedWikiPage(checkpointCtx, kbID, updates, page, exists)
+	saved, err := s.persistReducedWikiPage(checkpointCtx, kbID, updates, page, exists)
+	if err != nil {
+		return nil, err
+	}
+	if application != nil {
+		if err := s.markWikiGenerationFragmentsSucceeded(checkpointCtx, application.PlanID); err != nil {
+			return nil, fmt.Errorf("settle wiki page generation %s: %w", page.Slug, err)
+		}
+	}
+	return saved, nil
 }
 
 // persistReducedWikiPage gives the already-generated page one bounded commit

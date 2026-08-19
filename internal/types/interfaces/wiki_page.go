@@ -2,6 +2,7 @@ package interfaces
 
 import (
 	"context"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 )
@@ -424,4 +425,18 @@ type WikiIngestCheckpointStore interface {
 	FindWikiSlugApplication(ctx context.Context, tenantID uint64, knowledgeBaseID, slug, contributionKey string) (*types.WikiSlugApplication, error)
 	MarkWikiSlugApplicationApplying(ctx context.Context, planID, generatedOutput string) error
 	ListWikiSlugContributionMarkers(ctx context.Context, workIDs []string) ([]types.WikiSlugContributionMarker, error)
+}
+
+// WikiGenerationFragmentStore fences and persists every potentially-paid Wiki
+// model call independently from the larger map/reduce checkpoints.
+type WikiGenerationFragmentStore interface {
+	ReserveWikiGenerationFragment(
+		ctx context.Context, candidate *types.WikiGenerationFragment,
+		callID string, leaseUntil time.Time, maxAttempts int,
+	) (*types.WikiGenerationFragment, bool, error)
+	CompleteWikiGenerationFragment(ctx context.Context, fragmentID, callID, output string) error
+	ReleaseWikiGenerationFragment(ctx context.Context, fragmentID, callID, lastError string, terminal bool) error
+	MarkWikiGenerationFragmentAmbiguous(ctx context.Context, fragmentID, callID, lastError string) error
+	ListWikiGenerationFragments(ctx context.Context, workRevision string) ([]types.WikiGenerationFragment, error)
+	MarkWikiGenerationFragmentsSucceeded(ctx context.Context, workRevision string) error
 }

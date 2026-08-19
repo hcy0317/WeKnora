@@ -382,6 +382,7 @@ func TestPartialWikiRetryRealRepositoryChainRestoresMappedWorkWithoutModelCall(t
 		&types.Knowledge{}, &types.KnowledgeProcessingSpan{}, &types.TaskPendingOp{},
 		&types.WikiIngestWorkUnit{}, &types.WikiTaxonomyPlan{},
 		&types.WikiSlugApplication{}, &types.WikiSlugContributionMarker{},
+		&types.WikiGenerationFragment{},
 	))
 	require.NoError(t, db.Exec(`CREATE UNIQUE INDEX uq_test_span_identity
 		ON knowledge_processing_spans (knowledge_id, attempt, span_id)`).Error)

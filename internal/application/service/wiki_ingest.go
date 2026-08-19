@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
@@ -2543,6 +2544,15 @@ func (s *wikiIngestService) rebuildIndexPage(ctx context.Context, chatModel chat
 	if idx := strings.Index(existingIntro, "\n## "); idx >= 0 {
 		existingIntro = strings.TrimSpace(existingIntro[:idx])
 	}
+	indexWorkRevision := wikiCheckpointDigest(
+		"index", indexPage.ID, strconv.Itoa(indexPage.Version), existingIntro,
+		changeDesc, lang, customInstructions,
+	)
+	ctx = withWikiGenerationScope(ctx, wikiGenerationScope{
+		TenantID: payload.TenantID, KnowledgeBaseID: payload.KnowledgeBaseID,
+		WorkRevision:    indexWorkRevision,
+		RuntimeSnapshot: wikiRuntimeSnapshotDigest(chatModel, lang),
+	})
 
 	var intro string
 	switch {
@@ -2621,8 +2631,13 @@ func (s *wikiIngestService) rebuildIndexPage(ctx context.Context, chatModel chat
 
 	indexPage.Content = intro
 	indexPage.Summary = intro
-	_, err := s.wikiService.UpdatePage(ctx, indexPage)
-	return err
+	if _, err := s.wikiService.UpdatePage(ctx, indexPage); err != nil {
+		return err
+	}
+	if err := s.markWikiGenerationFragmentsSucceeded(ctx, indexWorkRevision); err != nil {
+		return fmt.Errorf("settle wiki index generation: %w", err)
+	}
+	return nil
 }
 
 // splitSummaryLine extracts the "SUMMARY: ..." line from LLM output.
@@ -3078,14 +3093,21 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 	ctx = types.WithLLMCallMetadata(ctx, purpose, prefixFingerprint)
 
 	tenantID, tenantScoped := types.TenantIDFromContext(ctx)
-	requestJSON, _ := json.Marshal(struct {
+	requestJSON, err := json.Marshal(struct {
 		Messages []chat.Message    `json:"messages"`
 		Options  *chat.ChatOptions `json:"options"`
 	}{Messages: messages, Options: opts})
+	if err != nil {
+		return "", fmt.Errorf("encode wiki generation request: %w", err)
+	}
 	requestKey := chat.BuildPromptCacheKey(
 		tenantID, chatModel.GetModelID(), "wiki_exact_request",
 		chat.FingerprintPromptPrefix(string(requestJSON)),
 	)
+	ledger, err := s.prepareWikiGenerationLedger(ctx, purpose, requestJSON, chatModel)
+	if err != nil {
+		return "", err
+	}
 
 	execute := func() (interface{}, error) {
 		releaseWarmup := func() {}
@@ -3103,6 +3125,17 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 			attemptTimeout, budgetErr := wikiLLMAttemptBudget(ctx, wikiLLMMaxAttempts-attempt+1)
 			if budgetErr != nil {
 				return "", budgetErr
+			}
+			var reserved *types.WikiGenerationFragment
+			if ledger != nil {
+				var granted bool
+				reserved, granted, budgetErr = ledger.reserve(ctx, attemptTimeout)
+				if budgetErr != nil {
+					return "", budgetErr
+				}
+				if !granted {
+					return reserved.Output, nil
+				}
 			}
 			attemptCtx, cancelAttempt := context.WithTimeout(ctx, attemptTimeout)
 			response, callErr := callWikiLLMWithFallbacks(
@@ -3124,6 +3157,9 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 						errors.New("wiki LLM returned empty response content"),
 					)
 				} else {
+					if ledgerErr := ledger.complete(ctx, reserved, response.Content); ledgerErr != nil {
+						return "", ledgerErr
+					}
 					return response.Content, nil
 				}
 			}
@@ -3134,6 +3170,11 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 				)
 			}
 			lastErr = callErr
+			if ledger != nil {
+				if settleErr := ledger.settleFailure(ctx, reserved, callErr); settleErr != nil {
+					return "", settleErr
+				}
+			}
 
 			if !isTransientLLMError(ctx, callErr) {
 				return "", fmt.Errorf("LLM call failed: %w", callErr)
