@@ -19,6 +19,8 @@ import (
 	"github.com/Tencent/WeKnora/internal/application/service/file"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/database"
+	"github.com/Tencent/WeKnora/internal/engine/lifecycle"
+	enginerouting "github.com/Tencent/WeKnora/internal/engine/routing"
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -66,6 +68,10 @@ type SystemHandler struct {
 	// engineLifecycleClient is injected by focused tests. Production requests
 	// construct the mTLS client from mounted backend-only certificate files.
 	engineLifecycleClient engineLifecycleClient
+	// paddleOCRVLProbe is injectable so handler tests can prove passive lists
+	// never perform an HTTP probe. Production uses the context-aware gateway
+	// probe below.
+	paddleOCRVLProbe func(context.Context, string) (bool, string)
 	// startup snapshot for GET /system/capabilities; bound in router.NewRouter.
 	deploymentCapabilities DeploymentCapabilitiesData
 }
@@ -418,7 +424,9 @@ func (h *SystemHandler) ListParserEngines(c *gin.Context) {
 	reader, docreaderAddr, docreaderTransport := h.resolveDocReader(c.Request.Context(), overrides)
 	connected := reader != nil && reader.IsConnected()
 	remoteEngines := h.fetchRemoteEngines(c.Request.Context(), reader, overrides)
-	engines := docparser.ListAllEngines(connected, overrides, remoteEngines)
+	engines := docparser.ListAllEnginesWithOptions(
+		connected, overrides, remoteEngines, h.passiveParserEngineListOptions(c.Request.Context(), overrides),
+	)
 	c.JSON(200, gin.H{"code": 0, "msg": "success", "data": engines, "docreader_addr": docreaderAddr, "docreader_transport": docreaderTransport, "connected": connected})
 }
 
@@ -477,7 +485,9 @@ func (h *SystemHandler) ReconnectDocReader(c *gin.Context) {
 		}
 	}
 	remoteEngines := h.fetchRemoteEngines(c.Request.Context(), h.documentReader, overrides)
-	engines := docparser.ListAllEngines(true, overrides, remoteEngines)
+	engines := docparser.ListAllEnginesWithOptions(
+		true, overrides, remoteEngines, h.passiveParserEngineListOptions(c.Request.Context(), overrides),
+	)
 
 	_, docreaderTransport := h.getDocReaderConnInfo()
 	c.JSON(200, gin.H{"code": 0, "msg": "连接成功", "data": engines, "docreader_addr": addr, "docreader_transport": docreaderTransport, "connected": true})
@@ -519,8 +529,109 @@ func (h *SystemHandler) CheckParserEngines(c *gin.Context) {
 	reader, docreaderAddr, docreaderTransport := h.resolveDocReader(c.Request.Context(), overrides)
 	connected := reader != nil && reader.IsConnected()
 	remoteEngines := h.fetchRemoteEngines(c.Request.Context(), reader, overrides)
-	engines := docparser.ListAllEngines(connected, overrides, remoteEngines)
+	engines := docparser.ListAllEnginesWithOptions(
+		connected, overrides, remoteEngines, h.activeParserEngineListOptions(c.Request.Context(), overrides),
+	)
 	c.JSON(200, gin.H{"code": 0, "msg": "success", "data": engines, "docreader_addr": docreaderAddr, "docreader_transport": docreaderTransport, "connected": connected})
+}
+
+const parserEngineProbeTransportGrace = 5 * time.Second
+
+func (h *SystemHandler) passiveParserEngineListOptions(
+	ctx context.Context,
+	overrides map[string]string,
+) docparser.EngineListOptions {
+	_, managed := managedPaddleEndpoint(overrides)
+	if !managed {
+		return docparser.EngineListOptions{}
+	}
+	client, err := h.lifecycleClient()
+	if err != nil {
+		return paddleEngineListOptions(false, types.ParserEngineStateUnknown, "引擎生命周期控制器不可读")
+	}
+	config, err := client.GetConfig(ctx)
+	if err != nil {
+		return paddleEngineListOptions(false, types.ParserEngineStateUnknown, "引擎生命周期控制器不可读")
+	}
+	policy, err := config.PolicyFor(lifecycle.GroupPaddleOCR)
+	if err != nil {
+		return paddleEngineListOptions(false, types.ParserEngineStateUnknown, "PaddleOCR-VL 生命周期配置无效")
+	}
+	snapshot, err := client.GetGroupStatus(ctx, lifecycle.GroupPaddleOCR)
+	if err != nil {
+		return paddleEngineListOptions(false, types.ParserEngineStateUnknown, "PaddleOCR-VL 生命周期状态不可读")
+	}
+
+	switch snapshot.State {
+	case lifecycle.StateReady, lifecycle.StateBusy, lifecycle.StateDraining:
+		return paddleEngineListOptions(true, types.ParserEngineStateReady, "")
+	case lifecycle.StateStarting:
+		return paddleEngineListOptions(true, types.ParserEngineStateStarting, "")
+	case lifecycle.StateStopped, lifecycle.StateStopping:
+		if policy.Mode == lifecycle.ModeOnDemand {
+			return paddleEngineListOptions(true, types.ParserEngineStateStandby, "")
+		}
+		return paddleEngineListOptions(false, types.ParserEngineStateUnavailable, "PaddleOCR-VL 配置为始终运行但当前已停止")
+	case lifecycle.StateFailed:
+		return paddleEngineListOptions(false, types.ParserEngineStateUnavailable, "PaddleOCR-VL 生命周期控制器报告启动失败")
+	default:
+		return paddleEngineListOptions(false, types.ParserEngineStateUnknown, "PaddleOCR-VL 生命周期状态未知")
+	}
+}
+
+func (h *SystemHandler) activeParserEngineListOptions(
+	ctx context.Context,
+	overrides map[string]string,
+) docparser.EngineListOptions {
+	endpoint, managed := managedPaddleEndpoint(overrides)
+	if !managed {
+		return docparser.EngineListOptions{}
+	}
+	client, err := h.lifecycleClient()
+	if err != nil {
+		return paddleEngineListOptions(false, types.ParserEngineStateUnknown, "引擎生命周期控制器不可读")
+	}
+	config, err := client.GetConfig(ctx)
+	if err != nil {
+		return paddleEngineListOptions(false, types.ParserEngineStateUnknown, "引擎生命周期控制器不可读")
+	}
+	policy, err := config.PolicyFor(lifecycle.GroupPaddleOCR)
+	if err != nil {
+		return paddleEngineListOptions(false, types.ParserEngineStateUnknown, "PaddleOCR-VL 生命周期配置无效")
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, policy.StartupTimeout+parserEngineProbeTransportGrace)
+	defer cancel()
+	probe := h.paddleOCRVLProbe
+	if probe == nil {
+		probe = docparser.PingPaddleOCRVLContext
+	}
+	available, reason := probe(probeCtx, endpoint)
+	if available {
+		return paddleEngineListOptions(true, types.ParserEngineStateReady, "")
+	}
+	return paddleEngineListOptions(false, types.ParserEngineStateUnavailable, reason)
+}
+
+func managedPaddleEndpoint(overrides map[string]string) (string, bool) {
+	endpoint := strings.TrimSpace(overrides["paddleocr_vl_endpoint"])
+	if endpoint == "" {
+		return "", false
+	}
+	return enginerouting.Resolve(lifecycle.GroupPaddleOCR, endpoint)
+}
+
+func paddleEngineListOptions(
+	available bool,
+	state types.ParserEngineState,
+	reason string,
+) docparser.EngineListOptions {
+	return docparser.EngineListOptions{PassiveAvailability: map[string]types.ParserEngineInfo{
+		docparser.PaddleOCRVLEngineName: {
+			Available:         available,
+			UnavailableReason: reason,
+			State:             state,
+		},
+	}}
 }
 
 func (h *SystemHandler) resolveDocReader(ctx context.Context, overrides map[string]string) (interfaces.DocumentReader, string, string) {

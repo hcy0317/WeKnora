@@ -527,6 +527,15 @@ func (c *PaddleOCRVLReader) processImages(
 
 // PingPaddleOCRVL checks whether a self-hosted PaddleOCR-VL service is reachable.
 func PingPaddleOCRVL(endpoint string) (bool, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return PingPaddleOCRVLContext(ctx, endpoint)
+}
+
+// PingPaddleOCRVLContext probes the managed gateway with the caller's startup
+// budget. The gateway owns cold-start acquisition and releases its temporary
+// lease when this request completes.
+func PingPaddleOCRVLContext(ctx context.Context, endpoint string) (bool, string) {
 	endpoint, _ = enginerouting.Resolve(lifecycle.GroupPaddleOCR, endpoint)
 	endpoint = strings.TrimRight(endpoint, "/")
 	if endpoint == "" {
@@ -535,19 +544,34 @@ func PingPaddleOCRVL(endpoint string) (bool, string) {
 	if err := utils.ValidateURLForSSRF(endpoint); err != nil {
 		return false, fmt.Sprintf("PaddleOCR-VL 端点未通过 SSRF 校验: %v", err)
 	}
+	timeout := 5 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+		if timeout <= 0 {
+			return false, "PaddleOCR-VL 启动或健康检查超时"
+		}
+	}
 	client := utils.NewSSRFSafeHTTPClient(utils.SSRFSafeHTTPClientConfig{
-		Timeout:      5 * time.Second,
+		Timeout:      timeout,
 		MaxRedirects: 5,
 	})
-	return pingPaddleOCRVL(endpoint, client)
+	return pingPaddleOCRVLContext(ctx, endpoint, client)
 }
 
 func pingPaddleOCRVL(endpoint string, client *http.Client) (bool, string) {
+	return pingPaddleOCRVLContext(context.Background(), endpoint, client)
+}
+
+func pingPaddleOCRVLContext(ctx context.Context, endpoint string, client *http.Client) (bool, string) {
 	healthURL, err := paddleOCRVLRequestURL(endpoint, "/health")
 	if err != nil {
 		return false, "PaddleOCR-VL 端点格式无效"
 	}
-	resp, err := client.Get(healthURL)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if err != nil {
+		return false, "PaddleOCR-VL 端点格式无效"
+	}
+	resp, err := client.Do(request)
 	if err != nil {
 		return false, fmt.Sprintf("PaddleOCR-VL 服务不可达: %v", paddleOCRVLTransportError(err))
 	}
@@ -566,7 +590,11 @@ func pingPaddleOCRVL(endpoint string, client *http.Client) (bool, string) {
 	if err != nil {
 		return false, "PaddleOCR-VL 端点格式无效"
 	}
-	resp, err = client.Get(layoutURL)
+	request, err = http.NewRequestWithContext(ctx, http.MethodGet, layoutURL, nil)
+	if err != nil {
+		return false, "PaddleOCR-VL 端点格式无效"
+	}
+	resp, err = client.Do(request)
 	if err != nil {
 		return false, fmt.Sprintf("PaddleOCR-VL 服务不可达: %v", paddleOCRVLTransportError(err))
 	}

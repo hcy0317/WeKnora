@@ -47,7 +47,18 @@ type ParserEngineInfo struct {
 	FileTypes         []string
 	Available         bool
 	UnavailableReason string
+	State             ParserEngineState
 }
+
+type ParserEngineState string
+
+const (
+	ParserEngineStateReady       ParserEngineState = "ready"
+	ParserEngineStateStandby     ParserEngineState = "standby"
+	ParserEngineStateStarting    ParserEngineState = "starting"
+	ParserEngineStateUnavailable ParserEngineState = "unavailable"
+	ParserEngineStateUnknown     ParserEngineState = "unknown"
+)
 
 // --- Internal types used by chunking pipeline ---
 
