@@ -1791,7 +1791,9 @@ const processConfigLines = computed<string[]>(() => {
                  scrolls away or fights position:sticky inside overflow. -->
             <div v-if="showRuler" class="kp-ruler">
               <div class="kp-ruler-spacer-name" />
-              <div class="kp-ruler-spacer-meta" />
+              <div class="kp-ruler-spacer-kind" />
+              <div class="kp-ruler-spacer-duration" />
+              <div class="kp-ruler-spacer-action" />
               <div class="kp-ruler-track">
                 <span v-for="(tick, i) in rulerTicks" :key="i" class="kp-tick"
                   :class="{ 'kp-tick-first': i === 0, 'kp-tick-last': i === rulerTicks.length - 1 }"
@@ -1828,21 +1830,11 @@ const processConfigLines = computed<string[]>(() => {
                     <span class="kp-name-text"
                       :class="{ 'kp-name-root': row.isRoot, 'kp-name-mono': !row.isRoot && !row.isStage }">{{
                         rowLabel(row) }}</span>
-                    <span class="kp-name-kind">{{ rowKindLabel(row) }}</span>
-                    <t-popconfirm v-if="rowCanRetry(row)"
-                      :content="t('knowledgeStages.retryItemConfirm', { name: row.node.name })"
-                      :confirm-btn="{ content: t('knowledgeStages.retryItem'), theme: 'primary' }"
-                      :cancel-btn="{ content: t('common.cancel') }"
-                      :popup-props="{ attach: 'body', zIndex: 2300 }" placement="bottom-right"
-                      @confirm="onRetrySpan(row.node)">
-                      <button type="button" class="kp-row-retry" :class="{ 'kp-row-retry-loading': spanRetrying(row.node.span_id) }"
-                        :disabled="mutationBusy" :aria-label="`${t('knowledgeStages.retryItem')}：${row.node.name}`"
-                        @click.stop>
-                        <t-icon name="refresh" size="14px" />
-                        <span>{{ t('knowledgeStages.retryItem') }}</span>
-                      </button>
-                    </t-popconfirm>
                   </div>
+                </div>
+
+                <div class="kp-cell-kind">
+                  <span class="kp-name-kind">{{ rowKindLabel(row) }}</span>
                 </div>
 
                 <div class="kp-cell-dur kp-mono">
@@ -1852,6 +1844,23 @@ const processConfigLines = computed<string[]>(() => {
                   <template v-else>
                     {{ formatSpanDuration(row.node) }}
                   </template>
+                </div>
+
+                <div class="kp-cell-action">
+                  <t-popconfirm v-if="rowCanRetry(row)"
+                    :content="t('knowledgeStages.retryItemConfirm', { name: row.node.name })"
+                    :confirm-btn="{ content: t('knowledgeStages.retryItem'), theme: 'primary' }"
+                    :cancel-btn="{ content: t('common.cancel') }"
+                    :popup-props="{ attach: 'body', zIndex: 2300 }" placement="bottom-right"
+                    @confirm="onRetrySpan(row.node)">
+                    <button type="button" class="kp-row-retry"
+                      :class="{ 'kp-row-retry-loading': spanRetrying(row.node.span_id) }"
+                      :disabled="mutationBusy" :aria-label="`${t('knowledgeStages.retryItem')}：${row.node.name}`"
+                      @click.stop>
+                      <t-icon name="refresh" size="14px" />
+                      <span>{{ t('knowledgeStages.retryItem') }}</span>
+                    </button>
+                  </t-popconfirm>
                 </div>
 
                 <div class="kp-cell-bar">
@@ -2590,7 +2599,7 @@ const processConfigLines = computed<string[]>(() => {
 .kp-ruler {
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: minmax(220px, 42%) 64px 1fr;
+  grid-template-columns: minmax(220px, 34%) minmax(64px, 9%) 64px 96px minmax(160px, 1fr);
   height: 24px;
   align-items: end;
   padding: 12px 20px 6px;
@@ -2600,7 +2609,9 @@ const processConfigLines = computed<string[]>(() => {
 }
 
 .kp-ruler-spacer-name,
-.kp-ruler-spacer-meta {
+.kp-ruler-spacer-kind,
+.kp-ruler-spacer-duration,
+.kp-ruler-spacer-action {
   height: 100%;
 }
 
@@ -2651,7 +2662,7 @@ const processConfigLines = computed<string[]>(() => {
 
 .kp-row {
   display: grid;
-  grid-template-columns: minmax(220px, 42%) 64px 1fr;
+  grid-template-columns: minmax(220px, 34%) minmax(64px, 9%) 64px 96px minmax(160px, 1fr);
   align-items: center;
   min-height: 36px;
   cursor: pointer;
@@ -2712,6 +2723,7 @@ const processConfigLines = computed<string[]>(() => {
   gap: 7px;
   min-width: 0;
   width: 100%;
+  box-sizing: border-box;
 }
 
 .kp-tree-toggle {
@@ -2790,6 +2802,8 @@ const processConfigLines = computed<string[]>(() => {
 }
 
 .kp-name-text {
+  flex: 1 1 auto;
+  min-width: 0;
   font-size: 12px;
   color: var(--td-text-color-primary);
   overflow: hidden;
@@ -2813,9 +2827,23 @@ const processConfigLines = computed<string[]>(() => {
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--td-text-color-placeholder);
-  margin-left: auto;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kp-cell-kind {
+  min-width: 0;
+  padding: 0 8px;
+}
+
+.kp-cell-action {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
   padding-left: 8px;
-  flex-shrink: 0;
 }
 
 /* Duration cell */
@@ -3636,10 +3664,20 @@ const processConfigLines = computed<string[]>(() => {
   }
 
   .kp-row {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "name action";
     padding-inline: 12px;
   }
 
+  .kp-cell-name {
+    grid-area: name;
+  }
+
+  .kp-cell-action {
+    grid-area: action;
+  }
+
+  .kp-cell-kind,
   .kp-cell-dur,
   .kp-cell-bar {
     display: none;

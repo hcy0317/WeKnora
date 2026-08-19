@@ -93,6 +93,16 @@ test('retry controls are keyboard reachable, 36px minimum, themed, and escape th
   assert.match(source, /@media \(max-width: 760px\)/)
 })
 
+test('trace rows reserve independent kind, duration, action, and timeline columns', () => {
+  assert.match(source, /grid-template-columns:\s*minmax\(220px, 34%\)\s+minmax\(64px, 9%\)\s+64px\s+96px\s+minmax\(160px, 1fr\)/)
+  assert.match(source, /class="kp-cell-kind"/)
+  assert.match(source, /class="kp-cell-action"/)
+  assert.match(source, /class="kp-ruler-spacer-action"/)
+  assert.match(source, /\.kp-cell-action\s*{[^}]*justify-content:\s*flex-end/s)
+  assert.match(source, /@media \(max-width: 760px\)[\s\S]*grid-template-areas:\s*"name action"/)
+  assert.match(source, /@media \(max-width: 760px\)[\s\S]*\.kp-cell-kind,[\s\S]*\.kp-cell-dur,[\s\S]*\.kp-cell-bar\s*{\s*display:\s*none/s)
+})
+
 test('uses attempt-aware live state and terminal duration fallback', () => {
   assert.match(source, /isKnowledgeTraceClockLive\(/)
   assert.match(source, /resolvedKnowledgeSpanDurationMs\(/)

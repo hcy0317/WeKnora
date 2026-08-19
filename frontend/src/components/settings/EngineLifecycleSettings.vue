@@ -50,9 +50,9 @@
       </div>
 
       <div v-else-if="draftInitialized" class="engine-lifecycle__form">
-        <div class="form-item">
+        <div class="form-item engine-lifecycle__mode">
           <label class="form-label">{{ t('settings.engineLifecycle.mode') }}</label>
-          <t-radio-group v-model="mode" variant="default-filled">
+          <t-radio-group v-model="mode" class="engine-lifecycle__mode-control" variant="outline">
             <t-radio-button value="on_demand">
               {{ t('settings.engineLifecycle.onDemand') }}
             </t-radio-button>
@@ -288,6 +288,76 @@ watch(
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.engine-lifecycle__mode {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.engine-lifecycle__mode > .form-label {
+  width: 100%;
+  margin: 0;
+  text-align: center;
+}
+
+.engine-lifecycle__mode-control {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-default);
+  background: var(--td-bg-color-container);
+}
+
+.engine-lifecycle__mode-control :deep(.t-radio-button) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 0 !important;
+  border-radius: 0;
+  background: var(--td-bg-color-container);
+  color: var(--td-text-color-primary);
+  box-sizing: border-box;
+  transition: background-color 150ms ease, color 150ms ease;
+}
+
+.engine-lifecycle__mode-control :deep(.t-radio-button + .t-radio-button) {
+  border-left: 1px solid var(--td-component-stroke) !important;
+}
+
+.engine-lifecycle__mode-control :deep(.t-radio-button:hover:not(.t-is-disabled):not(.t-is-checked)) {
+  background: var(--td-bg-color-container-hover);
+  color: var(--td-brand-color);
+}
+
+.engine-lifecycle__mode-control :deep(.t-radio-button.t-is-checked) {
+  background: var(--td-brand-color);
+  color: var(--td-text-color-anti);
+}
+
+.engine-lifecycle__mode-control :deep(.t-radio-button.t-is-checked > span),
+.engine-lifecycle__mode-control :deep(.t-radio-button.t-is-checked .t-radio-button__label) {
+  background: transparent;
+  color: inherit;
+}
+
+.engine-lifecycle__mode-control :deep(.t-radio-button.t-is-checked:hover:not(.t-is-disabled)) {
+  background: var(--td-brand-color-active);
+  color: var(--td-text-color-anti);
+}
+
+.engine-lifecycle__mode-control :deep(.t-radio-button:focus-within) {
+  z-index: 1;
+  outline: 2px solid var(--td-brand-color-focus);
+  outline-offset: -2px;
 }
 
 .engine-lifecycle__actions {
