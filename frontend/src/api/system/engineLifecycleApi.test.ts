@@ -18,3 +18,16 @@ test('SystemAdmin lifecycle API sends the whole editable config with a strong If
     'missing strong If-Match revision',
   )
 })
+
+test('parser engine checks defer timeout enforcement to the lifecycle-aware server probe', () => {
+  const start = source.indexOf('export function checkParserEngines')
+  const end = source.indexOf('export function getParserEngineConfig', start)
+
+  assert.notEqual(start, -1, 'missing parser engine check API')
+  assert.notEqual(end, -1, 'missing parser engine config API boundary')
+  assert.match(
+    source.slice(start, end),
+    /post\([^;]+\{\s*timeout:\s*0\s*\}\)/s,
+    'parser engine checks must not inherit the generic 30-second Axios timeout',
+  )
+})

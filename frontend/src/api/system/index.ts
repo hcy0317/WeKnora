@@ -176,7 +176,10 @@ export function getParserEngines(): Promise<ParserEnginesResponse> {
 
 /** 使用当前填写的参数检测引擎可用性（不保存），用于填写新参数后即时测试 */
 export function checkParserEngines(config: ParserEngineConfig): Promise<ParserEnginesResponse> {
-  return post('/api/v1/system/parser-engines/check', config)
+  // Managed engines may need a cold start. The server already bounds this probe
+  // with the configured lifecycle startup timeout plus transport grace, so the
+  // generic 30-second Axios timeout would only cancel a still-valid startup.
+  return post('/api/v1/system/parser-engines/check', config, { timeout: 0 })
 }
 
 export function getParserEngineConfig(): Promise<{ data: ParserEngineConfig }> {
