@@ -93,11 +93,11 @@ jobs:
         shell: bash
         run: |
           mapfile -t pkgs < <(go list ./... | grep -v '/docreader/')
-          go vet "${pkgs[@]}"
-          go test "${pkgs[@]}"
+          go vet -tags sqlite_fts5 "${pkgs[@]}"
+          go test -tags sqlite_fts5 "${pkgs[@]}"
 
       - name: Build server
-        run: go build ./cmd/server
+        run: go build -tags sqlite_fts5 ./cmd/server
 
   anydoc:
     name: anydoc parser engine
@@ -141,6 +141,6 @@ jobs:
 
       - name: Vet, test, and build with the engine linked in
         run: |
-          go vet -tags anydoc ./internal/infrastructure/docparser/...
-          go test -tags anydoc -count=1 ./internal/infrastructure/docparser/...
-          go build -tags anydoc ./cmd/server
+          go vet -tags "anydoc sqlite_fts5" ./internal/infrastructure/docparser/...
+          go test -tags "anydoc sqlite_fts5" -count=1 ./internal/infrastructure/docparser/...
+          go build -tags "anydoc sqlite_fts5" ./cmd/server
