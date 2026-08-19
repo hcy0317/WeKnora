@@ -1719,6 +1719,7 @@ func (s *wikiIngestService) mapOneDocument(
 		summaryContent, summaryErr = s.generateWithTemplate(summaryCtx, chatModel, agent.WikiSummaryPrompt, map[string]string{
 			"Content":            content,
 			"Language":           lang,
+			"PageTitle":          docTitle,
 			"ExtractedSlugs":     slugListing,
 			"CustomInstructions": batchCtx.ContentInstructions,
 			"InstructionScope":   "wiki_content",
@@ -2485,6 +2486,7 @@ func (s *wikiIngestService) reduceSlugUpdates(
 			"PageTitle":               pageTitle,
 			"PageType":                pageType,
 			"PageAliases":             pageAliases,
+			"ExistingSummary":         page.Summary,
 			"ExistingContent":         existingContent,
 			"SharedSourceContexts":    sharedSourceContexts.String(),
 			"NewContent":              newContentBuilder.String(),

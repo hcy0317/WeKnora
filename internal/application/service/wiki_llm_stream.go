@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	"github.com/Tencent/WeKnora/internal/models/openaiapi"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
@@ -45,18 +47,37 @@ func callWikiLLM(
 	opts *chat.ChatOptions,
 	purpose string,
 ) (*types.ChatResponse, error) {
+	return callWikiLLMWithFallbacks(ctx, chatModel, messages, opts, purpose, "", "")
+}
+
+func callWikiLLMWithFallbacks(
+	ctx context.Context,
+	chatModel chat.Chat,
+	messages []chat.Message,
+	opts *chat.ChatOptions,
+	purpose string,
+	existingSummary string,
+	pageTitle string,
+) (*types.ChatResponse, error) {
 	if !shouldStreamWikiLLM(purpose) {
-		return chatModel.Chat(ctx, messages, opts)
+		response, err := chatModel.Chat(ctx, messages, opts)
+		if err != nil {
+			return nil, classifyWikiGenerationError(ctx, err)
+		}
+		return response, nil
 	}
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream, err := chatModel.ChatStream(streamCtx, messages, opts)
 	if err != nil {
-		return nil, err
+		return nil, classifyWikiGenerationError(ctx, err)
 	}
 	if stream == nil {
-		return nil, fmt.Errorf("wiki LLM stream is nil")
+		return nil, newWikiGenerationError(
+			WikiGenerationErrorDeterministicOutput,
+			fmt.Errorf("wiki LLM stream is nil"),
+		)
 	}
 
 	var (
@@ -68,19 +89,30 @@ func callWikiLLM(
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, newWikiGenerationError(WikiGenerationErrorCancelled, ctx.Err())
 		case event, ok := <-stream:
 			if !ok {
 				if !completed {
-					return nil, fmt.Errorf("wiki LLM stream closed before completion")
+					return nil, newWikiGenerationError(
+						WikiGenerationErrorDeterministicOutput,
+						fmt.Errorf("wiki LLM stream closed before completion"),
+					)
 				}
 				if finishReason != "stop" {
-					return nil, fmt.Errorf("wiki LLM stream ended with finish reason %q", finishReason)
+					return nil, newWikiGenerationError(
+						WikiGenerationErrorDeterministicOutput,
+						fmt.Errorf("wiki LLM stream ended with finish reason %q", finishReason),
+					)
 				}
 				if content.Len() == 0 {
-					return nil, fmt.Errorf("wiki LLM stream completed without answer content")
+					return nil, newWikiGenerationError(
+						WikiGenerationErrorDeterministicOutput,
+						fmt.Errorf("wiki LLM stream completed without answer content"),
+					)
 				}
-				normalizedContent, err := normalizeWikiStreamContent(purpose, content.String())
+				normalizedContent, err := normalizeWikiStreamContent(
+					purpose, content.String(), existingSummary, pageTitle,
+				)
 				if err != nil {
 					return nil, err
 				}
@@ -96,10 +128,17 @@ func callWikiLLM(
 				if detail == "" {
 					detail = "provider returned an empty stream error"
 				}
-				return nil, fmt.Errorf("wiki LLM stream failed: %s", detail)
+				streamErr := fmt.Errorf("wiki LLM stream failed: %s", detail)
+				if status, ok := wikiStreamHTTPStatus(event.Data); ok {
+					streamErr = openaiapi.NewProtocolHTTPError(openaiapi.ProtocolResponses, status, detail)
+				}
+				return nil, classifyWikiGenerationError(ctx, streamErr)
 			}
 			if len(event.ToolCalls) > 0 || event.ResponseType == types.ResponseTypeToolCall {
-				return nil, fmt.Errorf("wiki LLM stream returned an unexpected tool call")
+				return nil, newWikiGenerationError(
+					WikiGenerationErrorDeterministicOutput,
+					fmt.Errorf("wiki LLM stream returned an unexpected tool call"),
+				)
 			}
 			if event.ResponseType == types.ResponseTypeAnswer && event.Content != "" {
 				content.WriteString(event.Content)
@@ -110,7 +149,10 @@ func callWikiLLM(
 			if event.FinishReason != "" {
 				finishReason = event.FinishReason
 				if finishReason != "stop" {
-					return nil, fmt.Errorf("wiki LLM stream ended with finish reason %q", finishReason)
+					return nil, newWikiGenerationError(
+						WikiGenerationErrorDeterministicOutput,
+						fmt.Errorf("wiki LLM stream ended with finish reason %q", finishReason),
+					)
 				}
 			}
 			if event.Done && finishReason == "stop" {
@@ -120,31 +162,147 @@ func callWikiLLM(
 	}
 }
 
-func normalizeWikiStreamContent(purpose, content string) (string, error) {
+func wikiStreamHTTPStatus(data map[string]interface{}) (int, bool) {
+	if data == nil {
+		return 0, false
+	}
+	value, ok := data["http_status"]
+	if !ok {
+		return 0, false
+	}
+	switch status := value.(type) {
+	case int:
+		return status, status > 0
+	case int64:
+		return int(status), status > 0
+	case float64:
+		return int(status), status > 0 && status == float64(int(status))
+	case json.Number:
+		parsed, err := strconv.Atoi(status.String())
+		return parsed, err == nil && parsed > 0
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(status))
+		return parsed, err == nil && parsed > 0
+	default:
+		return 0, false
+	}
+}
+
+func normalizeWikiStreamContent(purpose, content, existingSummary, pageTitle string) (string, error) {
 	if strings.TrimSpace(content) == "" {
-		return "", fmt.Errorf("wiki LLM stream completed without answer content")
+		return "", newWikiGenerationError(
+			WikiGenerationErrorDeterministicOutput,
+			fmt.Errorf("wiki LLM stream completed without answer content"),
+		)
 	}
 	switch wikiStreamContract(purpose) {
 	case wikiStreamOutputNone:
 		return content, nil
 	case wikiStreamOutputSummaryMarkdown:
 		summary, body := splitSummaryLine(content)
-		if strings.TrimSpace(summary) == "" {
-			return "", fmt.Errorf("wiki LLM stream content validation failed: missing SUMMARY line")
+		if strings.TrimSpace(summary) != "" {
+			if strings.TrimSpace(body) == "" {
+				return "", newWikiGenerationError(
+					WikiGenerationErrorDeterministicOutput,
+					fmt.Errorf("wiki LLM stream content validation failed: missing Markdown body"),
+				)
+			}
+			return content, nil
 		}
-		if strings.TrimSpace(body) == "" {
-			return "", fmt.Errorf("wiki LLM stream content validation failed: missing Markdown body")
+		body = strings.TrimSpace(content)
+		fallback := strings.TrimSpace(existingSummary)
+		if fallback == "" {
+			fallback = firstMeaningfulWikiParagraph(body)
 		}
-		return content, nil
+		if fallback == "" {
+			fallback = strings.TrimSpace(pageTitle)
+		}
+		if fallback == "" || !hasUsableWikiMarkdownBody(body) {
+			return "", newWikiGenerationError(
+				WikiGenerationErrorDeterministicOutput,
+				fmt.Errorf("wiki LLM stream content validation failed: missing SUMMARY line and stable fallback"),
+			)
+		}
+		return "SUMMARY: " + fallback + "\n\n" + body, nil
 	case wikiStreamOutputJSON:
 		normalized, err := normalizeWikiJSONContent(purpose, content)
 		if err != nil {
-			return "", fmt.Errorf("wiki LLM stream content validation failed: %w", err)
+			return "", newWikiGenerationError(
+				WikiGenerationErrorDeterministicOutput,
+				fmt.Errorf("wiki LLM stream content validation failed: %w", err),
+			)
 		}
 		return normalized, nil
 	default:
-		return "", fmt.Errorf("wiki LLM stream content validation failed: unknown output contract")
+		return "", newWikiGenerationError(
+			WikiGenerationErrorDeterministicOutput,
+			fmt.Errorf("wiki LLM stream content validation failed: unknown output contract"),
+		)
 	}
+}
+
+func firstMeaningfulWikiParagraph(content string) string {
+	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	inFence := false
+	paragraph := make([]string, 0, 2)
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
+		if line == "" {
+			if len(paragraph) > 0 {
+				return strings.Join(paragraph, " ")
+			}
+			continue
+		}
+		if isWikiNonProseLine(line) {
+			if len(paragraph) > 0 {
+				return strings.Join(paragraph, " ")
+			}
+			continue
+		}
+		paragraph = append(paragraph, line)
+	}
+	return strings.Join(paragraph, " ")
+}
+
+func hasUsableWikiMarkdownBody(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return false
+	}
+	if firstMeaningfulWikiParagraph(trimmed) != "" {
+		return true
+	}
+	for _, rawLine := range strings.Split(strings.ReplaceAll(trimmed, "\r\n", "\n"), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(line, "#") || strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ") || strings.HasPrefix(line, "+ ") {
+			return true
+		}
+	}
+	return false
+}
+
+func isWikiNonProseLine(line string) bool {
+	if strings.HasPrefix(line, "#") || strings.HasPrefix(line, ">") ||
+		strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ") || strings.HasPrefix(line, "+ ") {
+		return true
+	}
+	if len(line) >= 3 && line[0] >= '0' && line[0] <= '9' {
+		if dot := strings.IndexByte(line, '.'); dot > 0 && dot < 5 {
+			return true
+		}
+	}
+	if strings.Count(line, "|") >= 2 {
+		return true
+	}
+	withoutSeparators := strings.NewReplacer("-", "", ":", "", "|", "", " ", "").Replace(line)
+	return withoutSeparators == "" && strings.Contains(line, "-")
 }
 
 func normalizeWikiJSONContent(purpose, content string) (string, error) {

@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/agent"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	"github.com/Tencent/WeKnora/internal/models/openaiapi"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
@@ -410,7 +412,7 @@ func TestCallWikiLLMRejectsStreamWithoutSuccessfulFinish(t *testing.T) {
 
 func TestCallWikiLLMRejectsCompletedButInvalidContent(t *testing.T) {
 	for _, purpose := range []string{"wiki_summary", "wiki_page_modify"} {
-		for _, content := range []string{"plain body without summary", "SUMMARY: headline only"} {
+		for _, content := range []string{"# heading without a stable fallback", "SUMMARY: headline only"} {
 			model := &scriptedWikiChat{events: []types.StreamResponse{{
 				ResponseType: types.ResponseTypeAnswer,
 				Content:      content,
@@ -425,6 +427,79 @@ func TestCallWikiLLMRejectsCompletedButInvalidContent(t *testing.T) {
 	}
 }
 
+func TestNormalizeWikiStreamContentRepairsMissingSummaryDeterministically(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		content         string
+		existingSummary string
+		pageTitle       string
+		wantSummary     string
+	}{
+		{
+			name:            "existing summary wins",
+			content:         "# Generated heading\n\nA fresh body paragraph.",
+			existingSummary: "Stable existing summary",
+			pageTitle:       "Stable title",
+			wantSummary:     "Stable existing summary",
+		},
+		{
+			name:        "first prose paragraph skips heading list and table separator",
+			content:     "# Generated heading\n\n- list item\n\n| --- | --- |\n\nThe first meaningful paragraph.\nIt continues here.\n\nLater text.",
+			pageTitle:   "Stable title",
+			wantSummary: "The first meaningful paragraph. It continues here.",
+		},
+		{
+			name:        "stable page title is final local fallback",
+			content:     "# Generated heading\n\n- list item",
+			pageTitle:   "Stable title",
+			wantSummary: "Stable title",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := normalizeWikiStreamContent(
+				"wiki_page_modify", tc.content, tc.existingSummary, tc.pageTitle,
+			)
+			if err != nil {
+				t.Fatalf("normalizeWikiStreamContent() error = %v", err)
+			}
+			summary, body := splitSummaryLine(got)
+			if summary != tc.wantSummary || strings.TrimSpace(body) != strings.TrimSpace(tc.content) {
+				t.Fatalf("normalized summary/body = %q/%q, want %q/%q", summary, body, tc.wantSummary, tc.content)
+			}
+		})
+	}
+}
+
+func TestNormalizeWikiStreamContentFailsClosedWithoutAnyStableSummary(t *testing.T) {
+	_, err := normalizeWikiStreamContent("wiki_summary", "# Heading only", "", "")
+	if err == nil || wikiGenerationErrorClassOf(err) != WikiGenerationErrorDeterministicOutput {
+		t.Fatalf("missing all deterministic fallbacks must fail as deterministic_output: %v", err)
+	}
+}
+
+func TestGenerateWithTemplateRepairsSummaryWithoutAdditionalModelCall(t *testing.T) {
+	model := &scriptedWikiChat{events: []types.StreamResponse{{
+		ResponseType: types.ResponseTypeAnswer,
+		Content:      "# Generated heading\n\nA usable body paragraph.",
+		Done:         true,
+		FinishReason: "stop",
+	}}}
+	content, err := (&wikiIngestService{}).generateWithTemplate(
+		context.Background(), model, agent.WikiSummaryPrompt, map[string]string{
+			"Content": "source", "Language": "Chinese", "PageTitle": "Stable document title",
+		},
+	)
+	if err != nil {
+		t.Fatalf("generateWithTemplate() error = %v", err)
+	}
+	if model.streamCalls != 1 {
+		t.Fatalf("local summary repair used %d model calls, want exactly 1", model.streamCalls)
+	}
+	if summary, _ := splitSummaryLine(content); summary != "A usable body paragraph." {
+		t.Fatalf("repaired summary = %q", summary)
+	}
+}
+
 func TestGenerateWithTemplateRetriesInterruptedStreamWithinThreeAttempts(t *testing.T) {
 	if wikiLLMMaxAttempts != 3 {
 		t.Fatalf("wikiLLMMaxAttempts = %d, want 3", wikiLLMMaxAttempts)
@@ -434,11 +509,11 @@ func TestGenerateWithTemplateRetriesInterruptedStreamWithinThreeAttempts(t *test
 		streamSteps: [][]types.StreamResponse{
 			{
 				{ResponseType: types.ResponseTypeAnswer, Content: "discard-first"},
-				{ResponseType: types.ResponseTypeError, Content: "Upstream HTTP/2 stream failed"},
+				{ResponseType: types.ResponseTypeError, Content: "Upstream HTTP/2 stream failed", Data: map[string]interface{}{"http_status": 503}},
 			},
 			{
 				{ResponseType: types.ResponseTypeAnswer, Content: "discard-second"},
-				{ResponseType: types.ResponseTypeError, Content: "upstream HTTP/2 stream failed"},
+				{ResponseType: types.ResponseTypeError, Content: "upstream HTTP/2 stream failed", Data: map[string]interface{}{"http_status": 503}},
 			},
 			{{ResponseType: types.ResponseTypeAnswer, Content: "SUMMARY: recovered\n\ncomplete body", Done: true, FinishReason: "stop"}},
 		},
@@ -526,7 +601,9 @@ func TestGenerateWithTemplateRetriesWikiAttemptTimeoutWithoutInheritingTaskDeadl
 }
 
 func TestCallWikiLLMMarksHTTP2StreamCreationInterruptionTransient(t *testing.T) {
-	wantErr := errors.New("Upstream HTTP/2 stream failed")
+	wantErr := openaiapi.NewProtocolHTTPError(
+		openaiapi.ProtocolResponses, http.StatusServiceUnavailable, "Upstream HTTP/2 stream failed",
+	)
 	model := &scriptedWikiChat{modelName: "any-chat-model", streamErr: wantErr}
 
 	response, err := callWikiLLM(
@@ -541,7 +618,9 @@ func TestCallWikiLLMMarksHTTP2StreamCreationInterruptionTransient(t *testing.T) 
 }
 
 func TestCallWikiLLMReturnsStreamCreationError(t *testing.T) {
-	wantErr := errors.New("API request failed with status 503: unavailable")
+	wantErr := openaiapi.NewProtocolHTTPError(
+		openaiapi.ProtocolResponses, http.StatusServiceUnavailable, "unavailable",
+	)
 	model := &scriptedWikiChat{modelName: "any-chat-model", streamErr: wantErr}
 
 	response, err := callWikiLLM(
@@ -552,15 +631,15 @@ func TestCallWikiLLMReturnsStreamCreationError(t *testing.T) {
 	}
 }
 
-func TestIsTransientLLMErrorRecognizesHTTP200UpstreamEnvelope(t *testing.T) {
+func TestIsTransientLLMErrorRejectsAmbiguousHTTP200UpstreamEnvelope(t *testing.T) {
 	for _, message := range []string{
 		"wiki LLM stream failed: API stream error: Upstream request failed (type=upstream_error)",
 		"wiki LLM stream failed: API stream error: gateway failed (code=bad_gateway)",
 		"wiki LLM stream closed before completion",
 		"wiki LLM stream failed: Responses stream failed: stream_read_error",
 	} {
-		if !isTransientLLMError(context.Background(), errors.New(message)) {
-			t.Fatalf("HTTP-200 upstream stream error should be retryable: %q", message)
+		if isTransientLLMError(context.Background(), errors.New(message)) {
+			t.Fatalf("HTTP-200 upstream text must fail closed without typed transport evidence: %q", message)
 		}
 	}
 }

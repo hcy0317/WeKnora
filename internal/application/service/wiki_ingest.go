@@ -36,8 +36,6 @@ import (
 // lock (Phase 3) and never returns this.
 var ErrWikiIngestConcurrent = errors.New("concurrent wiki task active")
 
-var errWikiLLMEmptyContent = errors.New("wiki LLM returned empty response content")
-
 const (
 	// maxContentForWiki limits the document content sent to LLM for wiki generation
 	maxContentForWiki = 32768
@@ -3107,21 +3105,33 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 				return "", budgetErr
 			}
 			attemptCtx, cancelAttempt := context.WithTimeout(ctx, attemptTimeout)
-			response, callErr := callWikiLLM(attemptCtx, chatModel, messages, opts, purpose)
+			response, callErr := callWikiLLMWithFallbacks(
+				attemptCtx, chatModel, messages, opts, purpose,
+				maskedData["ExistingSummary"], maskedData["PageTitle"],
+			)
 			attemptTimedOut := errors.Is(callErr, context.DeadlineExceeded) && ctx.Err() == nil
 			cancelAttempt()
 			if attemptTimedOut {
-				callErr = fmt.Errorf("wiki LLM attempt timed out after %s: %w", attemptTimeout, callErr)
+				callErr = &WikiGenerationError{
+					Class: WikiGenerationErrorTransientTransport,
+					Err:   fmt.Errorf("wiki LLM attempt timed out after %s: %w", attemptTimeout, callErr),
+				}
 			}
 			if callErr == nil && response != nil {
 				if strings.TrimSpace(response.Content) == "" {
-					callErr = errWikiLLMEmptyContent
+					callErr = newWikiGenerationError(
+						WikiGenerationErrorDeterministicOutput,
+						errors.New("wiki LLM returned empty response content"),
+					)
 				} else {
 					return response.Content, nil
 				}
 			}
 			if callErr == nil {
-				callErr = errors.New("LLM returned nil response")
+				callErr = newWikiGenerationError(
+					WikiGenerationErrorDeterministicOutput,
+					errors.New("LLM returned nil response"),
+				)
 			}
 			lastErr = callErr
 
@@ -3241,73 +3251,10 @@ func (s *wikiIngestService) awaitWikiPromptWarmup(ctx context.Context, key strin
 	}
 }
 
-// isTransientLLMError reports whether an error from the chat provider
-// looks like an infrastructure hiccup worth retrying. Classification is
-// intentionally conservative: the truthful "could not tell, assume
-// permanent" choice keeps retries cheap and avoids masking real bugs.
-//
-// We treat the following as transient:
-//   - HTTP 408 (client request timeout — upstream usually didn't process),
-//     429 (rate-limited — retry after backoff may succeed), 5xx (any
-//     server-side fault, including the 504 "Remote error, timeout with
-//     60" we see from the gateway in front of several LLM providers).
-//   - Wrapped context.DeadlineExceeded when the parent ctx is still alive
-//     (nested per-call timeouts).
-//   - Substring matches on the error text for common transport failures
-//     ("timeout", "connection reset", "EOF") that providers surface
-//     without a structured status code.
+// isTransientLLMError retries only errors backed by typed transport facts.
+// Ambiguous provider text fails closed so a possibly-paid call is not repeated.
 func isTransientLLMError(ctx context.Context, err error) bool {
-	if err == nil {
-		return false
-	}
-	// Never retry after the parent ctx itself expired — the task is
-	// being cancelled and the next attempt would just fail again.
-	if ctx.Err() != nil {
-		return false
-	}
-	if errors.Is(err, errWikiLLMEmptyContent) {
-		return true
-	}
-
-	msg := err.Error()
-	// Providers that bubble HTTP status up formatted as
-	// "API request failed with status NNN: ..." — match that first.
-	for _, s := range []string{
-		"status 408", "status 429",
-		"status 500", "status 501", "status 502", "status 503", "status 504",
-		"status 520", "status 521", "status 522", "status 523", "status 524",
-	} {
-		if strings.Contains(msg, s) {
-			return true
-		}
-	}
-
-	lower := strings.ToLower(msg)
-	for _, s := range []string{
-		"timeout",
-		"timed out",
-		"upstream request failed",
-		"upstream_error",
-		"bad_gateway",
-		"stream closed before completion",
-		"stream_read_error",
-		"http/2 stream failed",
-		"http2: stream closed",
-		"http2: client connection lost",
-		"connection reset",
-		"connection refused",
-		"broken pipe",
-		"no such host", // DNS hiccup
-		"i/o timeout",
-		"unexpected eof",
-		"tls handshake",
-		"context deadline exceeded", // nested per-call deadline
-	} {
-		if strings.Contains(lower, s) {
-			return true
-		}
-	}
-	return false
+	return wikiGenerationErrorClassOf(classifyWikiGenerationError(ctx, err)) == WikiGenerationErrorTransientTransport
 }
 
 // --- Helpers ---
