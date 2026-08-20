@@ -33,7 +33,7 @@ var versionedSQLiteColumns = map[string][]string{
 	"mcp_oauth_tokens":   {"principal_type", "principal_id"}, // 000064
 }
 
-const expectedSQLiteMigrationVersion = 11
+const expectedSQLiteMigrationVersion = 16
 
 func TestSQLiteMigrationsCreateVersionedSchema(t *testing.T) {
 	repoRoot := sqliteRepoRoot(t)
@@ -48,7 +48,7 @@ func TestSQLiteMigrationsCreateVersionedSchema(t *testing.T) {
 	require.False(t, dirty)
 
 	for _, table := range versionedSQLiteTables {
-		require.Truef(t, sqliteTableExists(t, db, table), "SQLite migrations must create table %s", table)
+		require.Truef(t, sqliteTestTableExists(t, db, table), "SQLite migrations must create table %s", table)
 	}
 	for table, columns := range versionedSQLiteColumns {
 		for _, column := range columns {
@@ -103,7 +103,7 @@ func TestSQLiteMigrationsUpgradeV4PreservesData(t *testing.T) {
 	require.False(t, dirtyAfter)
 
 	for _, table := range versionedSQLiteTables {
-		require.Truef(t, sqliteTableExists(t, db, table), "upgraded SQLite DB must have table %s", table)
+		require.Truef(t, sqliteTestTableExists(t, db, table), "upgraded SQLite DB must have table %s", table)
 	}
 	for table, columns := range versionedSQLiteColumns {
 		for _, column := range columns {
@@ -159,7 +159,7 @@ func sqliteMigrationState(t *testing.T, db *sql.DB) (version int, dirty bool) {
 	return version, dirty
 }
 
-func sqliteTableExists(t *testing.T, db *sql.DB, table string) bool {
+func sqliteTestTableExists(t *testing.T, db *sql.DB, table string) bool {
 	t.Helper()
 	var n int
 	require.NoError(t, db.QueryRow(
@@ -253,6 +253,27 @@ func copySQLiteMigrationsV4(t *testing.T, repoRoot string) string {
 		"000002_knowledge_folder_path.up.sql",
 		"000003_knowledge_base_auto_tag_config.up.sql",
 		"000004_memory.up.sql",
+	}
+	for _, name := range legacy {
+		data, err := os.ReadFile(filepath.Join(srcDir, name))
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(destDir, name), data, 0o600))
+	}
+	return dest
+}
+
+func copySQLiteMigrationsV3(t *testing.T, repoRoot string) string {
+	t.Helper()
+	dest := t.TempDir()
+	srcDir := filepath.Join(repoRoot, "migrations", "sqlite")
+	destDir := filepath.Join(dest, "migrations", "sqlite")
+	require.NoError(t, os.MkdirAll(destDir, 0o755))
+
+	legacy := []string{
+		"000000_init.up.sql",
+		"000001_remove_wiki_log.up.sql",
+		"000002_knowledge_folder_path.up.sql",
+		"000003_knowledge_base_auto_tag_config.up.sql",
 	}
 	for _, name := range legacy {
 		data, err := os.ReadFile(filepath.Join(srcDir, name))

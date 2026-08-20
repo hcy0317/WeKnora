@@ -96,9 +96,9 @@ func TestSQLiteQuestionGenerationManifestMigrationRollbackIsIdempotent(t *testin
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	up, err := os.ReadFile("migrations/sqlite/000005_question_generation_manifests.up.sql")
+	up, err := os.ReadFile("migrations/sqlite/000012_question_generation_manifests.up.sql")
 	require.NoError(t, err)
-	down, err := os.ReadFile("migrations/sqlite/000005_question_generation_manifests.down.sql")
+	down, err := os.ReadFile("migrations/sqlite/000012_question_generation_manifests.down.sql")
 	require.NoError(t, err)
 	_, err = db.Exec(string(down))
 	require.NoError(t, err)
@@ -159,9 +159,9 @@ func TestSQLiteWikiCheckpointMigrationRollbackIsIdempotent(t *testing.T) {
 	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "wiki-checkpoint-rollback.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	up, err := os.ReadFile("migrations/sqlite/000006_wiki_ingest_checkpoints.up.sql")
+	up, err := os.ReadFile("migrations/sqlite/000013_wiki_ingest_checkpoints.up.sql")
 	require.NoError(t, err)
-	down, err := os.ReadFile("migrations/sqlite/000006_wiki_ingest_checkpoints.down.sql")
+	down, err := os.ReadFile("migrations/sqlite/000013_wiki_ingest_checkpoints.down.sql")
 	require.NoError(t, err)
 	_, err = db.Exec(string(up))
 	require.NoError(t, err)
@@ -177,29 +177,33 @@ func TestSQLiteWikiCheckpointMigrationRollbackIsIdempotent(t *testing.T) {
 
 func TestSQLiteLegacyLocalVersion6ReplaysUpstreamMemory(t *testing.T) {
 	useRepositoryRoot(t)
+	repoRoot, err := filepath.Abs(".")
+	require.NoError(t, err)
+	legacyRoot := copySQLiteMigrationsV3(t, repoRoot)
+	chdirAndRestore(t, legacyRoot)
+
 	dbPath := filepath.Join(t.TempDir(), "legacy-local-v6.db")
+	require.NoError(t, RunMigrationsWithOptions(
+		"sqlite3://unused",
+		MigrationOptions{SQLiteDBPath: dbPath},
+	))
 	db, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
-
-	_, err = db.Exec(`
-		CREATE TABLE tenants (id INTEGER PRIMARY KEY);
-		CREATE TABLE messages (id TEXT PRIMARY KEY);
-		CREATE TABLE schema_migrations (version INTEGER NOT NULL PRIMARY KEY, dirty BOOLEAN NOT NULL);
-		INSERT INTO schema_migrations(version, dirty) VALUES (6, 0);
-	`)
-	require.NoError(t, err)
 	for _, migration := range []string{
-		"migrations/sqlite/000005_question_generation_manifests.up.sql",
-		"migrations/sqlite/000006_wiki_ingest_checkpoints.up.sql",
-		"migrations/sqlite/000007_wiki_canonical_identities.up.sql",
+		"000012_question_generation_manifests.up.sql",
+		"000013_wiki_ingest_checkpoints.up.sql",
+		"000014_wiki_canonical_identities.up.sql",
 	} {
-		contents, readErr := os.ReadFile(migration)
+		contents, readErr := os.ReadFile(filepath.Join(repoRoot, "migrations", "sqlite", migration))
 		require.NoError(t, readErr)
 		_, execErr := db.Exec(string(contents))
 		require.NoError(t, execErr)
 	}
+	_, err = db.Exec("UPDATE schema_migrations SET version = 6, dirty = 0")
+	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
+	chdirAndRestore(t, repoRoot)
 	require.NoError(t, RunMigrationsWithOptions(
 		"sqlite3://unused",
 		MigrationOptions{SQLiteDBPath: dbPath},
@@ -211,7 +215,7 @@ func TestSQLiteLegacyLocalVersion6ReplaysUpstreamMemory(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	require.Equal(t, uint(9), version)
+	require.Equal(t, uint(16), version)
 	require.False(t, dirty)
 
 	for _, table := range []string{
@@ -247,5 +251,88 @@ func TestSQLiteLegacyLocalVersion6ReplaysUpstreamMemory(t *testing.T) {
 		}
 		require.NoError(t, rows.Close())
 		require.Truef(t, found, "legacy upgrade must add %s.%s", column.table, column.name)
+	}
+}
+
+func TestSQLiteLegacyLocalVersion9ReplaysUpstreamMigrations(t *testing.T) {
+	useRepositoryRoot(t)
+	repoRoot, err := filepath.Abs(".")
+	require.NoError(t, err)
+	legacyRoot := copySQLiteMigrationsV4(t, repoRoot)
+	chdirAndRestore(t, legacyRoot)
+
+	dbPath := filepath.Join(t.TempDir(), "legacy-local-v9.db")
+	require.NoError(t, RunMigrationsWithOptions(
+		"sqlite3://unused",
+		MigrationOptions{SQLiteDBPath: dbPath},
+	))
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	for _, migration := range []string{
+		"000012_question_generation_manifests.up.sql",
+		"000013_wiki_ingest_checkpoints.up.sql",
+		"000014_wiki_canonical_identities.up.sql",
+		"000015_wiki_generation_fragments.up.sql",
+		"000016_knowledge_completion_outbox.up.sql",
+	} {
+		contents, readErr := os.ReadFile(filepath.Join(repoRoot, "migrations", "sqlite", migration))
+		require.NoError(t, readErr)
+		_, execErr := db.Exec(string(contents))
+		require.NoError(t, execErr)
+	}
+	_, err = db.Exec("UPDATE schema_migrations SET version = 9, dirty = 0")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	chdirAndRestore(t, repoRoot)
+	require.NoError(t, RunMigrationsWithOptions(
+		"sqlite3://unused",
+		MigrationOptions{SQLiteDBPath: dbPath},
+	))
+
+	db, err = sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	var version uint
+	var dirty bool
+	require.NoError(t, db.QueryRow("SELECT version, dirty FROM schema_migrations").Scan(&version, &dirty))
+	require.Equal(t, uint(16), version)
+	require.False(t, dirty)
+
+	for _, table := range []string{
+		"task_pending_ops",
+		"task_dead_letters",
+		"system_settings",
+		"knowledge_processing_spans",
+		"knowledge_tag_relations",
+		"question_generation_manifests",
+		"wiki_ingest_work_units",
+		"wiki_canonical_identities",
+		"wiki_generation_fragments",
+		"knowledge_completion_outbox",
+	} {
+		var count int
+		require.NoError(t, db.QueryRow(
+			"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", table,
+		).Scan(&count))
+		require.Equalf(t, 1, count, "legacy upgrade must preserve or create %s", table)
+	}
+	for _, column := range []struct {
+		table string
+		name  string
+	}{
+		{table: "messages", name: "attachments"},
+		{table: "users", name: "is_system_admin"},
+		{table: "knowledges", name: "pending_subtasks_count"},
+		{table: "embed_channels", name: "allow_memory"},
+		{table: "tenants", name: "api_principal_config"},
+		{table: "mcp_oauth_tokens", name: "principal_type"},
+		{table: "mcp_oauth_tokens", name: "principal_id"},
+	} {
+		var count int
+		require.NoError(t, db.QueryRow(
+			"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?", column.table, column.name,
+		).Scan(&count))
+		require.Equalf(t, 1, count, "legacy upgrade must add %s.%s", column.table, column.name)
 	}
 }

@@ -1140,11 +1140,11 @@ func (s *wikiIngestService) scheduleCappedRetry(ctx context.Context, payload Wik
 // ever re-trigger the KB afterwards.
 //
 // The delay is set past the stale threshold so that when the net fires the
-// abandoned claims are guaranteed eligible again. asynq.TaskID coalesces all
-// rechecks for one KB into a single pending net (no thundering herd from
-// concurrent no-op batches). If PendingCount is already zero the KB has fully
-// drained and no net is needed. Returns true if a net is (or already was)
-// scheduled.
+// abandoned claims are guaranteed eligible again. Two alternating asynq task
+// IDs coalesce rechecks without letting a running recheck conflict with the
+// successor it is trying to schedule. If PendingCount is already zero the KB
+// has fully drained and no net is needed. Returns true if a net is (or already
+// was) scheduled.
 func (s *wikiIngestService) scheduleStaleClaimRecheck(ctx context.Context, payload WikiIngestPayload) bool {
 	if s.pendingRepo == nil {
 		return false
@@ -1158,12 +1158,19 @@ func (s *wikiIngestService) scheduleStaleClaimRecheck(ctx context.Context, paylo
 
 	langfuse.InjectTracing(ctx, &payload)
 	b, _ := json.Marshal(payload)
+	recheckTaskID := "wiki-ingest-recheck-" + payload.KnowledgeBaseID
+	// Asynq retains a running task's ID until its handler returns, so that
+	// task cannot enqueue its own successor under the same ID. Alternate once;
+	// the -next task falls back to the base ID and keeps the ID set bounded.
+	if currentTaskID, ok := asynq.GetTaskID(ctx); ok && currentTaskID == recheckTaskID {
+		recheckTaskID += "-next"
+	}
 	t := asynq.NewTask(types.TypeWikiIngest, b,
 		asynq.Queue(types.QueueWiki),
 		asynq.MaxRetry(wikiIngestMaxRetry),
 		asynq.Timeout(WikiIngestTaskTimeout),
 		asynq.ProcessIn(wikiClaimStaleAfter+wikiFollowUpDelay),
-		asynq.TaskID("wiki-ingest-recheck-"+payload.KnowledgeBaseID),
+		asynq.TaskID(recheckTaskID),
 	)
 	if _, err := s.task.Enqueue(t); err != nil {
 		if errors.Is(err, asynq.ErrTaskIDConflict) || errors.Is(err, asynq.ErrDuplicateTask) {
