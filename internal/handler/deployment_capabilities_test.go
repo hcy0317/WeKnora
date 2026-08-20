@@ -6,7 +6,6 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
-	"strings"
 	"testing"
 )
 
@@ -60,14 +59,11 @@ func readFrontendDeploymentCapabilityKeys() ([]string, error) {
 		return nil, os.ErrInvalid
 	}
 
-	var keys []string
-	for _, line := range strings.Split(string(match[1]), "\n") {
-		line = strings.TrimSpace(strings.TrimRight(line, ","))
-		if line == "" {
-			continue
-		}
-		line = strings.Trim(line, `'`)
-		keys = append(keys, line)
+	quotedKey := regexp.MustCompile(`['"]([^'"]+)['"]`)
+	keyMatches := quotedKey.FindAllSubmatch(match[1], -1)
+	keys := make([]string, 0, len(keyMatches))
+	for _, keyMatch := range keyMatches {
+		keys = append(keys, string(keyMatch[1]))
 	}
 	return keys, nil
 }

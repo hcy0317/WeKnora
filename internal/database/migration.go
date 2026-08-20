@@ -111,6 +111,7 @@ const (
 	rootAttemptUniqueVersion      = 85
 	postgresCollisionBaseVersion  = 80
 	sqliteCollisionBaseVersion    = 3
+	sqliteUpstreamBaseVersion     = 4
 )
 
 type migrationGateSnapshot struct {
@@ -334,22 +335,34 @@ func sqliteTableExists(ctx context.Context, db *sql.DB, table string) (bool, err
 func reconcileSQLiteMigrationCollision(
 	ctx context.Context, m *migrate.Migrate, db *sql.DB, version uint, dirty bool,
 ) (uint, error) {
-	if dirty || version < 4 || version > 6 {
+	if dirty || version < 4 || version > 9 {
 		return version, nil
 	}
 	memoryExists, err := sqliteTableExists(ctx, db, "memory_subjects")
 	if err != nil {
 		return version, fmt.Errorf("inspect upstream SQLite memory migration: %w", err)
 	}
+	legacyTable := ""
+	replayFrom := sqliteCollisionBaseVersion
 	if memoryExists {
+		legacyTable = map[uint]string{
+			5: "question_generation_manifests",
+			6: "wiki_ingest_work_units",
+			7: "wiki_canonical_identities",
+			8: "wiki_generation_fragments",
+			9: "knowledge_completion_outbox",
+		}[version]
+		replayFrom = sqliteUpstreamBaseVersion
+	} else {
+		legacyTable = map[uint]string{
+			4: "question_generation_manifests",
+			5: "wiki_ingest_work_units",
+			6: "wiki_canonical_identities",
+		}[version]
+	}
+	if legacyTable == "" {
 		return version, nil
 	}
-
-	legacyTable := map[uint]string{
-		4: "question_generation_manifests",
-		5: "wiki_ingest_work_units",
-		6: "wiki_canonical_identities",
-	}[version]
 	legacyExists, err := sqliteTableExists(ctx, db, legacyTable)
 	if err != nil {
 		return version, fmt.Errorf("inspect legacy SQLite migration %d: %w", version, err)
@@ -360,12 +373,12 @@ func reconcileSQLiteMigrationCollision(
 
 	logger.Warnf(ctx,
 		"Detected legacy local SQLite migration version %d; replaying collision range from %d",
-		version, sqliteCollisionBaseVersion+1)
-	if err := m.Force(sqliteCollisionBaseVersion); err != nil {
+		version, replayFrom+1)
+	if err := m.Force(replayFrom); err != nil {
 		return version, fmt.Errorf("rewind legacy SQLite migration version %d to %d: %w",
-			version, sqliteCollisionBaseVersion, err)
+			version, replayFrom, err)
 	}
-	return sqliteCollisionBaseVersion, nil
+	return uint(replayFrom), nil
 }
 
 // RunMigrationsWithOptions executes all pending database migrations with custom options
