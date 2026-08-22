@@ -36,6 +36,23 @@ func TestSummarizeKnowledgeTokenUsage_GroupsByStageAndModel(t *testing.T) {
 	assert.Equal(t, 2, got.Stages[1].Models[0].Usage.Calls)
 }
 
+func TestSummarizeKnowledgeTokenUsage_CollapsesIndexedFanoutStages(t *testing.T) {
+	rows := []types.KnowledgeProcessingSpan{
+		generationUsageRow("postprocess.graph.chunk[7]", "chat", "gpt-test", false, true, 10, 2, 12, 0),
+		generationUsageRow("postprocess.graph.chunk[42]", "chat", "gpt-test", false, true, 20, 3, 23, 0),
+		generationUsageRow("postprocess.question.batch[3]", "chat", "gpt-test", false, true, 30, 4, 34, 0),
+		generationUsageRow("postprocess.wiki.page[concept/example]", "chat", "gpt-test", false, true, 40, 5, 45, 0),
+	}
+
+	got := summarizeKnowledgeTokenUsage(rows)
+	require.Len(t, got.Stages, 3)
+	assert.Equal(t, "postprocess.graph", got.Stages[0].Stage)
+	assert.Equal(t, 2, got.Stages[0].Usage.Calls)
+	assert.EqualValues(t, 30, got.Stages[0].Usage.InputTokens)
+	assert.Equal(t, "postprocess.question", got.Stages[1].Stage)
+	assert.Equal(t, "postprocess.wiki.page", got.Stages[2].Stage)
+}
+
 func generationUsageRow(
 	stage, modelType, modelName string,
 	estimated, available bool,

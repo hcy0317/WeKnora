@@ -686,6 +686,7 @@ func (h *KnowledgeHandler) GetKnowledgeSpans(c *gin.Context) {
 	}
 
 	rows := []types.KnowledgeProcessingSpan{}
+	usageRows := []types.KnowledgeProcessingSpan{}
 	currentAttempt := 0
 	latestAttempt := 0
 	if h.spanRepo != nil {
@@ -701,14 +702,30 @@ func (h *KnowledgeHandler) GetKnowledgeSpans(c *gin.Context) {
 			currentAttempt = latestAttempt
 		}
 		if currentAttempt > 0 {
-			rows, err = h.spanRepo.ListByAttempt(ctx, knowledge.ID, currentAttempt)
+			if compactRepo, ok := h.spanRepo.(compactKnowledgeTimelineRepository); ok {
+				rows, err = compactRepo.ListTimelineByAttempt(ctx, knowledge.ID, currentAttempt)
+				if err == nil {
+					var usageErr error
+					usageRows, usageErr = compactRepo.ListTokenUsageByAttempt(ctx, knowledge.ID, currentAttempt)
+					if usageErr != nil {
+						logger.Warnf(ctx, "spans token usage read failed kid=%s attempt=%d: %v",
+							knowledge.ID, currentAttempt, usageErr)
+						usageRows = nil
+					}
+				}
+			} else {
+				rows, err = h.spanRepo.ListByAttempt(ctx, knowledge.ID, currentAttempt)
+				usageRows = rows
+			}
 			if err != nil {
 				logger.Warnf(ctx, "spans ListByAttempt failed kid=%s attempt=%d: %v",
 					knowledge.ID, currentAttempt, err)
 				rows = nil
+				usageRows = nil
 			}
 		}
 	}
+	rows = compactKnowledgeTimelineRows(rows)
 
 	// Build tree: index by SpanID, then attach to parents. Stages
 	// missing from the DB are synthesized as "pending" placeholders
@@ -747,7 +764,7 @@ func (h *KnowledgeHandler) GetKnowledgeSpans(c *gin.Context) {
 		"current_attempt":     currentAttempt,
 		"current_stage":       currentStageName,
 		"trace":               tree,
-		"token_usage":         summarizeKnowledgeTokenUsage(rows),
+		"token_usage":         summarizeKnowledgeTokenUsage(usageRows),
 		"retry_failed_action": retryFailedAction,
 	}
 	if lastError := knowledgeSpansLastError(
