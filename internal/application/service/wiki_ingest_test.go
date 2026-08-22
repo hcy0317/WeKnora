@@ -117,6 +117,40 @@ func TestReconstructContentEmpty(t *testing.T) {
 	}
 }
 
+func TestSampleWikiContentPreservesDocumentScope(t *testing.T) {
+	sectionNames := []string{"汇总", "安县", "平武", "北川", "江油", "绵阳", "梓潼", "三台", "盐亭"}
+	sections := make([]string, 0, len(sectionNames))
+	for i, name := range sectionNames {
+		date := "2023-06-30"
+		if i == 0 {
+			date = "2021-01-01"
+		}
+		section := "## " + name + "\n" + date + "\n" + strings.Repeat(name+" data row\n", 600)
+		if i == len(sectionNames)-1 {
+			section += "2025-12-31\n"
+		}
+		sections = append(sections, section)
+	}
+
+	const budget = 4096
+	got := sampleWikiContent(strings.Join(sections, "\n"), budget)
+
+	if runes := len([]rune(got)); runes > budget {
+		t.Fatalf("sample length = %d, want <= %d", runes, budget)
+	}
+	for _, name := range sectionNames {
+		if !strings.Contains(got, "## "+name) {
+			t.Errorf("sample omitted document section %q", name)
+		}
+	}
+	if !strings.Contains(got, "2021-01-01") || !strings.Contains(got, "2025-12-31") {
+		t.Fatalf("sample must preserve the document date range, got: %q", got)
+	}
+	if !strings.Contains(got, "content omitted") {
+		t.Fatalf("sample must disclose omitted content, got: %q", got)
+	}
+}
+
 func TestStripImageMarkup(t *testing.T) {
 	tests := []struct {
 		name  string

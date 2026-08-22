@@ -534,6 +534,89 @@ func TestGenerateWithTemplateRetriesInterruptedStreamWithinThreeAttempts(t *test
 	}
 }
 
+func TestGenerateWithTemplateRetriesStructuredTransportErrorBeforeOutput(t *testing.T) {
+	model := &scriptedWikiChat{streamSteps: [][]types.StreamResponse{
+		{{
+			ResponseType: types.ResponseTypeError,
+			Content:      "Responses stream failed: stream_read_error",
+			Done:         true,
+			Data: map[string]interface{}{
+				"provider_request_id": "sub2api-retryable",
+				"last_sse_event_type": "error",
+				"error_code":          "stream_read_error",
+				"error_type":          "upstream_error",
+				"output_started":      false,
+				"usage_observed":      false,
+			},
+		}},
+		{{ResponseType: types.ResponseTypeAnswer, Content: "SUMMARY: recovered\n\ncomplete body", Done: true, FinishReason: "stop"}},
+	}}
+	content, err := (&wikiIngestService{}).generateWithTemplate(
+		context.Background(), model, agent.WikiSummaryPrompt, map[string]string{
+			"Content": "source", "Language": "Chinese",
+		},
+	)
+	if err != nil {
+		t.Fatalf("generateWithTemplate() error = %v", err)
+	}
+	if content != "SUMMARY: recovered\n\ncomplete body" || model.streamCalls != 2 {
+		t.Fatalf("content=%q calls=%d, want recovered output after one retry", content, model.streamCalls)
+	}
+}
+
+func TestGenerateWithTemplateMarksPossiblyBilledStreamErrorAmbiguous(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		outputStarted bool
+		usageObserved bool
+	}{
+		{name: "output started", outputStarted: true},
+		{name: "usage observed", usageObserved: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pages := &wikiGenerationLedgerPageService{}
+			model := &scriptedWikiChat{streamSteps: [][]types.StreamResponse{
+				{{
+					ResponseType: types.ResponseTypeError,
+					Content:      "Responses stream failed: stream_read_error",
+					Done:         true,
+					Data: map[string]interface{}{
+						"provider_request_id": "sub2api-ambiguous",
+						"last_sse_event_type": "error",
+						"error_code":          "stream_read_error",
+						"error_type":          "upstream_error",
+						"output_started":      tc.outputStarted,
+						"usage_observed":      tc.usageObserved,
+					},
+				}},
+				{{ResponseType: types.ResponseTypeAnswer, Content: "SUMMARY: must not run\n\nbody", Done: true, FinishReason: "stop"}},
+			}}
+			service := &wikiIngestService{wikiService: pages}
+			ctx := withWikiGenerationScope(context.Background(), wikiGenerationScope{
+				TenantID: 7, KnowledgeBaseID: "kb", WorkRevision: "work", RuntimeSnapshot: "runtime",
+			})
+
+			content, err := service.generateWithTemplate(ctx, model, agent.WikiSummaryPrompt, map[string]string{
+				"Content": "source", "Language": "Chinese",
+			})
+			if err == nil || content != "" {
+				t.Fatalf("possibly billed stream must fail atomically: content=%q err=%v", content, err)
+			}
+			if class := wikiGenerationErrorClassOf(err); class != WikiGenerationErrorAmbiguousCall {
+				t.Fatalf("class=%q, want %q: %v", class, WikiGenerationErrorAmbiguousCall, err)
+			}
+			if model.streamCalls != 1 || pages.ambiguous != 1 {
+				t.Fatalf("calls=%d ambiguous=%d, want one call and one ambiguous settlement", model.streamCalls, pages.ambiguous)
+			}
+			for _, detail := range []string{"request_id=\"sub2api-ambiguous\"", "last_sse_event_type=\"error\"", "error_code=\"stream_read_error\""} {
+				if !strings.Contains(err.Error(), detail) {
+					t.Fatalf("persistable error %q missing %q", err, detail)
+				}
+			}
+		})
+	}
+}
+
 func TestGenerateWithTemplateDoesNotRetryContractValidationFailure(t *testing.T) {
 	model := &scriptedWikiChat{streamSteps: [][]types.StreamResponse{
 		{{ResponseType: types.ResponseTypeAnswer, Content: `{}`, Done: true, FinishReason: "stop"}},

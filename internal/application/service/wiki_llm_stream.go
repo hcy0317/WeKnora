@@ -129,7 +129,9 @@ func callWikiLLMWithFallbacks(
 					detail = "provider returned an empty stream error"
 				}
 				streamErr := fmt.Errorf("wiki LLM stream failed: %s", detail)
-				if status, ok := wikiStreamHTTPStatus(event.Data); ok {
+				if _, ok := types.StreamErrorDetailsFromData(event.Data); ok {
+					streamErr = newWikiProviderStreamError(streamErr, event.Data)
+				} else if status, ok := wikiStreamHTTPStatus(event.Data); ok {
 					streamErr = openaiapi.NewProtocolHTTPError(openaiapi.ProtocolResponses, status, detail)
 				}
 				return nil, classifyWikiGenerationError(ctx, streamErr)

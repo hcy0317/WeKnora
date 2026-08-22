@@ -15,6 +15,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
+	"github.com/xuri/excelize/v2"
 )
 
 var dataAnalysisTool = BaseTool{
@@ -457,8 +458,9 @@ func (t *DataAnalysisTool) LoadFromCSV(ctx context.Context, filename string, tab
 //   - *TableSchema: schema information of the created table
 //   - error: any error that occurred during the operation
 //
-// Note: requires the DuckDB 'excel' extension (for read_xlsx) and the
-// 'spatial' extension (for st_read_meta used to enumerate sheets).
+// Note: requires the DuckDB 'excel' extension for read_xlsx. Sheet names are
+// read directly from the XLSX package so discovery does not depend on GDAL's
+// interpretation of workbook layers.
 func (t *DataAnalysisTool) LoadFromExcel(ctx context.Context, filename string, tableName string) (*TableSchema, error) {
 	logger.Infof(ctx, "[Tool][DataAnalysis] Loading Excel file '%s' into table '%s' for session %s", filename, tableName, t.sessionID)
 
@@ -489,40 +491,64 @@ func (t *DataAnalysisTool) LoadFromExcel(ctx context.Context, filename string, t
 	return t.LoadFromTable(ctx, tableName)
 }
 
-// listExcelSheets returns the names of every sheet (layer) inside the given
-// Excel workbook by querying DuckDB's spatial st_read_meta table function.
-// The returned slice preserves the on-disk order of sheets.
-//
-// st_read_meta returns a single row whose `layers` column is a LIST of
-// STRUCTs (one per layer / sheet). We UNNEST that list and project the
-// struct's `name` field to get a flat list of sheet names.
+// listExcelSheets returns the names of every sheet inside the given workbook.
+// XLSX metadata is read directly because GDAL can expose only the active sheet
+// for some valid workbooks. DuckDB remains the fallback for legacy XLS files.
 func (t *DataAnalysisTool) listExcelSheets(ctx context.Context, filename string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	workbook, workbookErr := excelize.OpenFile(filename, excelize.Options{RawCellValue: true})
+	if workbookErr == nil {
+		names := workbook.GetSheetList()
+		if err := workbook.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close workbook metadata: %w", err)
+		}
+		return nonEmptySheetNames(names), nil
+	}
+
+	names, duckDBErr := t.listExcelSheetsWithDuckDB(ctx, filename)
+	if duckDBErr != nil {
+		return nil, fmt.Errorf("failed to enumerate sheets (workbook metadata: %v; DuckDB fallback: %w)",
+			workbookErr, duckDBErr)
+	}
+	return names, nil
+}
+
+func nonEmptySheetNames(names []string) []string {
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		filtered = append(filtered, name)
+	}
+	return filtered
+}
+
+func (t *DataAnalysisTool) listExcelSheetsWithDuckDB(ctx context.Context, filename string) ([]string, error) {
 	metaSQL := fmt.Sprintf(
 		"SELECT UNNEST(layers).name FROM st_read_meta('%s')",
 		sqlSingleQuoteEscape(filename),
 	)
-
 	rows, err := t.db.QueryContext(ctx, metaSQL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query sheet metadata: %w", err)
 	}
 	defer rows.Close()
 
-	var names []string
+	names := make([]string, 0)
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			return nil, fmt.Errorf("failed to scan sheet name: %w", err)
-		}
-		if strings.TrimSpace(name) == "" {
-			continue
 		}
 		names = append(names, name)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating sheet metadata rows: %w", err)
 	}
-	return names, nil
+	return nonEmptySheetNames(names), nil
 }
 
 // buildExcelCreateTableSQL assembles the CREATE TABLE statement used by

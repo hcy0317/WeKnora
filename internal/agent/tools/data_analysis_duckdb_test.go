@@ -5,16 +5,16 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/xuri/excelize/v2"
 )
 
-// newTestDuckDB opens an in-memory DuckDB and loads the extensions the
-// Data Analysis tool needs. If the extensions can't be installed (e.g. the
-// test environment has no network), the test is skipped — we can't validate
-// Excel handling without them.
+// newTestDuckDB opens an in-memory DuckDB and loads the Excel extension.
+// If the extension can't be installed (e.g. the test environment has no
+// network), the test is skipped — we can't validate Excel handling without it.
 func newTestDuckDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("duckdb", ":memory:")
@@ -24,7 +24,7 @@ func newTestDuckDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctx := context.Background()
-	for _, ext := range []string{"spatial", "excel"} {
+	for _, ext := range []string{"excel"} {
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("INSTALL %s;", ext)); err != nil {
 			t.Skipf("cannot install duckdb %s extension (network required): %v", ext, err)
 		}
@@ -80,6 +80,35 @@ func writeWorkbook(t *testing.T, path string, sheets map[string][][]any, sheetOr
 
 	if err := f.SaveAs(path); err != nil {
 		t.Fatalf("save workbook: %v", err)
+	}
+}
+
+func TestListExcelSheetsUsesWorkbookMetadata(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "weather.xlsx")
+	want := []string{"汇总", "安县", "平武", "北川", "江油", "绵阳", "梓潼", "三台", "盐亭"}
+	sheets := make(map[string][][]any, len(want))
+	for _, name := range want {
+		sheets[name] = [][]any{{"date", "temperature"}, {"2021-01-01", 1}}
+	}
+	writeWorkbook(t, path, sheets, want)
+
+	// Deliberately do not load DuckDB's spatial extension. Sheet discovery is
+	// an XLSX metadata concern and must not silently degrade to the first sheet
+	// because an unrelated database extension is unavailable or incomplete.
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+
+	tool := &DataAnalysisTool{db: db}
+	got, err := tool.listExcelSheets(context.Background(), path)
+	if err != nil {
+		t.Fatalf("listExcelSheets: %v", err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("sheet list = %v, want %v", got, want)
 	}
 }
 

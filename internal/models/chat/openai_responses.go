@@ -509,24 +509,36 @@ func (c *RemoteAPIChat) processResponsesStream(
 	reader := NewSSEReader(resp.Body)
 	completed := false
 	firstEventReported := false
+	lastEventType := ""
+	outputStarted := false
+	usageObserved := false
+	providerRequestID := responsesProviderRequestID(resp)
 	reducer := openaiapi.NewResponsesStreamReducer()
+	emitError := func(content, code, errorType string, httpStatus int) bool {
+		return emit(types.StreamResponse{
+			ResponseType: types.ResponseTypeError,
+			Content:      content,
+			Done:         true,
+			Data: types.StreamErrorDetails{
+				ProviderRequestID: providerRequestID,
+				LastSSEEventType:  lastEventType,
+				Code:              code,
+				Type:              errorType,
+				OutputStarted:     outputStarted,
+				UsageObserved:     usageObserved,
+				HTTPStatus:        httpStatus,
+			}.Data(),
+		})
+	}
 	for {
 		event, err := reader.ReadEvent()
 		if err != nil {
 			if err == io.EOF {
 				if !completed {
-					emit(types.StreamResponse{
-						ResponseType: types.ResponseTypeError,
-						Content:      "Responses stream closed before response.completed",
-						Done:         true,
-					})
+					emitError("Responses stream closed before response.completed", "stream_closed_before_completion", "transport_error", 0)
 				}
 			} else {
-				emit(types.StreamResponse{
-					ResponseType: types.ResponseTypeError,
-					Content:      fmt.Sprintf("Responses stream read failed: %v", err),
-					Done:         true,
-				})
+				emitError(fmt.Sprintf("Responses stream read failed: %v", err), "stream_read_error", "transport_error", 0)
 			}
 			return
 		}
@@ -535,11 +547,7 @@ func (c *RemoteAPIChat) processResponsesStream(
 		}
 		if event.Done {
 			if !completed {
-				emit(types.StreamResponse{
-					ResponseType: types.ResponseTypeError,
-					Content:      "Responses stream ended before response.completed",
-					Done:         true,
-				})
+				emitError("Responses stream ended before response.completed", "stream_ended_before_completion", "transport_error", 0)
 			}
 			return
 		}
@@ -549,13 +557,15 @@ func (c *RemoteAPIChat) processResponsesStream(
 
 		responseEvent, err := openaiapi.DecodeResponsesStreamEvent(event.Data)
 		if err != nil {
-			emit(types.StreamResponse{
-				ResponseType: types.ResponseTypeError,
-				Content:      err.Error(),
-				Done:         true,
-			})
+			emitError(err.Error(), "invalid_responses_sse_envelope", "protocol_error", 0)
 			return
 		}
+		lastEventType = responseEvent.Type
+		errorMessage, errorType, errorCode, eventRequestID, httpStatus, eventUsageObserved := responsesStreamErrorFacts(responseEvent)
+		if providerRequestID == "" {
+			providerRequestID = normalizeResponsesRequestID(eventRequestID)
+		}
+		usageObserved = usageObserved || eventUsageObserved
 		if !firstEventReported {
 			firstEventReported = true
 			langfuse.ReportGenerationProgress(ctx, langfuse.GenerationProgress{
@@ -566,13 +576,16 @@ func (c *RemoteAPIChat) processResponsesStream(
 		}
 		update, reduceErr := reducer.Apply(responseEvent)
 		if reduceErr != nil {
-			emit(types.StreamResponse{
-				ResponseType: types.ResponseTypeError,
-				Content:      reduceErr.Error(),
-				Done:         true,
-			})
+			if errorMessage == "" {
+				errorMessage = reduceErr.Error()
+			}
+			if errorCode == "" {
+				errorCode = responsesReducerErrorCode(responseEvent.Type)
+			}
+			emitError(errorMessage, errorCode, errorType, httpStatus)
 			return
 		}
+		outputStarted = outputStarted || update.OutputObserved
 		if update.AnswerDelta != "" && !emit(types.StreamResponse{ResponseType: types.ResponseTypeAnswer, Content: update.AnswerDelta}) {
 			return
 		}
@@ -592,4 +605,96 @@ func (c *RemoteAPIChat) processResponsesStream(
 			return
 		}
 	}
+}
+
+func responsesProviderRequestID(resp *http.Response) string {
+	if resp == nil {
+		return ""
+	}
+	for _, name := range []string{"X-Request-Id", "Request-Id", "X-Correlation-Id"} {
+		if value := strings.TrimSpace(resp.Header.Get(name)); value != "" {
+			return normalizeResponsesRequestID(value)
+		}
+	}
+	return ""
+}
+
+func normalizeResponsesRequestID(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 256 {
+		return value[:256]
+	}
+	return value
+}
+
+func responsesStreamErrorFacts(event openaiapi.ResponsesStreamEvent) (message, errorType, code, requestID string, httpStatus int, usageObserved bool) {
+	usageObserved = hasResponsesJSONValue(event.Usage)
+	requestID = strings.TrimSpace(event.RequestID)
+	if event.Error != nil {
+		message = strings.TrimSpace(event.Error.Message)
+		errorType = strings.TrimSpace(event.Error.Type)
+		code = strings.TrimSpace(event.Error.Code)
+		if requestID == "" {
+			requestID = strings.TrimSpace(event.Error.RequestID)
+		}
+		httpStatus = event.Error.HTTPStatus
+		if httpStatus == 0 {
+			httpStatus = event.Error.StatusCode
+		}
+	}
+	if len(event.Response) == 0 {
+		return
+	}
+	var response struct {
+		Error     *openaiapi.ResponsesStreamError `json:"error"`
+		Usage     json.RawMessage                 `json:"usage"`
+		RequestID string                          `json:"request_id"`
+	}
+	if json.Unmarshal(event.Response, &response) != nil {
+		return
+	}
+	usageObserved = usageObserved || hasResponsesJSONValue(response.Usage)
+	if requestID == "" {
+		requestID = strings.TrimSpace(response.RequestID)
+	}
+	if response.Error == nil {
+		return
+	}
+	if requestID == "" {
+		requestID = strings.TrimSpace(response.Error.RequestID)
+	}
+	if message == "" {
+		message = strings.TrimSpace(response.Error.Message)
+	}
+	if errorType == "" {
+		errorType = strings.TrimSpace(response.Error.Type)
+	}
+	if code == "" {
+		code = strings.TrimSpace(response.Error.Code)
+	}
+	if httpStatus == 0 {
+		httpStatus = response.Error.HTTPStatus
+		if httpStatus == 0 {
+			httpStatus = response.Error.StatusCode
+		}
+	}
+	return
+}
+
+func responsesReducerErrorCode(eventType string) string {
+	switch eventType {
+	case "error":
+		return "responses_error"
+	case "response.failed":
+		return "response_failed"
+	case "response.incomplete":
+		return "response_incomplete"
+	default:
+		return "responses_stream_reducer_error"
+	}
+}
+
+func hasResponsesJSONValue(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) && !bytes.Equal(trimmed, []byte("{}"))
 }
