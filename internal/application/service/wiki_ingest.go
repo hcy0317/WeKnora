@@ -3483,6 +3483,59 @@ func reconstructContent(chunks []*types.Chunk) string {
 	return searchutil.MergeTextChunks(textChunks, "\n")
 }
 
+func sampleWikiContent(content string, maxChars int) string {
+	if len([]rune(content)) <= maxChars {
+		return content
+	}
+
+	const (
+		sampleNotice = "[Document content is sampled from its beginning, middle, and end. Omission markers represent skipped source text, not the end of the document.]"
+		outlineLabel = "Document outline:"
+		contentLabel = "Representative content:"
+	)
+	prefix := sampleNotice + "\n\n" + outlineLabel + "\n"
+	suffix := "\n\n" + contentLabel + "\n"
+	reserved := len([]rune(prefix + suffix))
+	if maxChars <= reserved+100 {
+		return sampleLongContent(content, maxChars)
+	}
+
+	outlineBudget := min(4096, maxChars/4)
+	outline := sampleLongContent(markdownHeadingOutline(content), outlineBudget)
+	bodyBudget := maxChars - reserved - len([]rune(outline))
+	if bodyBudget < 100 {
+		return sampleLongContent(content, maxChars)
+	}
+
+	return prefix + outline + suffix + sampleLongContent(content, bodyBudget)
+}
+
+func markdownHeadingOutline(content string) string {
+	headings := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if !isMarkdownHeading(line) {
+			continue
+		}
+		if _, exists := seen[line]; exists {
+			continue
+		}
+		seen[line] = struct{}{}
+		headings = append(headings, line)
+	}
+	return strings.Join(headings, "\n")
+}
+
+func isMarkdownHeading(line string) bool {
+	level := 0
+	for level < len(line) && level < 6 && line[level] == '#' {
+		level++
+	}
+	return level > 0 && level < len(line) && line[level] == ' ' &&
+		strings.TrimSpace(line[level+1:]) != ""
+}
+
 // reconstructEnrichedContent rebuilds document text and inlines image_info
 // (OCR text + caption) pulled from image_ocr / image_caption child chunks.
 //

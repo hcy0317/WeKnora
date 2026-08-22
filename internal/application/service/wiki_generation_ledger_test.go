@@ -178,6 +178,51 @@ func TestGenerateWithTemplateFailsAmbiguousWhenDBAndRedisCannotPersistOutput(t *
 	require.Equal(t, 1, pages.ambiguous)
 }
 
+func TestGenerateWithTemplatePersistsStructuredAmbiguousStreamFacts(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&types.WikiGenerationFragment{}))
+	pages := NewWikiPageService(apprepo.NewWikiPageRepository(db), nil, nil, nil, nil)
+	model := &scriptedWikiChat{events: []types.StreamResponse{{
+		ResponseType: types.ResponseTypeError,
+		Content:      "Responses stream failed: stream_read_error",
+		Done:         true,
+		Data: map[string]interface{}{
+			"provider_request_id": "sub2api-persisted",
+			"last_sse_event_type": "response.output_text.delta",
+			"error_code":          "stream_read_error",
+			"error_type":          "upstream_error",
+			"output_started":      true,
+			"usage_observed":      false,
+		},
+	}}}
+	service := &wikiIngestService{wikiService: pages}
+	ctx := withWikiGenerationScope(context.Background(), wikiGenerationScope{
+		TenantID: 7, KnowledgeBaseID: "kb", WorkRevision: "ambiguous-work", RuntimeSnapshot: "runtime",
+	})
+
+	_, err = service.generateWithTemplate(ctx, model, agent.WikiSummaryPrompt, map[string]string{
+		"Content": "source", "Language": "Chinese",
+	})
+	require.Error(t, err)
+	require.Equal(t, WikiGenerationErrorAmbiguousCall, wikiGenerationErrorClassOf(err))
+
+	var fragment types.WikiGenerationFragment
+	require.NoError(t, db.Take(&fragment).Error)
+	require.Equal(t, types.WikiGenerationFragmentAmbiguous, fragment.State)
+	require.Equal(t, 1, fragment.Attempts)
+	require.Empty(t, fragment.CallID)
+	require.Nil(t, fragment.LeaseUntil)
+	for _, detail := range []string{
+		`request_id="sub2api-persisted"`,
+		`last_sse_event_type="response.output_text.delta"`,
+		`error_code="stream_read_error"`,
+		"output_started=true",
+	} {
+		require.Contains(t, fragment.LastError, detail)
+	}
+}
+
 func TestGenerateWithTemplateReusesFragmentAcrossServiceRestart(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)

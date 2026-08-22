@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1076,6 +1077,86 @@ func TestProcessResponsesStreamReportsReadInterruptionWithoutSuccess(t *testing.
 	require.Equal(t, "partial", content)
 	require.Contains(t, streamErr, wantErr.Error())
 	require.False(t, successDone)
+}
+
+func TestProcessResponsesStreamPreservesStructuredProviderError(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		body          string
+		wantCode      string
+		wantLastEvent string
+		wantOutput    bool
+	}{
+		{
+			name:     "transport error before output",
+			body:     "data: {\"type\":\"error\",\"error\":{\"message\":\"stream_read_error\",\"type\":\"upstream_error\",\"code\":\"stream_read_error\"}}\n\n",
+			wantCode: "stream_read_error", wantLastEvent: "error",
+		},
+		{
+			name: "transport error after output",
+			body: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n" +
+				"data: {\"type\":\"error\",\"error\":{\"message\":\"stream_read_error\",\"type\":\"upstream_error\",\"code\":\"stream_read_error\"}}\n\n",
+			wantCode: "stream_read_error", wantLastEvent: "error", wantOutput: true,
+		},
+		{
+			name: "malformed envelope after non-content event",
+			body: "data: {\"type\":\"response.in_progress\"}\n\n" +
+				"data: {\"error\":{\"message\":\"stream_read_error\"}}\n\n",
+			wantCode: "invalid_responses_sse_envelope", wantLastEvent: "response.in_progress",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := &http.Response{
+				Header: http.Header{"X-Request-Id": []string{"sub2api-request-1"}},
+				Body:   io.NopCloser(strings.NewReader(tc.body)),
+			}
+			stream := make(chan types.StreamResponse, 4)
+			(&RemoteAPIChat{}).processResponsesStream(context.Background(), response, stream)
+
+			var terminal types.StreamResponse
+			for event := range stream {
+				if event.ResponseType == types.ResponseTypeError {
+					terminal = event
+				}
+			}
+			require.True(t, terminal.Done)
+			require.Equal(t, "sub2api-request-1", terminal.Data["provider_request_id"])
+			require.Equal(t, tc.wantCode, terminal.Data["error_code"])
+			require.Equal(t, tc.wantLastEvent, terminal.Data["last_sse_event_type"])
+			require.Equal(t, tc.wantOutput, terminal.Data["output_started"])
+			require.Equal(t, false, terminal.Data["usage_observed"])
+		})
+	}
+}
+
+func TestProcessResponsesStreamPreservesRequestIDFromSSEErrorBody(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "event request id",
+			body: "data: {\"type\":\"error\",\"request_id\":\"sub2api-event-request\",\"error\":{\"message\":\"upstream failed\",\"code\":\"upstream_error\"}}\n\n",
+		},
+		{
+			name: "nested error request id",
+			body: "data: {\"type\":\"error\",\"error\":{\"message\":\"upstream failed\",\"code\":\"upstream_error\",\"request_id\":\"sub2api-event-request\"}}\n\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := &http.Response{Body: io.NopCloser(strings.NewReader(tc.body))}
+			stream := make(chan types.StreamResponse, 2)
+			(&RemoteAPIChat{}).processResponsesStream(context.Background(), response, stream)
+
+			var terminal types.StreamResponse
+			for event := range stream {
+				if event.ResponseType == types.ResponseTypeError {
+					terminal = event
+				}
+			}
+			require.Equal(t, "sub2api-event-request", terminal.Data["provider_request_id"])
+		})
+	}
 }
 
 func TestRemoteAPIChatUnknownStreamProbeLockReleasesAfterHeaders(t *testing.T) {

@@ -1606,10 +1606,8 @@ func (s *wikiIngestService) mapOneDocument(
 
 	content := reconstructEnrichedContent(ctx, s.chunkRepo, payload.TenantID, chunks)
 	rawRuneCount := len([]rune(content))
-	if len([]rune(content)) > maxContentForWiki {
-		content = string([]rune(content)[:maxContentForWiki])
-	}
-	logger.Infof(ctx, "wiki ingest: doc %s chunks=%d content_len(raw=%d,truncated=%d)", knowledgeID, len(chunks), rawRuneCount, len([]rune(content)))
+	content = sampleWikiContent(content, maxContentForWiki)
+	logger.Infof(ctx, "wiki ingest: doc %s chunks=%d content_len(raw=%d,sampled=%d)", knowledgeID, len(chunks), rawRuneCount, len([]rune(content)))
 
 	// Refuse to run LLM-based extraction when the document carries no real
 	// text — e.g. a scanned PDF whose pages were converted to images but where

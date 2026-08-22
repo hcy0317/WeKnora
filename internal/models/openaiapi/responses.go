@@ -424,20 +424,30 @@ func ParseResponsesHTTPResponse(status int, contentType string, body []byte) (*t
 	return response, facts, nil
 }
 
+type ResponsesStreamError struct {
+	Message    string `json:"message"`
+	Type       string `json:"type"`
+	Code       string `json:"code"`
+	RequestID  string `json:"request_id"`
+	HTTPStatus int    `json:"http_status"`
+	StatusCode int    `json:"status_code"`
+}
+
 type ResponsesStreamEvent struct {
-	Type     string          `json:"type"`
-	Delta    string          `json:"delta"`
-	Item     json.RawMessage `json:"item"`
-	Response json.RawMessage `json:"response"`
-	Error    *struct {
-		Message string `json:"message"`
-	} `json:"error"`
+	Type      string                `json:"type"`
+	Delta     string                `json:"delta"`
+	Item      json.RawMessage       `json:"item"`
+	Response  json.RawMessage       `json:"response"`
+	Usage     json.RawMessage       `json:"usage"`
+	Error     *ResponsesStreamError `json:"error"`
+	RequestID string                `json:"request_id"`
 }
 
 type ResponsesStreamUpdate struct {
-	AnswerDelta   string
-	ThinkingDelta string
-	Completed     *types.ChatResponse
+	AnswerDelta    string
+	ThinkingDelta  string
+	OutputObserved bool
+	Completed      *types.ChatResponse
 }
 
 type ResponsesStreamReducer struct {
@@ -464,10 +474,13 @@ func (r *ResponsesStreamReducer) Apply(event ResponsesStreamEvent) (ResponsesStr
 	case "response.output_text.delta":
 		r.emitted.WriteString(event.Delta)
 		update.AnswerDelta = event.Delta
+		update.OutputObserved = event.Delta != ""
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		update.ThinkingDelta = event.Delta
+		update.OutputObserved = event.Delta != ""
 	case "response.output_item.done":
 		if toolCall, ok := parseResponsesSSEToolCall(event.Item); ok {
+			update.OutputObserved = true
 			key := toolCall.ID + "\x00" + toolCall.Function.Name
 			if _, exists := r.seenTools[key]; !exists {
 				r.seenTools[key] = struct{}{}
