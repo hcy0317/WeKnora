@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -1640,6 +1641,41 @@ func TestRetryFailedKnowledgeSpansAllStalledOwnersShareOneAttempt(t *testing.T) 
 
 func TestRetryFailedKnowledgeSpansIncludesFailedAndAllStalledOwners(t *testing.T) {
 	runFourOwnerAggregateRetry(t, types.SpanStatusFailed)
+}
+
+func TestEvaluateKnowledgeSpanAggregateRetrySkipsTerminalNonFailedOwners(t *testing.T) {
+	post := types.KnowledgeProcessingSpan{ID: 1, KnowledgeID: "kid-terminal-fanout", Attempt: 4,
+		SpanID: "post", Name: types.StagePostProcess, Kind: types.SpanKindStage, Status: types.SpanStatusDone}
+	questionGroup := types.KnowledgeProcessingSpan{ID: 2, KnowledgeID: post.KnowledgeID, Attempt: 4,
+		SpanID: "question-group", ParentSpanID: post.SpanID, Name: "postprocess.question",
+		Kind: types.SpanKindSubSpan, Status: types.SpanStatusDone}
+	candidates := []types.KnowledgeProcessingSpan{post, questionGroup}
+	for i := 0; i < 4_500; i++ {
+		candidates = append(candidates, types.KnowledgeProcessingSpan{
+			ID: int64(i + 3), KnowledgeID: post.KnowledgeID, Attempt: 4,
+			SpanID: fmt.Sprintf("graph-%d", i), ParentSpanID: post.SpanID,
+			Name: fmt.Sprintf("postprocess.graph.chunk[%d]", i), Kind: types.SpanKindSubSpan,
+			Status: types.SpanStatusDone,
+		})
+	}
+	for i := 0; i < 250; i++ {
+		candidates = append(candidates, types.KnowledgeProcessingSpan{
+			ID: int64(i + 4_503), KnowledgeID: post.KnowledgeID, Attempt: 4,
+			SpanID: fmt.Sprintf("question-%d", i), ParentSpanID: questionGroup.SpanID,
+			Name: fmt.Sprintf("postprocess.question.batch[%d]", i), Kind: types.SpanKindSubSpan,
+			Status: types.SpanStatusCancelled,
+		})
+	}
+
+	tracker := &retryPreparingTracker{candidates: candidates}
+	svc := &knowledgeService{spanTracker: tracker}
+	action, err := svc.EvaluateKnowledgeSpanAggregateRetry(context.Background(),
+		types.KnowledgeSpanAggregateRetryRequest{KnowledgeID: post.KnowledgeID, Attempt: 4})
+
+	require.NoError(t, err)
+	require.False(t, action.Allowed)
+	require.Equal(t, "no_retryable_targets", action.Reason)
+	require.Zero(t, tracker.inspectCalls, "terminal non-failed owners must not trigger per-owner liveness reads")
 }
 
 func TestRetryFailedKnowledgeSpansCarriesUnreplayableStalledQuestion(t *testing.T) {

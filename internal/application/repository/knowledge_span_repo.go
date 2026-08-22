@@ -26,8 +26,9 @@ import (
 //     through the same write so the row stays internally consistent.
 //   - OpenAttempt atomically allocates a new attempt without touching
 //     terminal historical rows. Old attempts stay queryable for post-mortem.
-//   - ListByAttempt is the only read path; the handler builds the tree
-//     in memory rather than recursing through the DB.
+//   - ListByAttempt is the full-fidelity internal read. The operator timeline
+//     uses narrower projection methods on the concrete repository so large
+//     fan-out attempts do not transfer every successful model payload.
 type KnowledgeSpanRepository interface {
 	Upsert(ctx context.Context, row *types.KnowledgeProcessingSpan) error
 	// UpsertRunningStageIfCurrent starts or re-enters a canonical stage only
@@ -577,6 +578,58 @@ func (r *knowledgeSpanRepository) ListByAttempt(ctx context.Context, knowledgeID
 	// id ASC keeps the natural insertion order — useful for stable
 	// rendering of fan-out subspans (e.g. multimodal.image[0..N] in
 	// the order they were enqueued).
+	err := q.Order("id ASC").Find(&rows).Error
+	return rows, err
+}
+
+// ListTimelineByAttempt keeps the operator-facing tree lightweight by omitting
+// successful generation leaves. Their usage is returned through the separate
+// compact usage read below; failed or still-live generations remain visible so
+// diagnostics and retry actions retain their exact error boundary.
+func (r *knowledgeSpanRepository) ListTimelineByAttempt(
+	ctx context.Context, knowledgeID string, attempt int,
+) ([]types.KnowledgeProcessingSpan, error) {
+	if knowledgeID == "" {
+		return nil, nil
+	}
+	var rows []types.KnowledgeProcessingSpan
+	q := r.db.WithContext(ctx).
+		Where("knowledge_id = ?", knowledgeID).
+		Where("NOT (kind = ? AND status = ?)", types.SpanKindGeneration, types.SpanStatusDone)
+	if attempt > 0 {
+		q = q.Where("attempt = ?", attempt)
+	}
+	err := q.Order("id ASC").Find(&rows).Error
+	return rows, err
+}
+
+// ListTokenUsageByAttempt reads only the generation fields required by
+// summarizeKnowledgeTokenUsage. In PostgreSQL, JSON projection avoids moving
+// full model responses through the timeline endpoint merely to total tokens.
+func (r *knowledgeSpanRepository) ListTokenUsageByAttempt(
+	ctx context.Context, knowledgeID string, attempt int,
+) ([]types.KnowledgeProcessingSpan, error) {
+	if knowledgeID == "" {
+		return nil, nil
+	}
+	var rows []types.KnowledgeProcessingSpan
+	q := r.db.WithContext(ctx).Model(&types.KnowledgeProcessingSpan{}).
+		Where("knowledge_id = ? AND kind = ?", knowledgeID, types.SpanKindGeneration)
+	if attempt > 0 {
+		q = q.Where("attempt = ?", attempt)
+	}
+	if r.db.Dialector.Name() == "postgres" {
+		q = q.Select(`kind,
+			jsonb_build_object('usage', COALESCE(output -> 'usage', metadata -> 'usage')) AS output,
+			jsonb_build_object(
+				'processing_stage', metadata -> 'processing_stage',
+				'model_type', metadata -> 'model_type',
+				'model_id', metadata -> 'model_id',
+				'model_name', metadata -> 'model_name'
+			) AS metadata`)
+	} else {
+		q = q.Select("kind, output, metadata")
+	}
 	err := q.Order("id ASC").Find(&rows).Error
 	return rows, err
 }

@@ -894,6 +894,13 @@ func (s *knowledgeService) planFailedSpanAggregateRetry(
 	states := make(map[string]string, len(names))
 	for _, name := range names {
 		row := latest[name]
+		// Only failed or live owners need an authoritative retry/liveness read.
+		// Done, skipped, and cancelled fan-out leaves are terminal and cannot be
+		// selected, so inspecting each one turns the timeline GET into an N+1
+		// query on large documents without changing the retry decision.
+		if terminalRetrySpanStatus(row.Status) && row.Status != types.SpanStatusFailed {
+			continue
+		}
 		single := types.KnowledgeSpanRetryRequest{
 			KnowledgeID: request.KnowledgeID, Attempt: request.Attempt, SpanID: row.SpanID,
 			ClientRequestID: request.ClientRequestID, Language: request.Language,

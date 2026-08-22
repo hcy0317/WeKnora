@@ -65,6 +65,7 @@ func summarizeKnowledgeTokenUsage(rows []types.KnowledgeProcessingSpan) knowledg
 		if stageName == "" {
 			stageName = "unattributed"
 		}
+		stageName = compactKnowledgeUsageStage(stageName)
 		stage := stages[stageName]
 		if stage == nil {
 			stage = &mutableTokenStage{models: make(map[string]*tokenUsageModelSummary)}
@@ -117,6 +118,31 @@ func summarizeKnowledgeTokenUsage(rows []types.KnowledgeProcessingSpan) knowledg
 	}
 	result.HasData = result.Usage.Calls > 0
 	return result
+}
+
+func compactKnowledgeUsageStage(stage string) string {
+	families := []struct {
+		prefix string
+		name   string
+	}{
+		{prefix: "postprocess.graph.chunk", name: "postprocess.graph"},
+		{prefix: "postprocess.question.batch", name: "postprocess.question"},
+		{prefix: "postprocess.wiki.page", name: "postprocess.wiki.page"},
+	}
+	for _, family := range families {
+		if hasIndexedStageSuffix(stage, family.prefix) {
+			return family.name
+		}
+	}
+	return stage
+}
+
+func hasIndexedStageSuffix(stage, prefix string) bool {
+	if !strings.HasPrefix(stage, prefix+"[") || !strings.HasSuffix(stage, "]") {
+		return false
+	}
+	value := stage[len(prefix)+1 : len(stage)-1]
+	return strings.TrimSpace(value) != ""
 }
 
 func usageMetricsFromMap(usage types.JSONMap) tokenUsageMetrics {

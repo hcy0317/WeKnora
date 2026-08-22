@@ -749,6 +749,38 @@ func TestKnowledgeSpanRepo_UpsertAndList(t *testing.T) {
 	assert.Equal(t, int64(2000), rows[0].DurationMs)
 }
 
+func TestKnowledgeSpanRepo_TimelineReadOmitsSuccessfulGenerationPayloads(t *testing.T) {
+	repo, _ := setupSpanTestRepo(t)
+	ctx := context.Background()
+	now := time.Now()
+	rows := []*types.KnowledgeProcessingSpan{
+		{KnowledgeID: "timeline-kid", Attempt: 3, SpanID: "root", Name: "knowledge_processing", Kind: types.SpanKindRoot, Status: types.SpanStatusDone, StartedAt: &now},
+		{KnowledgeID: "timeline-kid", Attempt: 3, SpanID: "done-generation", ParentSpanID: "root", Name: "chat.response", Kind: types.SpanKindGeneration, Status: types.SpanStatusDone, StartedAt: &now,
+			Output: types.JSONMap{"usage": types.JSONMap{"total_tokens": 12}}, Metadata: types.JSONMap{"processing_stage": "postprocess.graph.chunk[1]"}},
+		{KnowledgeID: "timeline-kid", Attempt: 3, SpanID: "failed-generation", ParentSpanID: "root", Name: "chat.response", Kind: types.SpanKindGeneration, Status: types.SpanStatusFailed, StartedAt: &now,
+			ErrorCode: "STREAM_READ_ERROR", Metadata: types.JSONMap{"processing_stage": "postprocess.graph.chunk[2]"}},
+	}
+	for _, row := range rows {
+		require.NoError(t, repo.Upsert(ctx, row))
+	}
+
+	reader, ok := repo.(interface {
+		ListTimelineByAttempt(context.Context, string, int) ([]types.KnowledgeProcessingSpan, error)
+		ListTokenUsageByAttempt(context.Context, string, int) ([]types.KnowledgeProcessingSpan, error)
+	})
+	require.True(t, ok, "repository must expose the compact timeline read surface")
+	timelineRows, err := reader.ListTimelineByAttempt(ctx, "timeline-kid", 3)
+	require.NoError(t, err)
+	require.Len(t, timelineRows, 2)
+	assert.Equal(t, []string{"root", "failed-generation"}, []string{timelineRows[0].SpanID, timelineRows[1].SpanID})
+
+	usageRows, err := reader.ListTokenUsageByAttempt(ctx, "timeline-kid", 3)
+	require.NoError(t, err)
+	require.Len(t, usageRows, 2)
+	assert.Equal(t, types.SpanKindGeneration, usageRows[0].Kind)
+	assert.Empty(t, usageRows[0].Input)
+}
+
 func TestKnowledgeSpanRepo_CancelAllOpenSpansPersistsDuration(t *testing.T) {
 	repo, _ := setupSpanTestRepo(t)
 	ctx := context.Background()

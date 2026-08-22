@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -57,6 +58,83 @@ func TestBuildSpanTree_AssemblesParentChild(t *testing.T) {
 	require.NotNil(mmNode)
 	require.Len(mmNode.Children, 1, "image generation subspan must be a child of multimodal stage")
 	require.Equal("multimodal.image[0]", mmNode.Children[0].Name)
+}
+
+func TestCompactKnowledgeTimelineRowsAggregatesCompletedFanout(t *testing.T) {
+	now := time.Now()
+	later := now.Add(2 * time.Second)
+	rows := []types.KnowledgeProcessingSpan{
+		{KnowledgeID: "kid", Attempt: 2, SpanID: "root", Name: "knowledge_processing", Kind: types.SpanKindRoot, Status: types.SpanStatusDone, StartedAt: &now, FinishedAt: &later},
+		{KnowledgeID: "kid", Attempt: 2, SpanID: "post", ParentSpanID: "root", Name: types.StagePostProcess, Kind: types.SpanKindStage, Status: types.SpanStatusDone, StartedAt: &now, FinishedAt: &later},
+		{KnowledgeID: "kid", Attempt: 2, SpanID: "graph-0-old", ParentSpanID: "post", Name: "postprocess.graph.chunk[0]", Kind: types.SpanKindSubSpan, Status: types.SpanStatusCancelled, StartedAt: &now, FinishedAt: &later},
+		{KnowledgeID: "kid", Attempt: 2, SpanID: "graph-0-new", ParentSpanID: "post", Name: "postprocess.graph.chunk[0]", Kind: types.SpanKindSubSpan, Status: types.SpanStatusDone, StartedAt: &now, FinishedAt: &later},
+		{KnowledgeID: "kid", Attempt: 2, SpanID: "graph-1", ParentSpanID: "post", Name: "postprocess.graph.chunk[1]", Kind: types.SpanKindSubSpan, Status: types.SpanStatusDone, StartedAt: &now, FinishedAt: &later},
+		{KnowledgeID: "kid", Attempt: 2, SpanID: "graph-2", ParentSpanID: "post", Name: "postprocess.graph.chunk[2]", Kind: types.SpanKindSubSpan, Status: types.SpanStatusFailed, StartedAt: &now, FinishedAt: &later},
+		{KnowledgeID: "kid", Attempt: 2, SpanID: "question", ParentSpanID: "post", Name: "postprocess.question", Kind: types.SpanKindSubSpan, Status: types.SpanStatusDone, StartedAt: &now, FinishedAt: &later},
+		{KnowledgeID: "kid", Attempt: 2, SpanID: "question-0", ParentSpanID: "question", Name: "postprocess.question.batch[0]", Kind: types.SpanKindSubSpan, Status: types.SpanStatusDone, StartedAt: &now, FinishedAt: &later},
+		{KnowledgeID: "kid", Attempt: 2, SpanID: "question-1", ParentSpanID: "question", Name: "postprocess.question.batch[1]", Kind: types.SpanKindSubSpan, Status: types.SpanStatusDone, StartedAt: &now, FinishedAt: &later},
+		{KnowledgeID: "kid", Attempt: 2, SpanID: "done-generation", ParentSpanID: "graph-0-new", Name: "chat.response", Kind: types.SpanKindGeneration, Status: types.SpanStatusDone, StartedAt: &now, FinishedAt: &later},
+	}
+
+	got := compactKnowledgeTimelineRows(rows)
+	names := make([]string, 0, len(got))
+	spanIDs := make([]string, 0, len(got))
+	for _, row := range got {
+		names = append(names, row.Name)
+		spanIDs = append(spanIDs, row.SpanID)
+	}
+	assert.Contains(t, names, "postprocess.graph")
+	assert.Contains(t, names, "postprocess.graph.chunk[2]")
+	assert.NotContains(t, names, "postprocess.graph.chunk[0]")
+	assert.NotContains(t, names, "postprocess.graph.chunk[1]")
+	assert.Contains(t, names, "postprocess.question.batches")
+	assert.NotContains(t, names, "postprocess.question.batch[0]")
+	assert.NotContains(t, names, "postprocess.question.batch[1]")
+	assert.NotContains(t, spanIDs, "done-generation")
+
+	var graphGroup *types.KnowledgeProcessingSpan
+	for i := range got {
+		if got[i].Name == "postprocess.graph" {
+			graphGroup = &got[i]
+			break
+		}
+	}
+	if assert.NotNil(t, graphGroup) {
+		assert.Equal(t, 2, int(graphGroup.Output["completed_count"].(int)))
+		assert.Equal(t, "post", graphGroup.ParentSpanID)
+	}
+}
+
+func TestCompactKnowledgeTimelineRowsBoundsLargeCompletedFanout(t *testing.T) {
+	now := time.Now()
+	rows := []types.KnowledgeProcessingSpan{
+		{KnowledgeID: "kid", Attempt: 5, SpanID: "root", Name: "knowledge_processing", Kind: types.SpanKindRoot, Status: types.SpanStatusDone, StartedAt: &now},
+		{KnowledgeID: "kid", Attempt: 5, SpanID: "post", ParentSpanID: "root", Name: types.StagePostProcess, Kind: types.SpanKindStage, Status: types.SpanStatusDone, StartedAt: &now},
+		{KnowledgeID: "kid", Attempt: 5, SpanID: "question", ParentSpanID: "post", Name: "postprocess.question", Kind: types.SpanKindSubSpan, Status: types.SpanStatusDone, StartedAt: &now},
+	}
+	for i := 0; i < 4478; i++ {
+		rows = append(rows, types.KnowledgeProcessingSpan{
+			KnowledgeID: "kid", Attempt: 5, SpanID: fmt.Sprintf("graph-%d", i), ParentSpanID: "post",
+			Name: fmt.Sprintf("postprocess.graph.chunk[%d]", i), Kind: types.SpanKindSubSpan,
+			Status: types.SpanStatusDone, StartedAt: &now,
+		})
+	}
+	for i := 0; i < 255; i++ {
+		rows = append(rows, types.KnowledgeProcessingSpan{
+			KnowledgeID: "kid", Attempt: 5, SpanID: fmt.Sprintf("question-%d", i), ParentSpanID: "question",
+			Name: fmt.Sprintf("postprocess.question.batch[%d]", i), Kind: types.SpanKindSubSpan,
+			Status: types.SpanStatusDone, StartedAt: &now,
+		})
+	}
+	for i := 0; i < 68; i++ {
+		rows = append(rows, types.KnowledgeProcessingSpan{
+			KnowledgeID: "kid", Attempt: 5, SpanID: fmt.Sprintf("failed-generation-%d", i), ParentSpanID: "post",
+			Name: "chat.response", Kind: types.SpanKindGeneration, Status: types.SpanStatusFailed, StartedAt: &now,
+		})
+	}
+
+	got := compactKnowledgeTimelineRows(rows)
+	assert.Len(t, got, 73, "two summary groups plus exact failed generations must bound the response")
 }
 
 // TestBuildSpanTree_NoRows_SynthesizesPlaceholderRoot ensures the API
