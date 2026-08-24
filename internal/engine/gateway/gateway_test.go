@@ -129,17 +129,24 @@ func TestGatewayReconcilesActiveShadowLeaseAfterControllerRecovers(t *testing.T)
 	t.Parallel()
 
 	finishProxy := make(chan struct{})
+	var finishProxyOnce sync.Once
+	unblockProxy := func() {
+		finishProxyOnce.Do(func() { close(finishProxy) })
+	}
+	proxyStarted := make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/health" {
 			response.WriteHeader(http.StatusOK)
 			return
 		}
 		if request.Header.Get("X-Test-Block") == "true" {
+			close(proxyStarted)
 			<-finishProxy
 		}
 		response.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(backend.Close)
+	t.Cleanup(unblockProxy)
 	leaseClient := &fakeLeaseClient{lease: lifecycle.Lease{
 		ID:              "lease-signed",
 		Group:           lifecycle.GroupASR,
@@ -177,20 +184,32 @@ func TestGatewayReconcilesActiveShadowLeaseAfterControllerRecovers(t *testing.T)
 		gateway.ServeHTTP(httptest.NewRecorder(), request)
 	}()
 
+	select {
+	case <-proxyStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shadow proxy did not start")
+	}
+	leaseClient.mu.Lock()
+	leaseClient.reconcileErr = nil
+	leaseClient.mu.Unlock()
+	var reconcile lifecycle.GatewayReconcile
 	require.Eventually(t, func() bool {
 		leaseClient.mu.Lock()
 		defer leaseClient.mu.Unlock()
-		leaseClient.reconcileErr = nil
-		return len(leaseClient.reconciles) > 0 && len(leaseClient.reconciles[len(leaseClient.reconciles)-1].ShadowLeases) == 1
-	}, time.Second, 10*time.Millisecond)
-	leaseClient.mu.Lock()
-	reconcile := leaseClient.reconciles[len(leaseClient.reconciles)-1]
-	leaseClient.mu.Unlock()
+		for index := len(leaseClient.reconciles) - 1; index >= 0; index-- {
+			candidate := leaseClient.reconciles[index]
+			if len(candidate.ShadowLeases) == 1 {
+				reconcile = candidate
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 10*time.Millisecond)
 	require.Equal(t, "gateway-reconcile", reconcile.GatewayID)
 	require.Equal(t, lifecycle.GroupASR, reconcile.ShadowLeases[0].Group)
 	require.Equal(t, uint64(11), reconcile.ShadowLeases[0].ControllerEpoch)
 
-	close(finishProxy)
+	unblockProxy()
 	select {
 	case <-proxyDone:
 	case <-time.After(time.Second):
