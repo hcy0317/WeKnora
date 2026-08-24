@@ -27,13 +27,13 @@ var versionedSQLiteColumns = map[string][]string{
 	"tenants":            {"api_principal_config"},           // 000064
 	"users":              {"is_system_admin"},                // 000053
 	"knowledges":         {"pending_subtasks_count"},         // 000056
-	"messages":           {"attachments"},                    // 000034
+	"messages":           {"attachments", "usage"},           // 000034, 000092
 	"tenant_invitations": {"token", "accepted_count"},        // 000054
 	"embed_channels":     {"allow_memory"},                   // 000060
 	"mcp_oauth_tokens":   {"principal_type", "principal_id"}, // 000064
 }
 
-const expectedSQLiteMigrationVersion = 16
+const expectedSQLiteMigrationVersion = 17
 
 func TestSQLiteMigrationsCreateVersionedSchema(t *testing.T) {
 	repoRoot := sqliteRepoRoot(t)
@@ -66,6 +66,29 @@ func TestSQLiteMigrationsCreateVersionedSchema(t *testing.T) {
 	assertSQLiteMCPOAuthPrincipalUpsertWorks(t, db)
 	require.False(t, sqliteColumnExists(t, db, "knowledges", "tag_id"),
 		"SQLite migrations must drop legacy knowledges.tag_id after multi-tag migration")
+}
+
+func TestSQLiteLegacyLocalVersion16ReceivesMessageUsage(t *testing.T) {
+	repoRoot := sqliteRepoRoot(t)
+	chdirAndRestore(t, repoRoot)
+
+	dbPath := filepath.Join(t.TempDir(), "legacy-local-v16.db")
+	require.NoError(t, RunMigrationsWithOptions("sqlite3://unused", MigrationOptions{SQLiteDBPath: dbPath}))
+
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = db.Exec("ALTER TABLE messages DROP COLUMN usage")
+	require.NoError(t, err)
+	_, err = db.Exec("UPDATE schema_migrations SET version = 16, dirty = 0")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	require.NoError(t, RunMigrationsWithOptions("sqlite3://unused", MigrationOptions{SQLiteDBPath: dbPath}))
+	db = openSQLiteDB(t, dbPath)
+	version, dirty := sqliteMigrationState(t, db)
+	require.Equal(t, expectedSQLiteMigrationVersion, version)
+	require.False(t, dirty)
+	require.True(t, sqliteColumnExists(t, db, "messages", "usage"))
 }
 
 func TestSQLiteMigrationsUpgradeV4PreservesData(t *testing.T) {
@@ -261,7 +284,6 @@ func copySQLiteMigrationsV4(t *testing.T, repoRoot string) string {
 	}
 	return dest
 }
-
 func copySQLiteMigrationsV3(t *testing.T, repoRoot string) string {
 	t.Helper()
 	dest := t.TempDir()

@@ -23,7 +23,7 @@ func (e *countingAvailabilityEngine) NewReader(context.Context, ReaderDeps) (int
 	return nil, nil
 }
 
-func TestListAllEnginesBuiltinIncludesHTML(t *testing.T) {
+func TestListAllEnginesBuiltinIncludesDocumentFormats(t *testing.T) {
 	engines := ListAllEngines(true, nil, nil)
 	for _, engine := range engines {
 		if engine.Name != "builtin" {
@@ -37,7 +37,7 @@ func TestListAllEnginesBuiltinIncludesHTML(t *testing.T) {
 		for _, fileType := range engine.FileTypes {
 			fileTypes[fileType] = true
 		}
-		for _, want := range []string{"html", "htm"} {
+		for _, want := range []string{"html", "htm", "xmind"} {
 			if !fileTypes[want] {
 				t.Errorf("builtin engine file types do not include %q: %v", want, engine.FileTypes)
 			}

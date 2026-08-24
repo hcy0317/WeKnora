@@ -89,7 +89,7 @@ func setMigrationVersion(t *testing.T, db *sql.DB, version uint, dirty bool) {
 	require.NoError(t, err)
 }
 
-func TestPostgresMigration80To91AndIdempotentSQL(t *testing.T) {
+func TestPostgresMigration80To93AndIdempotentSQL(t *testing.T) {
 	useRepositoryRoot(t)
 	dsn, db := newEphemeralPostgresSchema(t)
 	m, err := migrate.New("file://migrations/versioned", dsn)
@@ -101,7 +101,7 @@ func TestPostgresMigration80To91AndIdempotentSQL(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	assert.Equal(t, uint(91), version)
+	assert.Equal(t, uint(93), version)
 	assert.False(t, dirty)
 	var definition string
 	require.NoError(t, db.QueryRow(`SELECT indexdef FROM pg_indexes
@@ -138,6 +138,37 @@ func TestPostgresMigration80To91AndIdempotentSQL(t *testing.T) {
 	require.NoError(t, execSQL(db, string(down)))
 	require.NoError(t, execSQL(db, string(up)))
 	require.NoError(t, execSQL(db, string(up)))
+}
+
+func TestPostgresMigrationLegacyLocalVersion91ReceivesUpstreamMigrations(t *testing.T) {
+	useRepositoryRoot(t)
+	dsn, db := newEphemeralPostgresSchema(t)
+	require.NoError(t, RunMigrationsWithOptions(dsn, MigrationOptions{}))
+
+	_, err := db.Exec(`
+		DROP TABLE tenant_skill_snapshots;
+		DROP TABLE tenant_skills;
+		ALTER TABLE messages DROP COLUMN usage;
+		UPDATE schema_migrations SET version = 91, dirty = false;
+	`)
+	require.NoError(t, err)
+
+	require.NoError(t, RunMigrationsWithOptions(dsn, MigrationOptions{}))
+	var version uint
+	var dirty bool
+	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
+	require.Equal(t, uint(93), version)
+	require.False(t, dirty)
+
+	var upstreamObjects int
+	require.NoError(t, db.QueryRow(`SELECT
+		(EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'messages' AND column_name = 'usage'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'tenant_skills'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'tenant_skill_snapshots'))::int`).Scan(&upstreamObjects))
+	require.Equal(t, 3, upstreamObjects)
 }
 
 func TestPostgresMigration88WikiCheckpointRollbackIsIdempotent(t *testing.T) {
@@ -298,7 +329,7 @@ func TestPostgresMigration85DirtyRecoversIdempotently(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	assert.Equal(t, uint(89), version)
+	assert.Equal(t, uint(93), version)
 	assert.False(t, dirty)
 	var indexes int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM pg_indexes
@@ -369,14 +400,14 @@ func TestPostgresMigrationGateDriftMatrix(t *testing.T) {
 	})
 }
 
-func TestPostgresFreshAndPre55MigrateTo89(t *testing.T) {
+func TestPostgresFreshAndPre55MigrateTo93(t *testing.T) {
 	useRepositoryRoot(t)
 	t.Run("fresh", func(t *testing.T) {
 		dsn, db := newEphemeralPostgresSchema(t)
 		require.NoError(t, RunMigrationsWithOptions(dsn, MigrationOptions{}))
 		var version uint
 		require.NoError(t, db.QueryRow(`SELECT version FROM schema_migrations`).Scan(&version))
-		assert.Equal(t, uint(89), version)
+		assert.Equal(t, uint(93), version)
 	})
 
 	t.Run("pre55", func(t *testing.T) {
@@ -391,11 +422,11 @@ func TestPostgresFreshAndPre55MigrateTo89(t *testing.T) {
 		require.NoError(t, RunMigrationsWithOptions(dsn, MigrationOptions{}))
 		var version uint
 		require.NoError(t, db.QueryRow(`SELECT version FROM schema_migrations`).Scan(&version))
-		assert.Equal(t, uint(89), version)
+		assert.Equal(t, uint(93), version)
 	})
 }
 
-func TestPostgresLegacyLocalVersion85ReplaysUpstreamMigrations(t *testing.T) {
+func TestPostgresMigrationLegacyLocalVersion85ReplaysUpstreamMigrations(t *testing.T) {
 	useRepositoryRoot(t)
 	dsn, db := newEphemeralPostgresSchema(t)
 	m, err := migrate.New("file://migrations/versioned", dsn)
@@ -426,14 +457,18 @@ func TestPostgresLegacyLocalVersion85ReplaysUpstreamMigrations(t *testing.T) {
 		(EXISTS (SELECT 1 FROM information_schema.columns
 			WHERE table_schema = current_schema() AND table_name = 'sessions' AND column_name = 'sandbox_config_id'))::int +
 		(EXISTS (SELECT 1 FROM information_schema.tables
-			WHERE table_schema = current_schema() AND table_name = 'memory_subjects'))::int`).Scan(&upstreamObjects))
+			WHERE table_schema = current_schema() AND table_name = 'memory_subjects'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'messages' AND column_name = 'usage'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'tenant_skills'))::int`).Scan(&upstreamObjects))
 	require.Zero(t, upstreamObjects, "fixture must represent the old local v85 history")
 
 	require.NoError(t, RunMigrationsWithOptions(dsn, MigrationOptions{}))
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	require.Equal(t, uint(89), version)
+	require.Equal(t, uint(93), version)
 	require.False(t, dirty)
 	require.NoError(t, db.QueryRow(`SELECT
 		(EXISTS (SELECT 1 FROM information_schema.columns
@@ -443,8 +478,12 @@ func TestPostgresLegacyLocalVersion85ReplaysUpstreamMigrations(t *testing.T) {
 		(EXISTS (SELECT 1 FROM information_schema.columns
 			WHERE table_schema = current_schema() AND table_name = 'sessions' AND column_name = 'sandbox_config_id'))::int +
 		(EXISTS (SELECT 1 FROM information_schema.tables
-			WHERE table_schema = current_schema() AND table_name = 'memory_subjects'))::int`).Scan(&upstreamObjects))
-	require.Equal(t, 4, upstreamObjects)
+			WHERE table_schema = current_schema() AND table_name = 'memory_subjects'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'messages' AND column_name = 'usage'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'tenant_skills'))::int`).Scan(&upstreamObjects))
+	require.Equal(t, 6, upstreamObjects)
 }
 
 func execSQL(db *sql.DB, statement string) error {
