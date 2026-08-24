@@ -215,7 +215,7 @@ func TestSQLiteLegacyLocalVersion6ReplaysUpstreamMemory(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	require.Equal(t, uint(16), version)
+	require.Equal(t, uint(17), version)
 	require.False(t, dirty)
 
 	for _, table := range []string{
@@ -296,7 +296,7 @@ func TestSQLiteLegacyLocalVersion9ReplaysUpstreamMigrations(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow("SELECT version, dirty FROM schema_migrations").Scan(&version, &dirty))
-	require.Equal(t, uint(16), version)
+	require.Equal(t, uint(17), version)
 	require.False(t, dirty)
 
 	for _, table := range []string{
@@ -322,6 +322,7 @@ func TestSQLiteLegacyLocalVersion9ReplaysUpstreamMigrations(t *testing.T) {
 		name  string
 	}{
 		{table: "messages", name: "attachments"},
+		{table: "messages", name: "usage"},
 		{table: "users", name: "is_system_admin"},
 		{table: "knowledges", name: "pending_subtasks_count"},
 		{table: "embed_channels", name: "allow_memory"},
