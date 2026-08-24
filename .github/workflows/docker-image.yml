@@ -15,7 +15,10 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  # Tencent owns the Docker Hub publishing credentials. Forks opt in with a
+  # repository variable after configuring their own credentials.
   build-ui:
+    if: github.repository == 'Tencent/WeKnora' || vars.ENABLE_DOCKER_PUBLISH == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -68,6 +71,7 @@ jobs:
           cache-to: type=gha,scope=build-ui,mode=max
 
   build-docreader:
+    if: github.repository == 'Tencent/WeKnora' || vars.ENABLE_DOCKER_PUBLISH == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Free Disk Space
@@ -117,6 +121,7 @@ jobs:
           cache-to: type=gha,scope=build-docreader,mode=max
 
   build-sandbox:
+    if: github.repository == 'Tencent/WeKnora' || vars.ENABLE_DOCKER_PUBLISH == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -176,6 +181,7 @@ jobs:
           cache-to: type=gha,scope=build-sandbox-cube,mode=max
 
   build-app:
+    if: github.repository == 'Tencent/WeKnora' || vars.ENABLE_DOCKER_PUBLISH == 'true'
     strategy:
       matrix:
         include:
