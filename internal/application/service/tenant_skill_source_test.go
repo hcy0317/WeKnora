@@ -165,6 +165,22 @@ func TestParseSkillSourceRejects(t *testing.T) {
 	require.ErrorContains(t, err, "ambiguous")
 }
 
+func TestGitSourceCandidatesTryLongestSlashRefFirst(t *testing.T) {
+	src, err := parseSkillSource(
+		"https://github.com/acme/skills/tree/feature/secure-install/catalog/pdf",
+	)
+	require.NoError(t, err)
+
+	candidates := gitSourceCandidates(src)
+	require.Equal(t, []string{
+		"feature/secure-install/catalog/pdf",
+		"feature/secure-install/catalog",
+		"feature/secure-install",
+		"feature",
+	}, []string{candidates[0].Ref, candidates[1].Ref, candidates[2].Ref, candidates[3].Ref})
+	require.Equal(t, "catalog/pdf", candidates[2].Subdir)
+}
+
 func TestParseSkillSourceAtSlugIsRegistryNotGitHub(t *testing.T) {
 	got, err := parseSkillSource("@clawhub_pskoett/self-improving-agent")
 	require.NoError(t, err)

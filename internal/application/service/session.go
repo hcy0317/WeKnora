@@ -947,7 +947,7 @@ func (s *sessionService) holdSandboxTurn(
 	if strings.TrimSpace(sessionID) == "" {
 		return func() {}
 	}
-	begin := func(mgr sandbox.Manager) sandbox.SessionTurnHolder {
+	begin := func(mgr sandbox.Manager) func() error {
 		if mgr == nil {
 			return nil
 		}
@@ -955,39 +955,53 @@ func (s *sessionService) holdSandboxTurn(
 		if !ok {
 			return nil
 		}
-		if err := holder.BeginSessionTurn(ctx, sessionID); err != nil {
+		release, err := holder.HoldSessionTurn(ctx, sessionID)
+		if err != nil {
 			logger.Warnf(ctx, "[sandbox] begin turn for session %s failed: %v", sessionID, err)
 			return nil
 		}
-		return holder
+		return release
 	}
 
-	if holder := begin(s.sandboxMgr); holder != nil {
-		return func() {
-			if err := holder.EndSessionTurn(ctx, sessionID); err != nil {
-				logger.Warnf(ctx, "[sandbox] end turn for session %s failed: %v", sessionID, err)
-			}
+	// An existing sandbox's pin is authoritative over the agent's current
+	// config. Repointing an agent must not place this turn's lease on a different
+	// backend while the old sandbox is still serving the session.
+	selectedConfigID := strings.TrimSpace(configID)
+	if s.sandboxPinner != nil {
+		pinned, err := s.sandboxPinner.Read(ctx, sessionID)
+		if err != nil {
+			logger.Warnf(ctx, "[sandbox] read pin to begin turn for session %s failed: %v", sessionID, err)
+			return func() {}
+		}
+		if strings.TrimSpace(pinned) != "" {
+			selectedConfigID = strings.TrimSpace(pinned)
 		}
 	}
 
 	tenantID, _ := types.TenantIDFromContext(ctx)
-	if s.sandboxResolver == nil || tenantID == 0 {
-		return func() {}
+	var mgr sandbox.Manager
+	if selectedConfigID == "" || selectedConfigID == types.SandboxConfigIDGlobalDefault {
+		mgr = s.sandboxMgr
+	} else {
+		if s.sandboxResolver == nil || tenantID == 0 {
+			return func() {}
+		}
+		var err error
+		mgr, err = resolveTenantSandboxForConfig(
+			ctx, s.sandboxResolver, s.sandboxMgr, tenantID, selectedConfigID, s.sandboxPolicy,
+		)
+		if err != nil {
+			logger.Warnf(ctx, "[sandbox] resolve config %s to begin turn of session %s failed: %v",
+				selectedConfigID, sessionID, err)
+			return func() {}
+		}
 	}
-	mgr, err := resolveTenantSandboxForConfig(
-		ctx, s.sandboxResolver, s.sandboxMgr, tenantID, configID, s.sandboxPolicy,
-	)
-	if err != nil {
-		logger.Warnf(ctx, "[sandbox] resolve config %s to begin turn of session %s failed: %v",
-			configID, sessionID, err)
-		return func() {}
-	}
-	holder := begin(mgr)
-	if holder == nil {
+	release := begin(mgr)
+	if release == nil {
 		return func() {}
 	}
 	return func() {
-		if err := holder.EndSessionTurn(ctx, sessionID); err != nil {
+		if err := release(); err != nil {
 			logger.Warnf(ctx, "[sandbox] end turn for session %s failed: %v", sessionID, err)
 		}
 	}

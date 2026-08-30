@@ -77,17 +77,30 @@ func (s *stubResourceCatalog) ResolvePath(_ context.Context, value string) (stri
 	}
 	return value, nil, nil
 }
+func (s *stubResourceCatalog) ResolvePathForDeletion(
+	ctx context.Context, value string,
+) (string, *types.StoredResource, error) {
+	return s.ResolvePath(ctx, value)
+}
 
 func (s *stubResourceCatalog) Bind(context.Context, string, string, string, string) error {
 	panic("unexpected Bind")
 }
 
-func (s *stubResourceCatalog) Release(context.Context, string, string, string) (int64, error) {
+func (s *stubResourceCatalog) Release(context.Context, string, string, string) (int64, time.Time, error) {
 	panic("unexpected Release")
 }
 
-func (s *stubResourceCatalog) MarkDeleted(context.Context, string) error {
+func (s *stubResourceCatalog) MarkDeleted(context.Context, string) (time.Time, error) {
 	panic("unexpected MarkDeleted")
+}
+
+func (s *stubResourceCatalog) ValidateDeletionClaim(context.Context, string, time.Time) error {
+	panic("unexpected ValidateDeletionClaim")
+}
+
+func (s *stubResourceCatalog) RestoreActive(context.Context, string, time.Time) error {
+	panic("unexpected RestoreActive")
 }
 
 func (s *stubResourceCatalog) CreateAccessGrant(context.Context, string, time.Duration) (string, error) {

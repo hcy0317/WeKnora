@@ -218,20 +218,147 @@ function rendersAsImage(artifact: ArtifactRefMeta): boolean {
   return type.startsWith('image/') && !type.includes('svg');
 }
 
-// blob URL 按 (会话, 消息, 下标) 缓存，并挂在 window 上：Vite 热更新会替换模块
-// 但不会重建文档，模块级 Map 会让已加载的图片退回占位图。
-type ArtifactBlobState = { blobByKey: Map<string, string>; inflight: Map<string, Promise<string | null>> };
-
-const artifactBlobState: ArtifactBlobState = (() => {
-  const fresh = (): ArtifactBlobState => ({ blobByKey: new Map(), inflight: new Map() });
-  if (typeof window === 'undefined') return fresh();
-  const scope = window as typeof window & { __weknoraArtifactBlobCacheV1__?: ArtifactBlobState };
-  scope.__weknoraArtifactBlobCacheV1__ ||= fresh();
-  return scope.__weknoraArtifactBlobCacheV1__;
-})();
+export const ARTIFACT_BLOB_CACHE_MAX_ENTRIES = 64;
 
 function blobCacheKey(ctx: ArtifactRefContext, index: number): string {
   return `${ctx.sessionId}\u0000${ctx.messageId}\u0000${index}`;
+}
+
+function messageCachePrefix(ctx: ArtifactRefContext): string {
+  return `${ctx.sessionId}\u0000${ctx.messageId}\u0000`;
+}
+
+function sessionCachePrefix(sessionId: string): string {
+  return `${sessionId}\u0000`;
+}
+
+function revokeBlobURL(url: string): void {
+  if (typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(url);
+}
+
+/** Bounded LRU owner for object URLs; every removal revokes the browser handle. */
+export class ArtifactBlobURLCache {
+  private readonly maxEntries: number;
+
+  constructor(
+    maxEntries = ARTIFACT_BLOB_CACHE_MAX_ENTRIES,
+    private readonly revoke: (url: string) => void = revokeBlobURL,
+    private readonly entries: Map<string, string> = new Map(),
+  ) {
+    this.maxEntries = Math.max(1, Math.floor(maxEntries));
+    this.trim();
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  get(ctx: ArtifactRefContext, index: number): string | undefined {
+    const key = blobCacheKey(ctx, index);
+    const url = this.entries.get(key);
+    if (!url) return undefined;
+    this.entries.delete(key);
+    this.entries.set(key, url);
+    return url;
+  }
+
+  set(ctx: ArtifactRefContext, index: number, url: string): void {
+    const key = blobCacheKey(ctx, index);
+    const previous = this.entries.get(key);
+    if (previous) {
+      this.entries.delete(key);
+      if (previous !== url) this.revoke(previous);
+    }
+    this.entries.set(key, url);
+    this.trim();
+  }
+
+  disposeMessage(ctx: ArtifactRefContext): number {
+    return this.disposeMatching((key) => key.startsWith(messageCachePrefix(ctx)));
+  }
+
+  disposeSession(sessionId: string): number {
+    return this.disposeMatching((key) => key.startsWith(sessionCachePrefix(sessionId)));
+  }
+
+  disposeAll(): number {
+    return this.disposeMatching(() => true);
+  }
+
+  private trim(): void {
+    while (this.entries.size > this.maxEntries) {
+      const oldestKey = this.entries.keys().next().value as string | undefined;
+      if (oldestKey === undefined) return;
+      const url = this.entries.get(oldestKey);
+      this.entries.delete(oldestKey);
+      if (url) this.revoke(url);
+    }
+  }
+
+  private disposeMatching(matches: (key: string) => boolean): number {
+    let disposed = 0;
+    for (const [key, url] of this.entries) {
+      if (!matches(key)) continue;
+      this.entries.delete(key);
+      this.revoke(url);
+      disposed += 1;
+    }
+    return disposed;
+  }
+}
+
+// blob URL 按 (会话, 消息, 下标) 缓存，并挂在 window 上：Vite 热更新会替换模块
+// 但不会重建文档，模块级 Map 会让已加载的图片退回占位图。
+type ArtifactBlobState = {
+  blobByKey: Map<string, string>;
+  inflight: Map<string, Promise<string | null>>;
+  invalidatedInflight: Set<string>;
+};
+
+const artifactBlobState: ArtifactBlobState = (() => {
+  const fresh = (): ArtifactBlobState => ({
+    blobByKey: new Map(),
+    inflight: new Map(),
+    invalidatedInflight: new Set(),
+  });
+  if (typeof window === 'undefined') return fresh();
+  const scope = window as typeof window & {
+    __weknoraArtifactBlobCacheV1__?: Partial<ArtifactBlobState>;
+  };
+  scope.__weknoraArtifactBlobCacheV1__ ||= fresh();
+  scope.__weknoraArtifactBlobCacheV1__.blobByKey ||= new Map();
+  scope.__weknoraArtifactBlobCacheV1__.inflight ||= new Map();
+  scope.__weknoraArtifactBlobCacheV1__.invalidatedInflight ||= new Set();
+  return scope.__weknoraArtifactBlobCacheV1__ as ArtifactBlobState;
+})();
+
+const artifactBlobCache = new ArtifactBlobURLCache(
+  ARTIFACT_BLOB_CACHE_MAX_ENTRIES,
+  revokeBlobURL,
+  artifactBlobState.blobByKey,
+);
+
+function invalidateInflight(matches: (key: string) => boolean): void {
+  for (const key of artifactBlobState.inflight.keys()) {
+    if (matches(key)) artifactBlobState.invalidatedInflight.add(key);
+  }
+}
+
+export function disposeArtifactBlobURLsForMessage(ctx: ArtifactRefContext): number {
+  const prefix = messageCachePrefix(ctx);
+  invalidateInflight((key) => key.startsWith(prefix));
+  return artifactBlobCache.disposeMessage(ctx);
+}
+
+export function disposeArtifactBlobURLsForSession(sessionId: string): number {
+  const prefix = sessionCachePrefix(sessionId);
+  invalidateInflight((key) => key.startsWith(prefix));
+  return artifactBlobCache.disposeSession(sessionId);
+}
+
+export function disposeAllArtifactBlobURLs(): number {
+  invalidateInflight(() => true);
+  return artifactBlobCache.disposeAll();
 }
 
 function fileIconSvg(): string {
@@ -274,7 +401,7 @@ function renderImage(
 ): string {
   const safeAlt = escapeHTML(alt || artifact.file_name || '');
   // 已经拉取过就直接给 blob：流式重渲染会重建 <img>，否则每帧都会闪回占位图。
-  const cached = ctx ? artifactBlobState.blobByKey.get(blobCacheKey(ctx, artifact.index)) : undefined;
+  const cached = ctx ? artifactBlobCache.get(ctx, artifact.index) : undefined;
   const src = cached || TRANSPARENT_PIXEL;
   const loading = cached ? '' : ' data-img-loading="1"';
   return (
@@ -325,7 +452,7 @@ export function renderArtifactReference(args: {
 
 async function loadArtifactBlobURL(ctx: ArtifactRefContext, index: number): Promise<string | null> {
   const key = blobCacheKey(ctx, index);
-  const cached = artifactBlobState.blobByKey.get(key);
+  const cached = artifactBlobCache.get(ctx, index);
   if (cached) return cached;
 
   let task = artifactBlobState.inflight.get(key);
@@ -337,12 +464,17 @@ async function loadArtifactBlobURL(ctx: ArtifactRefContext, index: number): Prom
         const { downloadArtifact } = await import('@/api/chat');
         const blob = await downloadArtifact(ctx.sessionId, ctx.messageId, index);
         const blobURL = URL.createObjectURL(blob);
-        artifactBlobState.blobByKey.set(key, blobURL);
+        if (artifactBlobState.invalidatedInflight.delete(key)) {
+          revokeBlobURL(blobURL);
+          return null;
+        }
+        artifactBlobCache.set(ctx, index, blobURL);
         return blobURL;
       } catch (error) {
         console.warn('[sandboxArtifactRefs] artifact image load failed:', error);
         return null;
       } finally {
+        artifactBlobState.invalidatedInflight.delete(key);
         artifactBlobState.inflight.delete(key);
       }
     })();

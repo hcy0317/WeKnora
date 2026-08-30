@@ -15,6 +15,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/Tencent/WeKnora/internal/application/repository"
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -214,11 +215,13 @@ type fakeConfigRepo struct {
 	updated *types.TenantSandboxConfigEntity
 	deleted bool
 
-	onSetCordon func()
-	onUpdate    func()
-	updateErr   error
+	onSetCordon  func()
+	setCordonErr error
+	onUpdate     func()
+	updateErr    error
 
 	clearCordonCtxErr error
+	cordonAt          time.Time
 }
 
 func (f *fakeConfigRepo) Create(_ context.Context, e *types.TenantSandboxConfigEntity) error {
@@ -278,18 +281,37 @@ func (f *fakeConfigRepo) SoftDelete(_ context.Context, _ uint64, id string) erro
 	return nil
 }
 
-func (f *fakeConfigRepo) SetCordon(_ context.Context, _ uint64, _ string, _ time.Time) error {
+func (f *fakeConfigRepo) SetCordon(_ context.Context, _ uint64, _ string, at time.Time) error {
 	f.events = append(f.events, "cordon")
+	f.cordonAt = at
 	if f.onSetCordon != nil {
 		f.onSetCordon()
 	}
-	return nil
+	return f.setCordonErr
+}
+
+func (f *fakeConfigRepo) SoftDeleteCordoned(
+	ctx context.Context, tenantID uint64, id string, cordonedAt time.Time,
+) error {
+	if !cordonedAt.Equal(f.cordonAt) {
+		return repository.ErrSandboxConfigDeleteOwnerLost
+	}
+	return f.SoftDelete(ctx, tenantID, id)
 }
 
 func (f *fakeConfigRepo) ClearCordon(ctx context.Context, _ uint64, _ string) error {
 	f.events = append(f.events, "uncordon")
 	f.clearCordonCtxErr = ctx.Err()
 	return nil
+}
+
+func (f *fakeConfigRepo) ClearCordonIfMatch(
+	ctx context.Context, _ uint64, _ string, cordonedAt time.Time,
+) error {
+	if !cordonedAt.Equal(f.cordonAt) {
+		return nil
+	}
+	return f.ClearCordon(ctx, 0, "")
 }
 
 type stubAgentRepo struct {
@@ -1116,6 +1138,24 @@ func TestUpdateClearsCordonWhenRequestContextCancelled(t *testing.T) {
 	require.NoError(t, repo.clearCordonCtxErr, "cordon release must survive request cancellation")
 }
 
+func TestUpdateDeferredClearCannotReleaseNewCordonOwner(t *testing.T) {
+	t.Setenv("SYSTEM_AES_KEY", strings.Repeat("k", 32))
+	repo := &fakeConfigRepo{entity: &types.TenantSandboxConfigEntity{
+		ID: "cfg-a", TenantID: 7, Name: "prod", SandboxType: "e2b",
+		Config: e2bCfg("key-a", "https://api.e2b.app", "e2b.app", "t1", 300),
+	}}
+	repo.onUpdate = func() { repo.cordonAt = repo.cordonAt.Add(time.Minute) }
+	svc := newTestConfigService(t, repo, nil, stubAgentRepo{})
+
+	_, err := svc.Update(context.Background(), 7, "cfg-a", UpdateSandboxConfigInput{
+		Name: "prod", Config: e2bCfg("key-b", "https://api.e2b.app", "e2b.app", "t1", 300),
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"get", "cordon", "write"}, repo.events,
+		"old defer must not clear a cordon acquired after its write")
+}
+
 func TestDeleteRefusesWhileSandboxesLive(t *testing.T) {
 	repo := &fakeConfigRepo{entity: &types.TenantSandboxConfigEntity{
 		ID:          "cfg-a",
@@ -1137,7 +1177,25 @@ func TestDeleteRefusesWhileSandboxesLive(t *testing.T) {
 	require.Equal(t, []string{"s-1"}, liveErr.Inventory.SessionIDs)
 	require.Equal(t, []string{"analyst"}, liveErr.Inventory.AgentNames)
 	require.False(t, repo.deleted)
-	require.Equal(t, []string{"get"}, repo.events)
+	require.Equal(t, []string{"get", "cordon"}, repo.events)
+}
+
+func TestDeleteStopsBeforeCleanupWhenUpdateOwnsFreshCordon(t *testing.T) {
+	client := &stubProviderClient{}
+	repo := &fakeConfigRepo{
+		entity: &types.TenantSandboxConfigEntity{
+			ID: "cfg-a", TenantID: 7, Name: "prod", SandboxType: "e2b",
+			Config: e2bCfg("key-a", "https://api.e2b.app", "e2b.app", "t1", 300),
+		},
+		setCordonErr: repository.ErrSandboxConfigCordoned,
+	}
+	svc := newTestConfigService(t, repo, client, stubAgentRepo{})
+
+	err := svc.Delete(context.Background(), 7, "cfg-a", false)
+
+	require.ErrorIs(t, err, repository.ErrSandboxConfigCordoned)
+	require.Zero(t, client.listCalls)
+	require.False(t, repo.deleted)
 }
 
 // "We cannot tell" must not read as "nothing there": refuse, and say which of
@@ -1253,7 +1311,7 @@ func TestDeleteSoftDeletesWhenEmpty(t *testing.T) {
 
 	require.NoError(t, err)
 	require.True(t, repo.deleted)
-	require.Equal(t, []string{"get", "delete"}, repo.events)
+	require.Equal(t, []string{"get", "cordon", "delete"}, repo.events)
 }
 
 // Reporting success for a config that is not there would let the UI drop a card
@@ -1704,6 +1762,16 @@ func (r *eventRecordingConfigRepo) SoftDelete(ctx context.Context, tenantID uint
 	}
 	*r.events = append(*r.events, "soft-delete")
 	return r.fakeConfigRepo.SoftDelete(ctx, tenantID, id)
+}
+
+func (r *eventRecordingConfigRepo) SoftDeleteCordoned(
+	ctx context.Context, tenantID uint64, id string, cordonedAt time.Time,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	*r.events = append(*r.events, "soft-delete")
+	return r.fakeConfigRepo.SoftDeleteCordoned(ctx, tenantID, id, cordonedAt)
 }
 
 type snapshotReleaseClient struct {

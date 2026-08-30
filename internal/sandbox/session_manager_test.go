@@ -321,9 +321,10 @@ func TestSessionBoundManagerEndSessionTurnIgnoresCancel(t *testing.T) {
 	require.NoError(t, err)
 
 	cancelled, cancel := context.WithCancel(ctx)
-	require.NoError(t, mgr.BeginSessionTurn(cancelled, "sess-1"))
+	release, err := mgr.HoldSessionTurn(cancelled, "sess-1")
+	require.NoError(t, err)
 	cancel()
-	require.NoError(t, mgr.EndSessionTurn(cancelled, "sess-1"))
+	require.NoError(t, release())
 
 	active, _, err := store.TurnState(ctx, SessionSandboxKey{TenantID: 10000, SessionID: "sess-1"})
 	require.NoError(t, err)

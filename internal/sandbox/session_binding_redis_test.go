@@ -56,6 +56,41 @@ func TestRedisSessionSandboxBindingStoreTurnLease(t *testing.T) {
 	require.Zero(t, exists, "consuming a missing turn must not create a lease key")
 }
 
+func TestRedisTurnLeaseRenewsIndependentlyOfRequest(t *testing.T) {
+	store, client, mini := newRedisBindingTestStore(t)
+	store.turnLeaseTTL = 80 * time.Millisecond
+	store.turnRenewInterval = 10 * time.Millisecond
+	key := SessionSandboxKey{TenantID: 42, SessionID: "session-long-wait"}
+
+	token, err := store.BeginTurn(context.Background(), key)
+	require.NoError(t, err)
+	mini.FastForward(60 * time.Millisecond)
+	time.Sleep(25 * time.Millisecond)
+	mini.FastForward(40 * time.Millisecond)
+
+	exists, err := client.Exists(context.Background(), store.turnKey(key)).Result()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, exists, "renewal must cover waits with no sandbox resolve")
+	require.NoError(t, store.EndTurn(context.Background(), key, token))
+}
+
+func TestRedisTurnLeaseOldTokenCannotReleaseNewTurn(t *testing.T) {
+	store, _, mini := newRedisBindingTestStore(t)
+	store.turnLeaseTTL = 50 * time.Millisecond
+	key := SessionSandboxKey{TenantID: 42, SessionID: "session-aba"}
+	oldToken, err := store.BeginTurn(context.Background(), key)
+	require.NoError(t, err)
+	mini.FastForward(60 * time.Millisecond)
+	newToken, err := store.BeginTurn(context.Background(), key)
+	require.NoError(t, err)
+
+	require.NoError(t, store.EndTurn(context.Background(), key, oldToken))
+	active, _, err := store.TurnState(context.Background(), key)
+	require.NoError(t, err)
+	require.True(t, active, "expired turn token must not decrement the replacement turn")
+	require.NoError(t, store.EndTurn(context.Background(), key, newToken))
+}
+
 func TestRedisSessionSandboxBindingStoreInvalidatesByConfig(t *testing.T) {
 	store, _, _ := newRedisBindingTestStore(t)
 	testSessionSandboxBindingInvalidateByConfig(t, store)

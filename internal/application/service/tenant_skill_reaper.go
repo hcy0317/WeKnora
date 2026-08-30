@@ -156,6 +156,12 @@ func (s *TenantSkillService) ReapStuckRuns(ctx context.Context) (int, error) {
 				reaped++
 				continue
 			}
+			if err := s.ensureCatalogBundleBeforeRemoval(ctx, row.TenantID, row); err != nil {
+				logger.Warnf(ctx,
+					"[skill] preserve catalog bundle before reaping removal %s failed: %v",
+					row.ID, err)
+				continue
+			}
 			if err := s.skills.DeleteSkill(ctx, row.TenantID, row.SandboxConfigID, row.ID); err != nil {
 				logger.Warnf(ctx, "[skill] drop abandoned removal %s failed: %v", row.ID, err)
 				continue

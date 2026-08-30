@@ -25,8 +25,10 @@ type TenantSandboxConfigRepository interface {
 	ListAll(ctx context.Context) ([]*types.TenantSandboxConfigEntity, error)
 	Update(ctx context.Context, e *types.TenantSandboxConfigEntity) error
 	SoftDelete(ctx context.Context, tenantID uint64, id string) error
+	SoftDeleteCordoned(ctx context.Context, tenantID uint64, id string, cordonedAt time.Time) error
 	SetCordon(ctx context.Context, tenantID uint64, id string, at time.Time) error
 	ClearCordon(ctx context.Context, tenantID uint64, id string) error
+	ClearCordonIfMatch(ctx context.Context, tenantID uint64, id string, cordonedAt time.Time) error
 }
 
 type tenantSandboxConfigRepository struct {
@@ -119,6 +121,10 @@ func (r *tenantSandboxConfigRepository) SoftDelete(
 // already holds a fresh cordon lease on the same config row.
 var ErrSandboxConfigCordoned = errors.New("sandbox config is being modified by another request")
 
+// ErrSandboxConfigDeleteOwnerLost is returned when another cordon owner wins
+// before a delete attempt reaches its final soft-delete CAS.
+var ErrSandboxConfigDeleteOwnerLost = errors.New("sandbox config delete ownership was lost")
+
 // SetCordon must be committed before the caller lists provider sandboxes:
 // resolution paths only stop creating sandboxes once they can see it.
 //
@@ -149,4 +155,32 @@ func (r *tenantSandboxConfigRepository) ClearCordon(
 		Model(&types.TenantSandboxConfigEntity{}).
 		Where("tenant_id = ? AND id = ?", tenantID, id).
 		Update("cordoned_at", nil).Error
+}
+
+func (r *tenantSandboxConfigRepository) ClearCordonIfMatch(
+	ctx context.Context, tenantID uint64, id string, cordonedAt time.Time,
+) error {
+	return r.db.WithContext(ctx).
+		Model(&types.TenantSandboxConfigEntity{}).
+		Where("tenant_id = ? AND id = ? AND cordoned_at = ?", tenantID, id, cordonedAt).
+		Update("cordoned_at", nil).Error
+}
+
+// SoftDeleteCordoned completes deletion only while the caller still owns the
+// exact cordon it acquired before provider cleanup. If that lease expired and
+// an update took over, the stale delete cannot remove the updated row.
+func (r *tenantSandboxConfigRepository) SoftDeleteCordoned(
+	ctx context.Context, tenantID uint64, id string, cordonedAt time.Time,
+) error {
+	result := r.db.WithContext(ctx).
+		Where("tenant_id = ? AND id = ?", tenantID, id).
+		Where("cordoned_at = ?", cordonedAt).
+		Delete(&types.TenantSandboxConfigEntity{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrSandboxConfigDeleteOwnerLost
+	}
+	return nil
 }

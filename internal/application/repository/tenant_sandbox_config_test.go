@@ -111,8 +111,48 @@ func TestSandboxConfigRepoCordonRoundTrip(t *testing.T) {
 	require.NotNil(t, got.CordonedAt)
 	require.True(t, got.IsCordoned(at.Add(time.Second), types.SandboxCordonLease))
 
-	require.NoError(t, repo.ClearCordon(ctx, 1, "cfg-a"))
+	require.NoError(t, repo.ClearCordonIfMatch(ctx, 1, "cfg-a", at.Add(time.Second)))
+	got, err = repo.GetByID(ctx, 1, "cfg-a")
+	require.NoError(t, err)
+	require.NotNil(t, got.CordonedAt, "stale owner must not clear the active cordon")
+
+	require.NoError(t, repo.ClearCordonIfMatch(ctx, 1, "cfg-a", at))
 	got, err = repo.GetByID(ctx, 1, "cfg-a")
 	require.NoError(t, err)
 	require.Nil(t, got.CordonedAt)
+}
+
+func TestSandboxConfigRepoFreshCordonBlocksDeleteAndExpiredCordonCanRetry(t *testing.T) {
+	repo, _ := newSandboxConfigTestRepo(t)
+	ctx := context.Background()
+	require.NoError(t, repo.Create(ctx, &types.TenantSandboxConfigEntity{
+		ID: "cfg-a", TenantID: 1, Name: "prod", SandboxType: "e2b",
+		Config: &types.TenantSandboxConfig{SandboxType: "e2b"},
+	}))
+	updateAt := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, repo.SetCordon(ctx, 1, "cfg-a", updateAt))
+	require.ErrorIs(t, repo.SetCordon(ctx, 1, "cfg-a", updateAt.Add(time.Second)), ErrSandboxConfigCordoned)
+
+	deleteAt := updateAt.Add(types.SandboxCordonLease + time.Second)
+	require.NoError(t, repo.SetCordon(ctx, 1, "cfg-a", deleteAt))
+	require.NoError(t, repo.SoftDeleteCordoned(ctx, 1, "cfg-a", deleteAt))
+}
+
+func TestSandboxConfigRepoStaleDeleteCannotRemoveRowAfterCordonTakeover(t *testing.T) {
+	repo, _ := newSandboxConfigTestRepo(t)
+	ctx := context.Background()
+	require.NoError(t, repo.Create(ctx, &types.TenantSandboxConfigEntity{
+		ID: "cfg-a", TenantID: 1, Name: "prod", SandboxType: "e2b",
+		Config: &types.TenantSandboxConfig{SandboxType: "e2b"},
+	}))
+	deleteAt := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, repo.SetCordon(ctx, 1, "cfg-a", deleteAt))
+	updateAt := deleteAt.Add(types.SandboxCordonLease + time.Second)
+	require.NoError(t, repo.SetCordon(ctx, 1, "cfg-a", updateAt))
+
+	err := repo.SoftDeleteCordoned(ctx, 1, "cfg-a", deleteAt)
+	require.ErrorIs(t, err, ErrSandboxConfigDeleteOwnerLost)
+	got, getErr := repo.GetByID(ctx, 1, "cfg-a")
+	require.NoError(t, getErr)
+	require.NotNil(t, got)
 }

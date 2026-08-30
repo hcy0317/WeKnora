@@ -36,7 +36,7 @@ type SkillCatalogView struct {
 	BundleSHA256  string                    `json:"bundle_sha256,omitempty"`
 	CreatedAt     time.Time                 `json:"created_at"`
 	UpdatedAt     time.Time                 `json:"updated_at"`
-	Installations []SkillCatalogInstallView `json:"installations"`
+	Installations []SkillCatalogInstallView `json:"installations,omitempty"`
 }
 
 // ListCatalog returns every workspace skill definition and which sandbox
@@ -44,6 +44,7 @@ type SkillCatalogView struct {
 func (s *TenantSkillService) ListCatalog(
 	ctx context.Context, tenantID uint64,
 ) ([]SkillCatalogView, error) {
+	includeOperationalState := types.TenantRoleFromContext(ctx).HasPermission(types.TenantRoleAdmin)
 	catalogs, err := s.skills.ListCatalogsByTenant(ctx, tenantID)
 	if err != nil {
 		return nil, err
@@ -119,6 +120,12 @@ func (s *TenantSkillService) ListCatalog(
 			CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 		}
 		out = append(out, catalogView(synthetic, []*types.TenantSkillEntity{row}, configByID))
+	}
+	if !includeOperationalState {
+		for i := range out {
+			out[i].BundleSHA256 = ""
+			out[i].Installations = nil
+		}
 	}
 	return out, nil
 }
@@ -264,7 +271,11 @@ func (s *TenantSkillService) DeleteCatalog(
 		return apperrors.NewConflictError(
 			"remove this skill from every sandbox before deleting it from the catalog")
 	}
-	return s.skills.DeleteCatalog(ctx, tenantID, catalogID)
+	if err := s.skills.DeleteCatalog(ctx, tenantID, catalogID); err != nil {
+		return err
+	}
+	s.deleteStoredBundleBestEffort(ctx, tenantID, catalog.BundleRef)
+	return nil
 }
 
 func (s *TenantSkillService) upsertCatalogFromBundle(
@@ -276,6 +287,7 @@ func (s *TenantSkillService) upsertCatalogFromBundle(
 	}
 	now := s.now()
 	if existing != nil {
+		oldRef := strings.TrimSpace(existing.BundleRef)
 		stored, err := s.storeCatalogBundle(ctx, tenantID, existing, archive, requireStore)
 		if err != nil {
 			return nil, err
@@ -289,7 +301,13 @@ func (s *TenantSkillService) upsertCatalogFromBundle(
 		existing.BundleSHA256 = bundle.SHA256
 		existing.UpdatedAt = now
 		if err := s.skills.UpdateCatalog(ctx, existing); err != nil {
+			if oldRef != strings.TrimSpace(existing.BundleRef) {
+				s.deleteStoredBundleBestEffort(ctx, tenantID, existing.BundleRef)
+			}
 			return nil, err
+		}
+		if oldRef != "" && oldRef != strings.TrimSpace(existing.BundleRef) {
+			s.deleteStoredBundleBestEffort(ctx, tenantID, oldRef)
 		}
 		return existing, nil
 	}
@@ -309,8 +327,10 @@ func (s *TenantSkillService) upsertCatalogFromBundle(
 	}
 	if err := s.skills.CreateCatalog(ctx, row); err != nil {
 		if !isSkillNameConflict(err) {
+			s.deleteStoredBundleBestEffort(ctx, tenantID, row.BundleRef)
 			return nil, err
 		}
+		s.deleteStoredBundleBestEffort(ctx, tenantID, row.BundleRef)
 		winner, lookupErr := s.skills.GetCatalogByName(ctx, tenantID, bundle.Name)
 		if lookupErr != nil {
 			return nil, lookupErr
@@ -338,7 +358,7 @@ func (s *TenantSkillService) storeCatalogBundle(
 		return false, nil
 	}
 	ref, err := fs.SaveBytes(ctx, archive, tenantID,
-		fmt.Sprintf("tenant-skills/catalog/%s.zip", catalog.ID), false)
+		fmt.Sprintf("tenant-skills/catalog/%s/%s.zip", catalog.ID, skillArchiveSHA256(archive)), false)
 	if err != nil {
 		if requireStore {
 			return false, fmt.Errorf("store catalog bundle: %w", err)
@@ -348,6 +368,23 @@ func (s *TenantSkillService) storeCatalogBundle(
 	}
 	catalog.BundleRef = ref
 	return true, nil
+}
+
+func (s *TenantSkillService) deleteStoredBundleBestEffort(
+	ctx context.Context, tenantID uint64, ref string,
+) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return
+	}
+	fs, err := s.fileServiceForTenant(ctx, tenantID)
+	if err != nil {
+		logger.Warnf(ctx, "[skill] resolve storage to delete bundle %s failed: %v", ref, err)
+		return
+	}
+	if err := fs.DeleteFile(ctx, ref); err != nil {
+		logger.Warnf(ctx, "[skill] delete superseded bundle %s failed: %v", ref, err)
+	}
 }
 
 func skillUserErrorMessage(err error) string {
@@ -408,8 +445,8 @@ func catalogProjectionFromSkill(row *types.TenantSkillEntity) *types.TenantSkill
 	return &types.TenantSkillCatalogEntity{
 		ID: row.ID, TenantID: row.TenantID, Name: row.Name, Version: row.Version,
 		Description: row.Description, Instructions: row.Instructions,
-		BundleRef: row.BundleRef, BundleSHA256: row.BundleSHA256,
-		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+		BundleSHA256: row.BundleSHA256,
+		CreatedAt:    row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}
 }
 
@@ -461,6 +498,12 @@ func (s *TenantSkillService) catalogBundleArchive(
 		return nil, apperrors.NewNotFoundError("skill not found")
 	}
 	wantSHA := strings.TrimSpace(catalog.BundleSHA256)
+	finishFallback := func(archive []byte) ([]byte, error) {
+		if err := s.ensureCatalogOwnedBundle(ctx, tenantID, catalog.ID, wantSHA, archive); err != nil {
+			return nil, err
+		}
+		return archive, nil
+	}
 	tryRow := func(row *types.TenantSkillEntity) ([]byte, bool) {
 		if row == nil || strings.TrimSpace(row.BundleRef) == "" {
 			return nil, false
@@ -488,7 +531,7 @@ func (s *TenantSkillService) catalogBundleArchive(
 	}
 	for _, row := range installs {
 		if archive, ok := tryRow(row); ok {
-			return archive, nil
+			return finishFallback(archive)
 		}
 	}
 	all, err := s.skills.ListSkillsByTenant(ctx, tenantID)
@@ -503,9 +546,63 @@ func (s *TenantSkillService) catalogBundleArchive(
 			continue
 		}
 		if archive, ok := tryRow(row); ok {
-			return archive, nil
+			return finishFallback(archive)
 		}
 	}
 	return nil, apperrors.NewBadRequestError(
 		"the archive of this skill is no longer stored; add it again from the original bundle")
+}
+
+func (s *TenantSkillService) ensureCatalogOwnedBundle(
+	ctx context.Context, tenantID uint64, catalogID, wantSHA string, archive []byte,
+) error {
+	persisted, err := s.skills.GetCatalog(ctx, tenantID, catalogID)
+	if err != nil || persisted == nil {
+		return err
+	}
+	if strings.TrimSpace(persisted.BundleRef) != "" {
+		if wantSHA != "" && persisted.BundleSHA256 != "" &&
+			!strings.EqualFold(persisted.BundleSHA256, wantSHA) {
+			return fmt.Errorf("catalog bundle digest changed while backfilling")
+		}
+		return nil
+	}
+	if len(archive) == 0 || (wantSHA != "" && !archiveMatchesSHA(archive, wantSHA)) {
+		return fmt.Errorf("catalog fallback bundle does not match its declared sha256")
+	}
+	copyRow := *persisted
+	stored, err := s.storeCatalogBundle(ctx, tenantID, &copyRow, archive, true)
+	if err != nil {
+		return err
+	}
+	if !stored || strings.TrimSpace(copyRow.BundleRef) == "" {
+		return fmt.Errorf("catalog bundle was not stored")
+	}
+	sha := wantSHA
+	if sha == "" {
+		sha = skillArchiveSHA256(archive)
+	}
+	won, err := s.skills.SetCatalogBundleIfEmpty(
+		ctx, tenantID, catalogID, copyRow.BundleRef, sha,
+	)
+	if err != nil {
+		s.deleteStoredBundleBestEffort(ctx, tenantID, copyRow.BundleRef)
+		return err
+	}
+	if won {
+		return nil
+	}
+	winner, loadErr := s.skills.GetCatalog(ctx, tenantID, catalogID)
+	if loadErr == nil && winner != nil && strings.TrimSpace(winner.BundleRef) != "" &&
+		(strings.TrimSpace(winner.BundleSHA256) == "" || strings.EqualFold(winner.BundleSHA256, sha)) {
+		if winner.BundleRef != copyRow.BundleRef {
+			s.deleteStoredBundleBestEffort(ctx, tenantID, copyRow.BundleRef)
+		}
+		return nil
+	}
+	s.deleteStoredBundleBestEffort(ctx, tenantID, copyRow.BundleRef)
+	if loadErr != nil {
+		return loadErr
+	}
+	return fmt.Errorf("catalog bundle backfill lost ownership")
 }

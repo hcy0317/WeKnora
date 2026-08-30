@@ -557,6 +557,7 @@ import i18n from '@/i18n';
 import { hydrateProtectedFileImages, clearProtectedFileFailureCache, sanitizeMarkdownHTML } from '@/utils/security';
 import {
   artifactIndexFromEventTarget,
+  disposeArtifactBlobURLsForMessage,
   hydrateArtifactImages,
   renderArtifactReference,
 } from '@/utils/sandboxArtifactRefs';
@@ -967,6 +968,15 @@ const artifactRefContext = computed(() => {
   const messageId = messageIdForArtifacts.value;
   if (!sessionId || !messageId) return null;
   return { sessionId, messageId };
+});
+
+watch(artifactRefContext, (context, previousContext) => {
+  if (!previousContext) return;
+  if (
+    context?.sessionId === previousContext.sessionId
+    && context?.messageId === previousContext.messageId
+  ) return;
+  disposeArtifactBlobURLsForMessage(previousContext);
 });
 
 const artifactRefLabels = computed(() => ({
@@ -2405,6 +2415,9 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  if (artifactRefContext.value) {
+    disposeArtifactBlobURLsForMessage(artifactRefContext.value);
+  }
   const root = rootElement.value;
   if (!root) return;
   root.removeEventListener('click', onRootClick, true);

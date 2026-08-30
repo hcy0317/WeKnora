@@ -100,10 +100,19 @@ func (s *TenantSkillService) InstallSkill(
 	}
 
 	skillID := uuid.NewString()
-	now := s.now()
 	if existing != nil {
 		skillID = existing.ID
-		takeSkillRowForInstall(existing, bundle, now)
+	}
+	// Store under an immutable digest-qualified object before claiming the DB
+	// row. The claim then writes BundleSHA256 and BundleRef together, so two
+	// uploads cannot leave one digest pointing at the other upload's bytes.
+	ref, err := s.saveBundle(ctx, tenantID, skillID, archive)
+	if err != nil {
+		return "", fmt.Errorf("store bundle for skill %s: %w", skillID, err)
+	}
+	now := s.now()
+	if existing != nil {
+		takeSkillRowForInstall(existing, bundle, now, ref)
 		existing.CatalogID = catalogID
 		if err := s.skills.UpdateSkill(ctx, existing); err != nil {
 			return "", err
@@ -114,10 +123,11 @@ func (s *TenantSkillService) InstallSkill(
 			CatalogID: catalogID,
 			Name:      bundle.Name, Version: bundle.Version,
 			Description: bundle.Description, Instructions: bundle.Instructions,
-			BundleSHA256: bundle.SHA256, Enabled: true,
+			BundleRef: ref, BundleSHA256: bundle.SHA256, Enabled: true,
 			Status: types.SkillStatusInstalling, InstallingSince: &now,
 		}); err != nil {
 			if !isSkillNameConflict(err) {
+				s.deleteStoredBundleBestEffort(ctx, tenantID, ref)
 				return "", err
 			}
 			// Two first-time uploads of the same name raced the unique index.
@@ -130,31 +140,14 @@ func (s *TenantSkillService) InstallSkill(
 				return "", err
 			}
 			skillID = winner.ID
-			takeSkillRowForInstall(winner, bundle, now)
+			takeSkillRowForInstall(winner, bundle, now, ref)
 			winner.CatalogID = catalogID
 			if err := s.skills.UpdateSkill(ctx, winner); err != nil {
+				s.deleteStoredBundleBestEffort(ctx, tenantID, ref)
 				return "", err
 			}
 		}
 	}
-
-	// Store the archive before the long-running part: read_skill serves file
-	// contents from it, and a re-install after a crash needs it too. A missing
-	// archive is a failed install, not a warning — otherwise the row says
-	// "installing" and later reads have nothing to serve.
-	ref, err := s.saveBundle(ctx, tenantID, skillID, archive)
-	if err != nil {
-		failCtx, cancelFail := s.cleanupContext(ctx)
-		defer cancelFail()
-		storeErr := fmt.Errorf("store bundle: %w", err)
-		logger.Errorf(ctx, "[skill] store bundle failed tenant=%d config=%s skill=%s name=%s: %v",
-			tenantID, configID, skillID, bundle.Name, err)
-		s.failSkill(failCtx, tenantID, configID, skillID, bundle, storeErr)
-		return "", fmt.Errorf("store bundle for skill %s: %w", skillID, err)
-	}
-	_ = s.updateSkillFields(ctx, tenantID, configID, skillID, func(e *types.TenantSkillEntity) {
-		e.BundleRef = ref
-	})
 
 	s.publishProgress(ctx, tenantID, configID, skillID, SkillProgress{
 		Percent: 10, Stage: "accepted", Status: types.SkillStatusInstalling,
@@ -184,11 +177,14 @@ func (s *TenantSkillService) InstallSkill(
 // to replay the previous attempt's report before its own agent had started.
 // They are rewritten by beginInstallTranscript once this run has a message of
 // its own; until then the honest answer is that there is nothing to show yet.
-func takeSkillRowForInstall(row *types.TenantSkillEntity, bundle *SkillBundle, now time.Time) {
+func takeSkillRowForInstall(
+	row *types.TenantSkillEntity, bundle *SkillBundle, now time.Time, bundleRef string,
+) {
 	row.Version = bundle.Version
 	row.Description = bundle.Description
 	row.Instructions = bundle.Instructions
 	row.BundleSHA256 = bundle.SHA256
+	row.BundleRef = bundleRef
 	row.Status = types.SkillStatusInstalling
 	row.Error = ""
 	row.InstallingSince = &now
@@ -906,7 +902,9 @@ func (s *TenantSkillService) saveBundle(
 	if err != nil {
 		return "", err
 	}
-	return fs.SaveBytes(ctx, archive, tenantID, fmt.Sprintf("tenant-skills/%s.zip", skillID), false)
+	return fs.SaveBytes(ctx, archive, tenantID, fmt.Sprintf(
+		"tenant-skills/%s/%s.zip", skillID, skillArchiveSHA256(archive),
+	), false)
 }
 
 // updateSkillFields loads, mutates and writes back one skill row. It logs on
@@ -1165,9 +1163,12 @@ func (s *TenantSkillService) refreshSkippedBundle(
 	if err != nil {
 		return err
 	}
+	wantSHA := skillArchiveSHA256(archive)
 	return s.updateSkillFields(ctx, existing.TenantID, existing.SandboxConfigID, existing.ID,
 		func(e *types.TenantSkillEntity) {
-			e.BundleRef = ref
+			if e.BundleSHA256 == wantSHA {
+				e.BundleRef = ref
+			}
 		})
 }
 

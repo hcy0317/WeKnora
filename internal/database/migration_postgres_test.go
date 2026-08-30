@@ -89,7 +89,7 @@ func setMigrationVersion(t *testing.T, db *sql.DB, version uint, dirty bool) {
 	require.NoError(t, err)
 }
 
-func TestPostgresMigration80To97AndIdempotentSQL(t *testing.T) {
+func TestPostgresMigration80To98AndIdempotentSQL(t *testing.T) {
 	useRepositoryRoot(t)
 	dsn, db := newEphemeralPostgresSchema(t)
 	m, err := migrate.New("file://migrations/versioned", dsn)
@@ -101,7 +101,7 @@ func TestPostgresMigration80To97AndIdempotentSQL(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	assert.Equal(t, uint(97), version)
+	assert.Equal(t, uint(98), version)
 	assert.False(t, dirty)
 	var definition string
 	require.NoError(t, db.QueryRow(`SELECT indexdef FROM pg_indexes
@@ -157,7 +157,7 @@ func TestPostgresMigrationLegacyLocalVersion91ReceivesUpstreamMigrations(t *test
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	require.Equal(t, uint(97), version)
+	require.Equal(t, uint(98), version)
 	require.False(t, dirty)
 
 	var upstreamObjects int
@@ -329,7 +329,7 @@ func TestPostgresMigration85DirtyRecoversIdempotently(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	assert.Equal(t, uint(97), version)
+	assert.Equal(t, uint(98), version)
 	assert.False(t, dirty)
 	var indexes int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM pg_indexes
@@ -400,7 +400,7 @@ func TestPostgresMigrationGateDriftMatrix(t *testing.T) {
 	})
 }
 
-func TestPostgresFreshAndPre55MigrateTo97(t *testing.T) {
+func TestPostgresFreshAndPre55MigrateTo98(t *testing.T) {
 	useRepositoryRoot(t)
 	t.Run("fresh", func(t *testing.T) {
 		dsn, db := newEphemeralPostgresSchema(t)
@@ -408,7 +408,7 @@ func TestPostgresFreshAndPre55MigrateTo97(t *testing.T) {
 		var version uint
 		var dirty bool
 		require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-		assert.Equal(t, uint(97), version)
+		assert.Equal(t, uint(98), version)
 		assert.False(t, dirty)
 		assertPostgresCompatibilitySchema(t, db)
 	})
@@ -426,13 +426,13 @@ func TestPostgresFreshAndPre55MigrateTo97(t *testing.T) {
 		var version uint
 		var dirty bool
 		require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-		assert.Equal(t, uint(97), version)
+		assert.Equal(t, uint(98), version)
 		assert.False(t, dirty)
 		assertPostgresCompatibilitySchema(t, db)
 	})
 }
 
-func TestPostgresMigrationForkVersion93AdvancesTo97(t *testing.T) {
+func TestPostgresMigrationForkVersion93AdvancesTo98(t *testing.T) {
 	useRepositoryRoot(t)
 	dsn, db := newEphemeralPostgresSchema(t)
 	m, err := migrate.New("file://migrations/versioned", dsn)
@@ -444,12 +444,45 @@ func TestPostgresMigrationForkVersion93AdvancesTo97(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	require.Equal(t, uint(97), version)
+	require.Equal(t, uint(98), version)
 	require.False(t, dirty)
 	assertPostgresCompatibilitySchema(t, db)
 }
 
-func TestPostgresMigrationUpstreamVersions85To90AdvanceTo97(t *testing.T) {
+func TestPostgresVersion97ClearsPreviouslySharedCatalogBundleRef(t *testing.T) {
+	useRepositoryRoot(t)
+	dsn, db := newEphemeralPostgresSchema(t)
+	m, err := migrate.New("file://migrations/versioned", dsn)
+	require.NoError(t, err)
+	require.NoError(t, m.Migrate(97))
+	_, _ = m.Close()
+	shared := "resource://shared-skill-bundle"
+	sha := strings.Repeat("a", 64)
+	_, err = db.Exec(`INSERT INTO tenant_skill_catalog
+		(id, tenant_id, name, bundle_ref, bundle_sha256)
+		VALUES ('cat-1', 7, 'demo', $1, $2)`, shared, sha)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO tenant_skills
+		(id, tenant_id, sandbox_config_id, catalog_id, name, bundle_ref, bundle_sha256, status)
+		VALUES ('skill-1', 7, 'cfg-1', 'cat-1', 'demo', $1, $2, 'ready')`, shared, sha)
+	require.NoError(t, err)
+
+	require.NoError(t, RunMigrationsWithOptions(dsn, MigrationOptions{}))
+	var version uint
+	var dirty bool
+	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
+	require.Equal(t, uint(98), version)
+	require.False(t, dirty)
+	var ref sql.NullString
+	var gotSHA string
+	require.NoError(t, db.QueryRow(
+		`SELECT bundle_ref, bundle_sha256 FROM tenant_skill_catalog WHERE id = 'cat-1'`,
+	).Scan(&ref, &gotSHA))
+	require.False(t, ref.Valid)
+	require.Equal(t, sha, gotSHA)
+}
+
+func TestPostgresMigrationUpstreamVersions85To90AdvanceTo98(t *testing.T) {
 	useRepositoryRoot(t)
 	upstreamMigrations := []string{
 		"migrations/versioned/000092_message_usage.up.sql",
@@ -493,7 +526,7 @@ func TestPostgresMigrationUpstreamVersions85To90AdvanceTo97(t *testing.T) {
 			var version uint
 			var dirty bool
 			require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-			require.Equal(t, uint(97), version)
+			require.Equal(t, uint(98), version)
 			require.False(t, dirty)
 			assertPostgresCompatibilitySchema(t, db)
 			if upstreamVersion == 90 {
@@ -600,7 +633,7 @@ func TestPostgresMigrationLegacyLocalVersion85ReplaysUpstreamMigrations(t *testi
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	require.Equal(t, uint(97), version)
+	require.Equal(t, uint(98), version)
 	require.False(t, dirty)
 	require.NoError(t, db.QueryRow(`SELECT
 		(EXISTS (SELECT 1 FROM information_schema.columns

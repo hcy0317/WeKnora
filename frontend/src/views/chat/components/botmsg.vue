@@ -115,6 +115,7 @@ import { isCollectingSkillArtifacts } from '@/utils/skillArtifacts';
 import { sanitizeMarkdownHTML, safeMarkdownToHTML, createSafeImage, isValidImageURL, hydrateProtectedFileImages } from '@/utils/security';
 import {
     artifactIndexFromEventTarget,
+    disposeArtifactBlobURLsForMessage,
     hydrateArtifactImages,
     isArtifactRefHref,
     renderArtifactReference,
@@ -247,6 +248,15 @@ const artifactRefContext = computed(() => {
     const messageId = messageIdForArtifacts.value;
     if (!props.sessionId || !messageId) return null;
     return { sessionId: props.sessionId, messageId };
+});
+
+watch(artifactRefContext, (context, previousContext) => {
+    if (!previousContext) return;
+    if (
+        context?.sessionId === previousContext.sessionId
+        && context?.messageId === previousContext.messageId
+    ) return;
+    disposeArtifactBlobURLsForMessage(previousContext);
 });
 
 const artifactRefLabels = computed(() => ({
@@ -428,6 +438,9 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+    if (artifactRefContext.value) {
+        disposeArtifactBlobURLsForMessage(artifactRefContext.value);
+    }
     if (parentMd.value) {
         parentMd.value.removeEventListener('click', handleMarkdownImageClick, true);
     }

@@ -150,31 +150,44 @@ type fakeCatalog struct {
 func (c *fakeCatalog) Register(context.Context, uint64, string, interfaces.ResourceRegistration) (string, error) {
 	return "", nil
 }
+
 func (c *fakeCatalog) Resolve(context.Context, string) (*types.StoredResource, error) {
 	return nil, nil
 }
+
 func (c *fakeCatalog) ResolvePath(_ context.Context, v string) (string, *types.StoredResource, error) {
 	return v, nil, nil
 }
+
+func (c *fakeCatalog) ResolvePathForDeletion(ctx context.Context, v string) (string, *types.StoredResource, error) {
+	return c.ResolvePath(ctx, v)
+}
+
 func (c *fakeCatalog) Bind(_ context.Context, ref, ownerType, ownerID, relation string) error {
 	c.binds = append(c.binds, bindCall{ref, ownerType, ownerID, relation})
 	return c.bindErr
 }
-func (c *fakeCatalog) MarkDeleted(context.Context, string) error { return nil }
+func (c *fakeCatalog) MarkDeleted(context.Context, string) (time.Time, error) {
+	return time.Now(), nil
+}
+func (c *fakeCatalog) ValidateDeletionClaim(context.Context, string, time.Time) error { return nil }
+func (c *fakeCatalog) RestoreActive(context.Context, string, time.Time) error         { return nil }
 
-func (c *fakeCatalog) Release(_ context.Context, ref, ownerType, ownerID string) (int64, error) {
+func (c *fakeCatalog) Release(_ context.Context, ref, ownerType, ownerID string) (int64, time.Time, error) {
 	c.releases = append(c.releases, ref+"|"+ownerType+"|"+ownerID)
 	if c.releaseErr != nil {
-		return -1, c.releaseErr
+		return -1, time.Time{}, c.releaseErr
 	}
 	if remaining, ok := c.releaseRemaining[ref]; ok {
-		return remaining, nil
+		return remaining, time.Time{}, nil
 	}
-	return -1, nil
+	return -1, time.Time{}, nil
 }
+
 func (c *fakeCatalog) CreateAccessGrant(context.Context, string, time.Duration) (string, error) {
 	return "", nil
 }
+
 func (c *fakeCatalog) ResolveAccessGrant(context.Context, string) (*types.StoredResource, error) {
 	return nil, nil
 }

@@ -92,6 +92,9 @@ type TenantSkillRepository interface {
 	ListCatalogsByTenant(ctx context.Context, tenantID uint64) ([]*types.TenantSkillCatalogEntity, error)
 	// UpdateCatalog writes mutable definition fields (bundle, description, version).
 	UpdateCatalog(ctx context.Context, e *types.TenantSkillCatalogEntity) error
+	SetCatalogBundleIfEmpty(
+		ctx context.Context, tenantID uint64, catalogID, bundleRef, bundleSHA256 string,
+	) (bool, error)
 	// DeleteCatalog soft-deletes a definition. Install rows are not touched.
 	DeleteCatalog(ctx context.Context, tenantID uint64, catalogID string) error
 	// ListSkillsByCatalog returns installations of one catalog skill.
@@ -468,6 +471,22 @@ func (r *tenantSkillRepository) UpdateCatalog(ctx context.Context, e *types.Tena
 			"bundle_sha256": e.BundleSHA256,
 			"updated_at":    time.Now(),
 		}).Error
+}
+
+func (r *tenantSkillRepository) SetCatalogBundleIfEmpty(
+	ctx context.Context, tenantID uint64, catalogID, bundleRef, bundleSHA256 string,
+) (bool, error) {
+	result := r.db.WithContext(ctx).
+		Model(&types.TenantSkillCatalogEntity{}).
+		Where("tenant_id = ? AND id = ?", tenantID, catalogID).
+		Where("bundle_ref IS NULL OR bundle_ref = ''").
+		Where("bundle_sha256 IS NULL OR bundle_sha256 = '' OR bundle_sha256 = ?", bundleSHA256).
+		Updates(map[string]any{
+			"bundle_ref":    bundleRef,
+			"bundle_sha256": bundleSHA256,
+			"updated_at":    time.Now(),
+		})
+	return result.RowsAffected > 0, result.Error
 }
 
 func (r *tenantSkillRepository) DeleteCatalog(ctx context.Context, tenantID uint64, catalogID string) error {
