@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/require"
@@ -811,9 +812,10 @@ var (
 )
 
 type reaperSkillStore struct {
-	rows      map[string]*types.TenantSkillEntity
-	snapshots []*types.TenantSkillSnapshotEntity
-	catalogs  map[string]*types.TenantSkillCatalogEntity
+	rows         map[string]*types.TenantSkillEntity
+	snapshots    []*types.TenantSkillSnapshotEntity
+	catalogs     map[string]*types.TenantSkillCatalogEntity
+	bundleClaims map[string]installBundleClaim
 }
 
 func (r *reaperSkillStore) put(e *types.TenantSkillEntity) {
@@ -864,38 +866,94 @@ func (r *reaperSkillStore) UpdateSkill(_ context.Context, e *types.TenantSkillEn
 	return nil
 }
 
-func (r *reaperSkillStore) ClaimSkillBundleWrite(context.Context, uint64, string, string) error {
-	panic("ClaimSkillBundleWrite is outside the reaper surface")
+func (r *reaperSkillStore) ClaimSkillBundleWrite(
+	_ context.Context, tenantID uint64, ref, token string,
+) error {
+	if r.bundleClaims == nil {
+		r.bundleClaims = map[string]installBundleClaim{}
+	}
+	key := installBundleClaimKey(tenantID, ref)
+	claim := r.bundleClaims[key]
+	if claim.state == "writing" || claim.state == "deleting" {
+		return repository.ErrSkillBundleRefBusy
+	}
+	r.bundleClaims[key] = installBundleClaim{state: "writing", token: token}
+	return nil
 }
 
 func (r *reaperSkillStore) CreateSkillWithBundleClaim(
-	context.Context, *types.TenantSkillEntity, string,
+	_ context.Context, e *types.TenantSkillEntity, token string,
 ) error {
-	panic("CreateSkillWithBundleClaim is outside the reaper surface")
+	return r.UpdateSkillWithBundleClaim(context.Background(), e, token)
 }
 
 func (r *reaperSkillStore) UpdateSkillWithBundleClaim(
-	context.Context, *types.TenantSkillEntity, string,
+	_ context.Context, e *types.TenantSkillEntity, token string,
 ) error {
-	panic("UpdateSkillWithBundleClaim is outside the reaper surface")
+	key := installBundleClaimKey(e.TenantID, e.BundleRef)
+	claim := r.bundleClaims[key]
+	if claim.state != "writing" || claim.token != token {
+		return repository.ErrSkillBundleRefBusy
+	}
+	r.put(e)
+	r.bundleClaims[key] = installBundleClaim{state: "live"}
+	return nil
 }
 
-func (r *reaperSkillStore) ReleaseSkillBundleWrite(context.Context, uint64, string, string) error {
-	panic("ReleaseSkillBundleWrite is outside the reaper surface")
+func (r *reaperSkillStore) ReleaseSkillBundleWrite(
+	_ context.Context, tenantID uint64, ref, token string,
+) error {
+	key := installBundleClaimKey(tenantID, ref)
+	claim := r.bundleClaims[key]
+	if claim.state != "writing" || claim.token != token {
+		return repository.ErrSkillBundleRefBusy
+	}
+	r.bundleClaims[key] = installBundleClaim{state: "live"}
+	return nil
 }
 
 func (r *reaperSkillStore) ClaimUnreferencedSkillBundleDelete(
-	context.Context, uint64, string, string, bool,
+	_ context.Context, tenantID uint64, ref, token string, _ bool,
 ) (bool, error) {
-	panic("ClaimUnreferencedSkillBundleDelete is outside the reaper surface")
+	for _, row := range r.rows {
+		if row != nil && row.TenantID == tenantID && strings.TrimSpace(row.BundleRef) == ref {
+			return false, nil
+		}
+	}
+	for _, row := range r.catalogs {
+		if row != nil && row.TenantID == tenantID && strings.TrimSpace(row.BundleRef) == ref {
+			return false, nil
+		}
+	}
+	if r.bundleClaims == nil {
+		r.bundleClaims = map[string]installBundleClaim{}
+	}
+	r.bundleClaims[installBundleClaimKey(tenantID, ref)] = installBundleClaim{state: "deleting", token: token}
+	return true, nil
 }
 
-func (r *reaperSkillStore) CompleteSkillBundleDelete(context.Context, uint64, string, string) error {
-	panic("CompleteSkillBundleDelete is outside the reaper surface")
+func (r *reaperSkillStore) CompleteSkillBundleDelete(
+	_ context.Context, tenantID uint64, ref, token string,
+) error {
+	key := installBundleClaimKey(tenantID, ref)
+	claim := r.bundleClaims[key]
+	if claim.state != "deleting" || claim.token != token {
+		return errors.New("bundle deletion claim mismatch")
+	}
+	r.bundleClaims[key] = installBundleClaim{state: "deleted"}
+	return nil
 }
 
-func (r *reaperSkillStore) ReleaseSkillBundleDelete(context.Context, uint64, string, string) error {
-	panic("ReleaseSkillBundleDelete is outside the reaper surface")
+func (r *reaperSkillStore) ReleaseSkillBundleDelete(
+	_ context.Context, tenantID uint64, ref, token string,
+) error {
+	key := installBundleClaimKey(tenantID, ref)
+	claim := r.bundleClaims[key]
+	if claim.state != "deleting" || claim.token != token {
+		return errors.New("bundle deletion claim mismatch")
+	}
+	r.bundleClaims[key] = installBundleClaim{state: "live"}
+	return nil
 }
 
 func (r *reaperSkillStore) UpdateSkillEnvs(
@@ -1024,6 +1082,11 @@ func (r *reaperSkillStore) DeleteUserEnvVarsByConfig(context.Context, uint64, st
 func (r *reaperSkillStore) CreateCatalog(context.Context, *types.TenantSkillCatalogEntity) error {
 	panic("CreateCatalog is outside the reaper surface")
 }
+func (r *reaperSkillStore) CreateCatalogWithBundleClaim(
+	ctx context.Context, row *types.TenantSkillCatalogEntity, token string,
+) error {
+	return r.UpdateCatalogWithBundleClaim(ctx, row, token)
+}
 
 func (r *reaperSkillStore) GetCatalog(
 	_ context.Context, tenantID uint64, id string,
@@ -1047,6 +1110,19 @@ func (r *reaperSkillStore) ListCatalogsByTenant(context.Context, uint64) ([]*typ
 func (r *reaperSkillStore) UpdateCatalog(context.Context, *types.TenantSkillCatalogEntity) error {
 	panic("UpdateCatalog is outside the reaper surface")
 }
+func (r *reaperSkillStore) UpdateCatalogWithBundleClaim(
+	_ context.Context, row *types.TenantSkillCatalogEntity, token string,
+) error {
+	key := installBundleClaimKey(row.TenantID, row.BundleRef)
+	claim := r.bundleClaims[key]
+	if claim.state != "writing" || claim.token != token {
+		return repository.ErrSkillBundleRefBusy
+	}
+	cp := *row
+	r.catalogs[row.ID] = &cp
+	r.bundleClaims[key] = installBundleClaim{state: "live"}
+	return nil
+}
 
 func (r *reaperSkillStore) SetCatalogBundleIfEmpty(
 	_ context.Context, tenantID uint64, catalogID, bundleRef, bundleSHA256 string,
@@ -1057,6 +1133,23 @@ func (r *reaperSkillStore) SetCatalogBundleIfEmpty(
 	}
 	row.BundleRef = bundleRef
 	row.BundleSHA256 = bundleSHA256
+	return true, nil
+}
+func (r *reaperSkillStore) SetCatalogBundleIfEmptyWithClaim(
+	_ context.Context, tenantID uint64, catalogID, bundleRef, bundleSHA256, token string,
+) (bool, error) {
+	key := installBundleClaimKey(tenantID, bundleRef)
+	claim := r.bundleClaims[key]
+	if claim.state != "writing" || claim.token != token {
+		return false, repository.ErrSkillBundleRefBusy
+	}
+	row := r.catalogs[catalogID]
+	if row == nil || row.TenantID != tenantID || strings.TrimSpace(row.BundleRef) != "" {
+		return false, nil
+	}
+	row.BundleRef = bundleRef
+	row.BundleSHA256 = bundleSHA256
+	r.bundleClaims[key] = installBundleClaim{state: "live"}
 	return true, nil
 }
 

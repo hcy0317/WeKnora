@@ -1581,9 +1581,34 @@ func TestDeleteReleasesSkillSnapshotsBeforeSoftDelete(t *testing.T) {
 	require.Empty(t, fx.skills.skills, "tenant_skills rows must be dropped before SoftDelete")
 	require.True(t, fx.skills.ledgerCleared)
 	require.Equal(t, []string{"bundle://skill-a.zip"}, fx.files.deleted)
+	require.Len(t, fx.skills.completedClaims, 1)
+	require.Contains(t, fx.skills.completedClaims[0], "bundle://skill-a.zip:",
+		"physical deletion must complete the exact durable claim token")
 	// DeleteSkill only takes values filed under a skill; the config-wide ones
 	// would outlive the config without this.
 	require.Equal(t, []string{"7:cfg-a"}, fx.skills.envVarsClearedFor)
+}
+
+func TestDeleteSkillMetadataFailureDoesNotDeleteBundle(t *testing.T) {
+	fx := newSnapshotReleaseFixture(t, nil)
+	fx.skills.deleteSkillErr = stderrors.New("database unavailable")
+
+	require.NoError(t, fx.svc.Delete(context.Background(), 7, "cfg-a", false))
+	require.Empty(t, fx.files.deleted)
+	require.Len(t, fx.skills.skills, 1,
+		"a surviving DB row must keep ownership of its physical archive")
+	require.Empty(t, fx.skills.completedClaims)
+}
+
+func TestDeleteSkillMetadataRetainsCatalogOwnedBundle(t *testing.T) {
+	fx := newSnapshotReleaseFixture(t, nil)
+	fx.skills.catalogBundleRefs = map[string]bool{"bundle://skill-a.zip": true}
+
+	require.NoError(t, fx.svc.Delete(context.Background(), 7, "cfg-a", false))
+	require.Empty(t, fx.files.deleted)
+	require.Empty(t, fx.skills.skills)
+	require.Empty(t, fx.skills.completedClaims,
+		"the catalog's live reference must prevent a deletion claim")
 }
 
 func TestDeleteRefusesWhenSnapshotReleaseFailsWithoutForce(t *testing.T) {
@@ -1833,6 +1858,10 @@ type deleteSkillStore struct {
 	marks             []string
 	ledgerCleared     bool
 	envVarsClearedFor []string
+	deleteSkillErr    error
+	catalogBundleRefs map[string]bool
+	bundleClaims      map[string]string
+	completedClaims   []string
 }
 
 func (s *deleteSkillStore) snapshot(id string) *types.TenantSkillSnapshotEntity {
@@ -1901,6 +1930,9 @@ func (s *deleteSkillStore) DeleteSkill(ctx context.Context, tenantID uint64, con
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if s.deleteSkillErr != nil {
+		return s.deleteSkillErr
+	}
 	kept := s.skills[:0]
 	for _, row := range s.skills {
 		if row.TenantID == tenantID && row.SandboxConfigID == configID && row.ID == skillID {
@@ -1909,6 +1941,45 @@ func (s *deleteSkillStore) DeleteSkill(ctx context.Context, tenantID uint64, con
 		kept = append(kept, row)
 	}
 	s.skills = kept
+	return nil
+}
+
+func (s *deleteSkillStore) ClaimUnreferencedSkillBundleDelete(
+	_ context.Context, tenantID uint64, ref, token string, _ bool,
+) (bool, error) {
+	for _, row := range s.skills {
+		if row != nil && row.TenantID == tenantID && row.BundleRef == ref {
+			return false, nil
+		}
+	}
+	if s.catalogBundleRefs[ref] {
+		return false, nil
+	}
+	if s.bundleClaims == nil {
+		s.bundleClaims = map[string]string{}
+	}
+	s.bundleClaims[ref] = token
+	return true, nil
+}
+
+func (s *deleteSkillStore) CompleteSkillBundleDelete(
+	_ context.Context, _ uint64, ref, token string,
+) error {
+	if s.bundleClaims[ref] != token {
+		return stderrors.New("claim token mismatch")
+	}
+	delete(s.bundleClaims, ref)
+	s.completedClaims = append(s.completedClaims, ref+":"+token)
+	return nil
+}
+
+func (s *deleteSkillStore) ReleaseSkillBundleDelete(
+	_ context.Context, _ uint64, ref, token string,
+) error {
+	if s.bundleClaims[ref] != token {
+		return stderrors.New("claim token mismatch")
+	}
+	delete(s.bundleClaims, ref)
 	return nil
 }
 

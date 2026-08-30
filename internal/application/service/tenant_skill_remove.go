@@ -494,13 +494,5 @@ func (s *TenantSkillService) removeStillOwnsTheRow(
 func (s *TenantSkillService) deleteBundleBestEffort(
 	ctx context.Context, tenantID uint64, bundleRef string,
 ) {
-	fs, err := s.fileServiceForTenant(ctx, tenantID)
-	if err != nil || fs == nil {
-		logger.Warnf(ctx, "[skill] resolve file service to delete bundle %s failed: %v",
-			bundleRef, err)
-		return
-	}
-	if err := fs.DeleteFile(ctx, bundleRef); err != nil {
-		logger.Warnf(ctx, "[skill] delete bundle %s failed: %v", bundleRef, err)
-	}
+	s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, bundleRef, uuid.NewString(), false)
 }

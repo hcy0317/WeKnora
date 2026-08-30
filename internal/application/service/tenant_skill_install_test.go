@@ -2704,6 +2704,22 @@ func (r *installSkillRepo) CreateCatalog(_ context.Context, e *types.TenantSkill
 	return nil
 }
 
+func (r *installSkillRepo) CreateCatalogWithBundleClaim(
+	ctx context.Context, e *types.TenantSkillCatalogEntity, token string,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := installBundleClaimKey(e.TenantID, e.BundleRef)
+	claim := r.bundleClaims[key]
+	if claim.state != "writing" || claim.token != token {
+		return repository.ErrSkillBundleRefBusy
+	}
+	cp := *e
+	r.catalogs[e.ID] = &cp
+	r.bundleClaims[key] = installBundleClaim{state: "live"}
+	return ctx.Err()
+}
+
 func (r *installSkillRepo) GetCatalog(_ context.Context, _ uint64, catalogID string) (*types.TenantSkillCatalogEntity, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -2751,6 +2767,22 @@ func (r *installSkillRepo) UpdateCatalog(_ context.Context, e *types.TenantSkill
 	return nil
 }
 
+func (r *installSkillRepo) UpdateCatalogWithBundleClaim(
+	_ context.Context, e *types.TenantSkillCatalogEntity, token string,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := installBundleClaimKey(e.TenantID, e.BundleRef)
+	claim := r.bundleClaims[key]
+	if claim.state != "writing" || claim.token != token {
+		return repository.ErrSkillBundleRefBusy
+	}
+	cp := *e
+	r.catalogs[e.ID] = &cp
+	r.bundleClaims[key] = installBundleClaim{state: "live"}
+	return nil
+}
+
 func (r *installSkillRepo) SetCatalogBundleIfEmpty(
 	_ context.Context, tenantID uint64, catalogID, bundleRef, bundleSHA256 string,
 ) (bool, error) {
@@ -2762,6 +2794,26 @@ func (r *installSkillRepo) SetCatalogBundleIfEmpty(
 	}
 	row.BundleRef = bundleRef
 	row.BundleSHA256 = bundleSHA256
+	return true, nil
+}
+
+func (r *installSkillRepo) SetCatalogBundleIfEmptyWithClaim(
+	_ context.Context, tenantID uint64, catalogID, bundleRef, bundleSHA256, token string,
+) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := installBundleClaimKey(tenantID, bundleRef)
+	claim := r.bundleClaims[key]
+	if claim.state != "writing" || claim.token != token {
+		return false, repository.ErrSkillBundleRefBusy
+	}
+	row := r.catalogs[catalogID]
+	if row == nil || row.TenantID != tenantID || strings.TrimSpace(row.BundleRef) != "" {
+		return false, nil
+	}
+	row.BundleRef = bundleRef
+	row.BundleSHA256 = bundleSHA256
+	r.bundleClaims[key] = installBundleClaim{state: "live"}
 	return true, nil
 }
 
