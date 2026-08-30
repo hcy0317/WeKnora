@@ -974,10 +974,11 @@ func (s *TenantSandboxConfigService) Update(
 		return s.writeConfig(ctx, entity, in, merged)
 	}
 
-	if err := s.repo.SetCordon(ctx, tenantID, id, s.now()); err != nil {
+	cordonedAt := s.now().UTC().Truncate(time.Microsecond)
+	if err := s.repo.SetCordon(ctx, tenantID, id, cordonedAt); err != nil {
 		return nil, err
 	}
-	defer s.clearCordonAfterRequest(ctx, tenantID, id)
+	defer s.clearCordonAfterRequest(ctx, tenantID, id, cordonedAt)
 
 	// When old credentials no longer reach the provider we cannot enumerate
 	// sandboxes to refuse the edit — but blocking the save traps the admin on
@@ -1041,6 +1042,19 @@ func (s *TenantSandboxConfigService) Delete(
 	if types.IsSandboxWorkspacePolicyRow(entity) {
 		return apperrors.NewBadRequestError("workspace policy cannot be deleted here")
 	}
+	// Persist the destructive intent before observing provider state. Unlike an
+	// edit, deletion keeps the cordon on every partial failure: otherwise a new
+	// session could allocate a sandbox between cleanup attempts. SetCordon's
+	// lease-aware compare-and-set deliberately refuses an active cordon because
+	// this field is also used by updates; a retry safely reacquires it after a
+	// crashed attempt's bounded lease expires.
+	// PostgreSQL stores timestamptz at microsecond precision; normalize the CAS
+	// token before persisting so the final equality predicate is byte-stable
+	// across PostgreSQL and SQLite drivers.
+	cordonedAt := s.now().UTC().Truncate(time.Microsecond)
+	if err := s.repo.SetCordon(ctx, tenantID, id, cordonedAt); err != nil {
+		return err
+	}
 	summaries, listErr := s.listSandboxes(ctx, entity.Config, tenantID, id)
 	if listErr != nil {
 		if !force {
@@ -1057,7 +1071,7 @@ func (s *TenantSandboxConfigService) Delete(
 	if err := s.releaseSkillSnapshots(ctx, entity, tenantID, id, force); err != nil {
 		return err
 	}
-	return s.repo.SoftDelete(ctx, tenantID, id)
+	return s.repo.SoftDeleteCordoned(ctx, tenantID, id, cordonedAt)
 }
 
 func snapshotReleaserFrom(client sandbox.ConfigSandboxClient) (sandboxSnapshotReleaser, bool) {
@@ -1384,11 +1398,12 @@ func (s *TenantSandboxConfigService) clearCordonAfterRequest(
 	ctx context.Context,
 	tenantID uint64,
 	id string,
+	cordonedAt time.Time,
 ) {
 	cleanupCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx), sandboxConfigCleanupTimeout)
 	defer cancel()
-	if err := s.repo.ClearCordon(cleanupCtx, tenantID, id); err != nil {
+	if err := s.repo.ClearCordonIfMatch(cleanupCtx, tenantID, id, cordonedAt); err != nil {
 		logger.Warnf(ctx, "[sandbox] clear cordon on config %s: %v", id, err)
 	}
 }

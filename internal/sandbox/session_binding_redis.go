@@ -5,11 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Tencent/WeKnora/internal/common/redislock"
@@ -47,23 +48,26 @@ return 1
 // image, which is what we want once no turn is actually using the sandbox.
 const sessionTurnLeaseTTL = 30 * time.Minute
 
+const sessionTurnLeaseRenewInterval = 10 * time.Minute
+
 var beginTurnScript = redis.NewScript(`
-local refs = redis.call('HINCRBY', KEYS[1], 'refs', 1)
-if refs == 1 then
+if redis.call('EXISTS', KEYS[1]) == 0 then
 	redis.call('HSET', KEYS[1], 'rebuild', '1')
 end
+redis.call('HSET', KEYS[1], 'token:' .. ARGV[2], '1')
 redis.call('PEXPIRE', KEYS[1], ARGV[1])
-return refs
+return 1
 `)
 
 var endTurnScript = redis.NewScript(`
 if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
-local refs = redis.call('HINCRBY', KEYS[1], 'refs', -1)
-if refs <= 0 then
+local removed = redis.call('HDEL', KEYS[1], 'token:' .. ARGV[1])
+if removed == 0 then return 0 end
+if redis.call('HLEN', KEYS[1]) <= 1 then
 	redis.call('DEL', KEYS[1])
 	return 0
 end
-return refs
+return 1
 `)
 
 var consumeTurnRebuildScript = redis.NewScript(`
@@ -84,6 +88,10 @@ type RedisSessionSandboxBindingStore struct {
 	namespace         string
 	lockLease         time.Duration
 	lockRenewInterval time.Duration
+	turnLeaseTTL      time.Duration
+	turnRenewInterval time.Duration
+	turnMu            sync.Mutex
+	localTurns        map[string]chan struct{}
 }
 
 // NewRedisSessionSandboxBindingStore creates a fail-closed Redis store.
@@ -103,6 +111,9 @@ func NewRedisSessionSandboxBindingStore(
 		namespace:         namespace,
 		lockLease:         redisLifecycleLockLease,
 		lockRenewInterval: redisLifecycleLockRenewInterval,
+		turnLeaseTTL:      sessionTurnLeaseTTL,
+		turnRenewInterval: sessionTurnLeaseRenewInterval,
+		localTurns:        make(map[string]chan struct{}),
 	}, nil
 }
 
@@ -308,18 +319,20 @@ func escapeRedisGlob(literal string) string {
 func (s *RedisSessionSandboxBindingStore) BeginTurn(
 	ctx context.Context,
 	key SessionSandboxKey,
-) error {
+) (string, error) {
 	if err := key.Validate(); err != nil {
-		return err
+		return "", err
 	}
-	ttlMS := sessionTurnLeaseTTL.Milliseconds()
+	token := uuid.NewString()
+	ttlMS := s.effectiveTurnLeaseTTL().Milliseconds()
 	if ttlMS <= 0 {
 		ttlMS = (30 * time.Minute).Milliseconds()
 	}
-	if err := beginTurnScript.Run(ctx, s.client, []string{s.turnKey(key)}, ttlMS).Err(); err != nil {
-		return fmt.Errorf("begin sandbox turn lease: %w", err)
+	if err := beginTurnScript.Run(ctx, s.client, []string{s.turnKey(key)}, ttlMS, token).Err(); err != nil {
+		return "", fmt.Errorf("begin sandbox turn lease: %w", err)
 	}
-	return nil
+	s.beginLocalTurnRenewal(key, token)
+	return token, nil
 }
 
 // EndTurn releases one chat-turn lease. The last release drops the lease so
@@ -327,11 +340,13 @@ func (s *RedisSessionSandboxBindingStore) BeginTurn(
 func (s *RedisSessionSandboxBindingStore) EndTurn(
 	ctx context.Context,
 	key SessionSandboxKey,
+	token string,
 ) error {
 	if err := key.Validate(); err != nil {
 		return err
 	}
-	if err := endTurnScript.Run(ctx, s.client, []string{s.turnKey(key)}).Err(); err != nil {
+	s.endLocalTurnRenewal(key, token)
+	if err := endTurnScript.Run(ctx, s.client, []string{s.turnKey(key)}, token).Err(); err != nil {
 		return fmt.Errorf("end sandbox turn lease: %w", err)
 	}
 	return nil
@@ -353,9 +368,14 @@ func (s *RedisSessionSandboxBindingStore) TurnState(
 	if len(values) == 0 {
 		return false, false, nil
 	}
-	_ = s.client.PExpire(ctx, s.turnKey(key), sessionTurnLeaseTTL).Err()
-	refs, _ := strconv.Atoi(values["refs"])
-	if refs <= 0 {
+	_ = s.client.PExpire(ctx, s.turnKey(key), s.effectiveTurnLeaseTTL()).Err()
+	tokens := 0
+	for field := range values {
+		if strings.HasPrefix(field, "token:") {
+			tokens++
+		}
+	}
+	if tokens == 0 {
 		return false, false, nil
 	}
 	return true, values["rebuild"] == "1", nil
@@ -370,11 +390,62 @@ func (s *RedisSessionSandboxBindingStore) ConsumeTurnRebuild(
 		return err
 	}
 	if err := consumeTurnRebuildScript.Run(
-		ctx, s.client, []string{s.turnKey(key)}, sessionTurnLeaseTTL.Milliseconds(),
+		ctx, s.client, []string{s.turnKey(key)}, s.effectiveTurnLeaseTTL().Milliseconds(),
 	).Err(); err != nil {
 		return fmt.Errorf("consume sandbox turn rebuild: %w", err)
 	}
 	return nil
+}
+
+func (s *RedisSessionSandboxBindingStore) effectiveTurnLeaseTTL() time.Duration {
+	if s.turnLeaseTTL > 0 {
+		return s.turnLeaseTTL
+	}
+	return sessionTurnLeaseTTL
+}
+
+func (s *RedisSessionSandboxBindingStore) effectiveTurnRenewInterval() time.Duration {
+	if s.turnRenewInterval > 0 {
+		return s.turnRenewInterval
+	}
+	return sessionTurnLeaseRenewInterval
+}
+
+func (s *RedisSessionSandboxBindingStore) beginLocalTurnRenewal(key SessionSandboxKey, token string) {
+	localKey := s.turnKey(key) + ":" + token
+	s.turnMu.Lock()
+	stop := make(chan struct{})
+	s.localTurns[localKey] = stop
+	s.turnMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(s.effectiveTurnRenewInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				// Detached from the request: model/provider waits may outlive the
+				// HTTP context, while EndTurn remains the lifecycle authority.
+				_ = s.client.PExpire(
+					context.Background(), s.turnKey(key), s.effectiveTurnLeaseTTL(),
+				).Err()
+			}
+		}
+	}()
+}
+
+func (s *RedisSessionSandboxBindingStore) endLocalTurnRenewal(key SessionSandboxKey, token string) {
+	localKey := s.turnKey(key) + ":" + token
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	stop := s.localTurns[localKey]
+	if stop == nil {
+		return
+	}
+	delete(s.localTurns, localKey)
+	close(stop)
 }
 
 func (s *RedisSessionSandboxBindingStore) turnKey(key SessionSandboxKey) string {

@@ -29,6 +29,9 @@ func (s *TenantSkillService) RemoveSkill(
 	if skill == nil {
 		return apperrors.NewNotFoundError("skill not found")
 	}
+	if err := s.ensureCatalogBundleBeforeRemoval(ctx, tenantID, skill); err != nil {
+		return fmt.Errorf("preserve catalog bundle before removal: %w", err)
+	}
 
 	now := s.now()
 	skill.Status = types.SkillStatusRemoving
@@ -53,6 +56,25 @@ func (s *TenantSkillService) RemoveSkill(
 		}
 	}()
 	return nil
+}
+
+func (s *TenantSkillService) ensureCatalogBundleBeforeRemoval(
+	ctx context.Context, tenantID uint64, skill *types.TenantSkillEntity,
+) error {
+	if skill == nil || strings.TrimSpace(skill.CatalogID) == "" {
+		return nil
+	}
+	catalog, err := s.skills.GetCatalog(ctx, tenantID, skill.CatalogID)
+	if err != nil || catalog == nil || strings.TrimSpace(catalog.BundleRef) != "" {
+		return err
+	}
+	archive, err := s.downloadSkillBundle(ctx, tenantID, skill)
+	if err != nil {
+		return err
+	}
+	return s.ensureCatalogOwnedBundle(
+		ctx, tenantID, catalog.ID, strings.TrimSpace(skill.BundleSHA256), archive,
+	)
 }
 
 func (s *TenantSkillService) runRemove(

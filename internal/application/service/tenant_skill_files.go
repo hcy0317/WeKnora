@@ -195,6 +195,9 @@ func (s *TenantSkillService) downloadSkillBundle(
 	if len(archive) > maxSkillBundleTotalBytes {
 		return nil, fmt.Errorf("skill bundle %s is larger than the upload limit", ref)
 	}
+	if want := strings.TrimSpace(skill.BundleSHA256); want != "" && !archiveMatchesSHA(archive, want) {
+		return nil, fmt.Errorf("bundle of skill %s does not match its declared sha256", skill.Name)
+	}
 	return archive, nil
 }
 

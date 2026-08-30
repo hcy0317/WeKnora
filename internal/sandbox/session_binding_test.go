@@ -254,13 +254,15 @@ func testSessionTurnLeaseStore(t *testing.T, store sessionTurnLeaseStore) {
 	require.False(t, active)
 	require.False(t, rebuildOnce)
 
-	require.NoError(t, store.BeginTurn(ctx, key))
+	firstToken, err := store.BeginTurn(ctx, key)
+	require.NoError(t, err)
 	active, rebuildOnce, err = store.TurnState(ctx, key)
 	require.NoError(t, err)
 	require.True(t, active)
 	require.True(t, rebuildOnce)
 
-	require.NoError(t, store.BeginTurn(ctx, key))
+	secondToken, err := store.BeginTurn(ctx, key)
+	require.NoError(t, err)
 	active, rebuildOnce, err = store.TurnState(ctx, key)
 	require.NoError(t, err)
 	require.True(t, active)
@@ -272,13 +274,13 @@ func testSessionTurnLeaseStore(t *testing.T, store sessionTurnLeaseStore) {
 	require.True(t, active)
 	require.False(t, rebuildOnce)
 
-	require.NoError(t, store.EndTurn(ctx, key))
+	require.NoError(t, store.EndTurn(ctx, key, firstToken))
 	active, rebuildOnce, err = store.TurnState(ctx, key)
 	require.NoError(t, err)
 	require.True(t, active)
 	require.False(t, rebuildOnce)
 
-	require.NoError(t, store.EndTurn(ctx, key))
+	require.NoError(t, store.EndTurn(ctx, key, secondToken))
 	active, rebuildOnce, err = store.TurnState(ctx, key)
 	require.NoError(t, err)
 	require.False(t, active)
@@ -286,7 +288,8 @@ func testSessionTurnLeaseStore(t *testing.T, store sessionTurnLeaseStore) {
 
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	require.Error(t, store.BeginTurn(cancelled, key))
+	_, err = store.BeginTurn(cancelled, key)
+	require.Error(t, err)
 }
 
 func TestMemorySessionSandboxBindingStoreSeparatesTenants(t *testing.T) {

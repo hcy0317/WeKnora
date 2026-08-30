@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Tencent/WeKnora/internal/sandbox"
@@ -112,7 +113,7 @@ func TestTenantSkillSourceReadsLevel3FilesFromTheBundle(t *testing.T) {
 	})
 	src := NewTenantSkillSource([]*types.TenantSkillEntity{{
 		ID: "sk-1", Name: "pdf", Status: types.SkillStatusReady, Enabled: true,
-		BundleRef: "local://sk-1.zip", BundleSHA256: "sha-1",
+		BundleRef: "local://sk-1.zip", BundleSHA256: bundleArchiveSHA256(archive),
 	}}, func(ref string) ([]byte, error) {
 		require.Equal(t, "local://sk-1.zip", ref)
 		return archive, nil
@@ -142,7 +143,7 @@ func TestTenantSkillSourceDownloadsEachBundleOnce(t *testing.T) {
 	downloads := 0
 	src := NewTenantSkillSource([]*types.TenantSkillEntity{{
 		ID: "sk-1", Name: "pdf", Status: types.SkillStatusReady, Enabled: true,
-		BundleRef: "local://sk-1.zip", BundleSHA256: "sha-1",
+		BundleRef: "local://sk-1.zip", BundleSHA256: bundleArchiveSHA256(archive),
 	}}, func(string) ([]byte, error) {
 		downloads++
 		return archive, nil
@@ -155,6 +156,20 @@ func TestTenantSkillSourceDownloadsEachBundleOnce(t *testing.T) {
 
 	require.Equal(t, 1, downloads,
 		"one read_skill call per file would re-download the whole archive every time")
+}
+
+func TestTenantSkillSourceRejectsBundleWithWrongDeclaredSHA(t *testing.T) {
+	archive := zipArchive(t, map[string]string{
+		"SKILL.md": "---\nname: pdf\ndescription: d\n---\nbody\n",
+	})
+	src := NewTenantSkillSource([]*types.TenantSkillEntity{{
+		ID: "sk-1", Name: "pdf", Status: types.SkillStatusReady, Enabled: true,
+		BundleRef: "local://sk-1.zip", BundleSHA256: strings.Repeat("0", 64),
+	}}, func(string) ([]byte, error) { return archive, nil })
+
+	_, err := src.ListSkillFiles("pdf")
+	require.ErrorContains(t, err, "does not match its declared sha256")
+	require.Empty(t, src.cache)
 }
 
 func TestTenantSkillSourceRefusesPathsOutsideTheSkill(t *testing.T) {
@@ -385,4 +400,17 @@ func zipArchive(t *testing.T, files map[string]string) []byte {
 	}
 	require.NoError(t, writer.Close())
 	return buf.Bytes()
+}
+
+func TestTenantSkillSourceCacheUsesUncompressedByteBudget(t *testing.T) {
+	src := &TenantSkillSource{maxCacheBytes: 10}
+	first := map[string][]byte{"SKILL.md": make([]byte, 6)}
+	second := map[string][]byte{"SKILL.md": make([]byte, 6)}
+
+	src.store("first", first)
+	src.store("second", second)
+
+	require.Nil(t, src.cached("first"), "least-recent bundle must be evicted by byte budget")
+	require.Equal(t, second, src.cached("second"))
+	require.LessOrEqual(t, src.cacheBytes, int64(10))
 }

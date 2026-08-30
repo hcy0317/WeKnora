@@ -3,6 +3,8 @@ package skills
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -24,11 +26,9 @@ const (
 	maxBundleBytes      = 256 << 20 // 256 MiB across the archive
 )
 
-// cachedBundleCount bounds the unpacked archives one source keeps. A source
-// lives for a single agent run, and within that run read_skill is typically
-// called several times against the same skill, so a handful of entries removes
-// the repeated download without holding archives past the turn.
-const cachedBundleCount = 4
+// cachedBundleBytes bounds retained *uncompressed* bytes. Counting entries is
+// not sufficient: four accepted archives may each inflate to 256 MiB.
+const cachedBundleBytes = maxBundleBytes
 
 // TenantSkillSource exposes the skills an administrator installed into one
 // sandbox config's snapshot image.
@@ -53,12 +53,15 @@ type TenantSkillSource struct {
 	// cache holds unpacked archives, most recently used first, keyed by
 	// bundle_sha256: the archive is immutable under that key, so a hit can
 	// never serve a stale tree.
-	cache []cachedBundle
+	cache         []cachedBundle
+	cacheBytes    int64
+	maxCacheBytes int64
 }
 
 type cachedBundle struct {
 	key   string
 	files map[string][]byte
+	bytes int64
 }
 
 // NewTenantSkillSource builds a source over the rows of one sandbox config.
@@ -277,12 +280,21 @@ func (s *TenantSkillSource) bundleFiles(
 	if err != nil {
 		return nil, fmt.Errorf("download bundle of skill %s: %w", row.Name, err)
 	}
+	if declared := strings.TrimSpace(row.BundleSHA256); declared != "" &&
+		!strings.EqualFold(declared, bundleArchiveSHA256(archive)) {
+		return nil, fmt.Errorf("bundle of skill %s does not match its declared sha256", row.Name)
+	}
 	files, err := unpackSkillBundle(archive)
 	if err != nil {
 		return nil, fmt.Errorf("read bundle of skill %s: %w", row.Name, err)
 	}
 	s.store(key, files)
 	return files, nil
+}
+
+func bundleArchiveSHA256(archive []byte) string {
+	sum := sha256.Sum256(archive)
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *TenantSkillSource) cached(key string) map[string][]byte {
@@ -300,12 +312,39 @@ func (s *TenantSkillSource) cached(key string) map[string][]byte {
 }
 
 func (s *TenantSkillSource) store(key string, files map[string][]byte) {
+	size := bundleFilesBytes(files)
+	limit := s.maxCacheBytes
+	if limit <= 0 {
+		limit = cachedBundleBytes
+	}
+	if size > limit {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cache = append([]cachedBundle{{key: key, files: files}}, s.cache...)
-	if len(s.cache) > cachedBundleCount {
-		s.cache = s.cache[:cachedBundleCount]
+	for i, entry := range s.cache {
+		if entry.key != key {
+			continue
+		}
+		s.cacheBytes -= entry.bytes
+		s.cache = append(s.cache[:i], s.cache[i+1:]...)
+		break
 	}
+	s.cache = append([]cachedBundle{{key: key, files: files, bytes: size}}, s.cache...)
+	s.cacheBytes += size
+	for s.cacheBytes > limit && len(s.cache) > 0 {
+		last := len(s.cache) - 1
+		s.cacheBytes -= s.cache[last].bytes
+		s.cache = s.cache[:last]
+	}
+}
+
+func bundleFilesBytes(files map[string][]byte) int64 {
+	var total int64
+	for _, content := range files {
+		total += int64(len(content))
+	}
+	return total
 }
 
 // unpackSkillBundle reads a skill archive into skill-root-relative paths. It

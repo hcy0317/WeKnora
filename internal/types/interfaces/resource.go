@@ -21,11 +21,15 @@ type ResourceRepository interface {
 	Create(ctx context.Context, resource *types.StoredResource) error
 	GetByID(ctx context.Context, id string) (*types.StoredResource, error)
 	GetByHandle(ctx context.Context, handle string) (*types.StoredResource, error)
+	GetByHandleIncludingDeleted(ctx context.Context, handle string) (*types.StoredResource, error)
 	GetByTenantLocation(ctx context.Context, tenantID uint64, locationHash string) (*types.StoredResource, error)
-	MarkDeleted(ctx context.Context, id string) error
-	CreateBinding(ctx context.Context, binding *types.ResourceBinding) error
-	DeleteBinding(ctx context.Context, resourceID, ownerType, ownerID string) error
-	CountBindings(ctx context.Context, resourceID string) (int64, error)
+	MarkDeletedIfUnbound(ctx context.Context, id string) (time.Time, error)
+	ValidateDeletionClaim(ctx context.Context, id string, claim time.Time) (bool, error)
+	RestoreActiveIfClaim(ctx context.Context, id string, claim time.Time) (bool, error)
+	CreateBindingIfActive(ctx context.Context, binding *types.ResourceBinding) (bool, error)
+	ReleaseBindingAndMarkIfUnbound(
+		ctx context.Context, resourceID, ownerType, ownerID string,
+	) (remaining int64, deletionClaim time.Time, err error)
 	CreateGrant(ctx context.Context, grant *types.ResourceAccessGrant) error
 	GetValidGrant(ctx context.Context, tokenHash string, now time.Time) (*types.ResourceAccessGrant, error)
 	DeleteExpiredGrants(ctx context.Context, before time.Time) error
@@ -47,6 +51,7 @@ type ResourceCatalog interface {
 	Register(ctx context.Context, tenantID uint64, physicalPath string, meta ResourceRegistration) (string, error)
 	Resolve(ctx context.Context, reference string) (*types.StoredResource, error)
 	ResolvePath(ctx context.Context, value string) (string, *types.StoredResource, error)
+	ResolvePathForDeletion(ctx context.Context, value string) (string, *types.StoredResource, error)
 	Bind(ctx context.Context, reference, ownerType, ownerID, relation string) error
 	// Release drops one owner's claim on a resource and reports how many
 	// claims remain. Callers use the count to decide whether the bytes may be
@@ -57,8 +62,38 @@ type ResourceCatalog interface {
 	// remaining is -1 when the answer is unknown (the reference is not a
 	// catalog handle, or the count could not be read), which callers should
 	// treat as "delete as before" rather than as "keep forever".
-	Release(ctx context.Context, reference, ownerType, ownerID string) (remaining int64, err error)
-	MarkDeleted(ctx context.Context, reference string) error
+	Release(
+		ctx context.Context, reference, ownerType, ownerID string,
+	) (remaining int64, deletionClaim time.Time, err error)
+	MarkDeleted(ctx context.Context, reference string) (time.Time, error)
+	ValidateDeletionClaim(ctx context.Context, reference string, claim time.Time) error
+	RestoreActive(ctx context.Context, reference string, claim time.Time) error
 	CreateAccessGrant(ctx context.Context, reference string, ttl time.Duration) (string, error)
 	ResolveAccessGrant(ctx context.Context, token string) (*types.StoredResource, error)
+}
+
+type resourceDeletionClaimContext struct {
+	reference string
+	claim     time.Time
+}
+
+type resourceDeletionClaimContextKey struct{}
+
+// WithResourceDeletionClaim carries the exact database claim that authorizes
+// one physical resource deletion attempt.
+func WithResourceDeletionClaim(ctx context.Context, reference string, claim time.Time) context.Context {
+	return context.WithValue(ctx, resourceDeletionClaimContextKey{}, resourceDeletionClaimContext{
+		reference: reference,
+		claim:     claim,
+	})
+}
+
+// ResourceDeletionClaimFromContext returns the matching physical-deletion
+// claim, if the caller is releasing the same resource reference.
+func ResourceDeletionClaimFromContext(ctx context.Context, reference string) (time.Time, bool) {
+	value, ok := ctx.Value(resourceDeletionClaimContextKey{}).(resourceDeletionClaimContext)
+	if !ok || value.reference != reference || value.claim.IsZero() {
+		return time.Time{}, false
+	}
+	return value.claim, true
 }

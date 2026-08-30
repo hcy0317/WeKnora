@@ -198,6 +198,33 @@ func TestListSkillFilesDoesNotFallbackToADifferentCatalogBundle(t *testing.T) {
 	require.Equal(t, 404, appErr.HTTPCode)
 }
 
+func TestListSkillFilesRejectsCorruptInstallAndFallsBackToSameDigestCatalog(t *testing.T) {
+	fx := newInstallFixture(t)
+	ctx := context.Background()
+	good := zipBundle(t, map[string]string{
+		"SKILL.md": validSkillMD, "scripts/extract.py": "print('good')\n",
+	})
+	sha := skillArchiveSHA256(good)
+	fx.storedBundles = map[string][]byte{
+		"file://install.zip": []byte("corrupt"),
+		"file://catalog.zip": good,
+	}
+	require.NoError(t, fx.skillRepo.CreateCatalog(ctx, &types.TenantSkillCatalogEntity{
+		ID: "cat-1", TenantID: 7, Name: "pdf-tools",
+		BundleRef: "file://catalog.zip", BundleSHA256: sha,
+	}))
+	skill, err := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	skill.CatalogID = "cat-1"
+	skill.BundleRef = "file://install.zip"
+	skill.BundleSHA256 = sha
+	require.NoError(t, fx.skillRepo.UpdateSkill(ctx, skill))
+
+	files, err := fx.svc.ListSkillFiles(ctx, 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	require.NotEmpty(t, files)
+}
+
 func (f *installFixture) seedStoredSkillBundle(t *testing.T) {
 	t.Helper()
 	archive, err := zipSkillFiles(map[string][]byte{
@@ -215,6 +242,7 @@ func (f *installFixture) storeSkillBundle(t *testing.T, skillID string, archive 
 	require.NoError(t, err)
 	require.NotNil(t, skill)
 	skill.BundleRef = "file://bundle.zip"
+	skill.BundleSHA256 = skillArchiveSHA256(archive)
 	skill.Status = types.SkillStatusReady
 	require.NoError(t, f.skillRepo.UpdateSkill(ctx, skill))
 	if f.storedBundles == nil {

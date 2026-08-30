@@ -815,39 +815,30 @@ func (m *SessionBoundManager) Cleanup(_ context.Context) error {
 
 // --- internal helpers --------------------------------------------------------
 
-// BeginSessionTurn opens the chat-turn lease for sessionID. The first
-// resolve after this may rebuild a stale image; later resolves of the same
-// turn keep the sandbox.
-func (m *SessionBoundManager) BeginSessionTurn(ctx context.Context, sessionID string) error {
+// HoldSessionTurn opens one tokenized chat-turn lease and returns its exact
+// release. A delayed release from an expired turn cannot decrement a newer
+// turn (the ABA case of the former shared refcount).
+func (m *SessionBoundManager) HoldSessionTurn(
+	ctx context.Context, sessionID string,
+) (func() error, error) {
 	if m == nil {
-		return nil
+		return func() error { return nil }, nil
 	}
 	leaser, ok := m.bindings.(sessionTurnLeaseStore)
 	if !ok {
-		return nil
+		return func() error { return nil }, nil
 	}
 	key, err := m.sessionKey(ctx, sessionID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return leaser.BeginTurn(ctx, key)
-}
-
-// EndSessionTurn closes the chat-turn lease. It ignores request cancellation
-// so a disconnected client still releases the lease.
-func (m *SessionBoundManager) EndSessionTurn(ctx context.Context, sessionID string) error {
-	if m == nil {
-		return nil
-	}
-	leaser, ok := m.bindings.(sessionTurnLeaseStore)
-	if !ok {
-		return nil
-	}
-	key, err := m.sessionKey(ctx, sessionID)
+	token, err := leaser.BeginTurn(ctx, key)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return leaser.EndTurn(context.WithoutCancel(ctx), key)
+	return func() error {
+		return leaser.EndTurn(context.WithoutCancel(ctx), key, token)
+	}, nil
 }
 
 var _ SessionTurnHolder = (*SessionBoundManager)(nil)

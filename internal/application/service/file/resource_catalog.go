@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -151,15 +152,39 @@ func (s *resourceCatalogFileService) GetFileURL(ctx context.Context, filePath st
 }
 
 func (s *resourceCatalogFileService) DeleteFile(ctx context.Context, filePath string) error {
-	physical, isResource, err := s.resolve(ctx, filePath)
+	_, isResource := types.ParseResourcePath(filePath)
+	var physical string
+	var err error
+	if isResource {
+		physical, _, err = s.catalog.ResolvePathForDeletion(ctx, filePath)
+	} else {
+		physical, _, err = s.resolve(ctx, filePath)
+	}
 	if err != nil {
 		return err
 	}
-	if err := s.inner.DeleteFile(ctx, physical); err != nil {
-		return err
-	}
+	// Claim deletion in the database before touching provider bytes. Bind uses
+	// the inverse active-only insert, so a concurrent bind either wins and keeps
+	// the file or loses after this tombstone is visible to every process.
+	var claim time.Time
 	if isResource {
-		return s.catalog.MarkDeleted(ctx, filePath)
+		if existing, ok := interfaces.ResourceDeletionClaimFromContext(ctx, filePath); ok {
+			claim = existing
+			if err := s.catalog.ValidateDeletionClaim(ctx, filePath, claim); err != nil {
+				return err
+			}
+		} else {
+			claim, err = s.catalog.MarkDeleted(ctx, filePath)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if err := s.inner.DeleteFile(ctx, physical); err != nil {
+		if isResource {
+			return errors.Join(err, s.catalog.RestoreActive(ctx, filePath, claim))
+		}
+		return err
 	}
 	return nil
 }

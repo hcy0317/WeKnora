@@ -73,17 +73,22 @@ type resourceReleaser struct {
 // orphaned blob that a later delete can still reclaim; the cost of guessing
 // wrong the other way is an image vanishing from a conversation or document
 // that nobody deleted.
-func (r *resourceReleaser) deletable(ctx context.Context, ref string) bool {
+func (r *resourceReleaser) deletable(ctx context.Context, ref string) (bool, time.Time) {
 	if r == nil || r.catalog == nil {
-		return true
+		return true, time.Time{}
 	}
 	remaining := int64(-1)
+	var deletionClaim time.Time
 	for _, ownerID := range r.ownerIDs {
-		count, err := r.catalog.Release(ctx, ref, r.ownerType, ownerID)
+		count, claim, err := r.catalog.Release(ctx, ref, r.ownerType, ownerID)
 		if err != nil {
 			logger.Warnf(ctx, "Failed to release resource %s from %s %s: %v",
 				ref, r.ownerType, ownerID, err)
-			return false
+			return false, time.Time{}
+		}
+		if !claim.IsZero() {
+			deletionClaim = claim
+			break
 		}
 		if count >= 0 {
 			remaining = count
@@ -91,7 +96,7 @@ func (r *resourceReleaser) deletable(ctx context.Context, ref string) bool {
 	}
 	// -1 means the reference is not a catalog handle: no claims to account
 	// for, so fall back to deleting it as before.
-	return remaining <= 0
+	return remaining <= 0, deletionClaim
 }
 
 // deleteExtractedImages deletes all extracted image files from storage.
@@ -110,11 +115,16 @@ func deleteExtractedImages(
 	}
 	logger.Infof(ctx, "Deleting %d extracted images", len(imageURLs))
 	for _, url := range imageURLs {
-		if !releaser.deletable(ctx, url) {
+		deletable, claim := releaser.deletable(ctx, url)
+		if !deletable {
 			logger.Infof(ctx, "Keeping extracted image %s: another owner may still reference it", url)
 			continue
 		}
-		if err := fileSvc.DeleteFile(ctx, url); err != nil {
+		deleteCtx := ctx
+		if !claim.IsZero() {
+			deleteCtx = interfaces.WithResourceDeletionClaim(ctx, url, claim)
+		}
+		if err := fileSvc.DeleteFile(deleteCtx, url); err != nil {
 			logger.Errorf(ctx, "Failed to delete extracted image %s: %v", url, err)
 		}
 	}
@@ -248,6 +258,7 @@ func (s *knowledgeService) DeleteKnowledge(ctx context.Context, id string) error
 	if err := s.repo.DeleteKnowledge(ctx, tenantID, id); err != nil {
 		return err
 	}
+	s.releaseManualContentResources(ctx, knowledge, kbFileSvc)
 
 	// Best-effort physical cleanup. Errors here only leak storage; they must not
 	// fail the delete now that the row is already gone.
@@ -717,8 +728,9 @@ func (s *knowledgeService) DeleteKnowledgeList(ctx context.Context, ids []string
 
 	storageAdjust := int64(0)
 	for _, knowledge := range knowledgeList {
+		fSvc := kbFileServices[knowledge.KnowledgeBaseID]
+		s.releaseManualContentResources(ctx, knowledge, fSvc)
 		if knowledge.FilePath != "" {
-			fSvc := kbFileServices[knowledge.KnowledgeBaseID]
 			if err := fSvc.DeleteFile(ctx, knowledge.FilePath); err != nil {
 				logger.GetLogger(ctx).WithField("error", err).Errorf("DeleteKnowledge delete file failed")
 			}

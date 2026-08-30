@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"errors"
+	"io"
+	"mime/multipart"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,8 @@ import (
 type resolvingCatalog struct {
 	tenantByRef map[string]uint64
 	binds       []bindCall
+	releases    []string
+	remaining   map[string]int64
 }
 
 func (c *resolvingCatalog) Resolve(_ context.Context, ref string) (*types.StoredResource, error) {
@@ -44,11 +48,26 @@ func (c *resolvingCatalog) ResolvePath(
 	return value, nil, nil
 }
 
-func (c *resolvingCatalog) Release(context.Context, string, string, string) (int64, error) {
-	return -1, nil
+func (c *resolvingCatalog) ResolvePathForDeletion(
+	ctx context.Context, value string,
+) (string, *types.StoredResource, error) {
+	return c.ResolvePath(ctx, value)
 }
 
-func (c *resolvingCatalog) MarkDeleted(context.Context, string) error { return nil }
+func (c *resolvingCatalog) Release(_ context.Context, ref, _, _ string) (int64, time.Time, error) {
+	c.releases = append(c.releases, ref)
+	return c.remaining[ref], time.Now(), nil
+}
+
+func (c *resolvingCatalog) MarkDeleted(context.Context, string) (time.Time, error) {
+	return time.Now(), nil
+}
+
+func (c *resolvingCatalog) ValidateDeletionClaim(context.Context, string, time.Time) error {
+	return nil
+}
+
+func (c *resolvingCatalog) RestoreActive(context.Context, string, time.Time) error { return nil }
 
 func (c *resolvingCatalog) CreateAccessGrant(
 	context.Context, string, time.Duration,
@@ -119,4 +138,62 @@ func TestBindContentResourcesIsInertWithoutCatalog(t *testing.T) {
 	// Must not panic; a deployment without a resource registry has nothing to
 	// claim and keeps the pre-binding behaviour.
 	svc.bindContentResources(context.Background(), 7, "kn-1", "![a]("+contentRef("f")+")")
+}
+
+type contentDeleteFileService struct{ deleted []string }
+
+func (*contentDeleteFileService) CheckConnectivity(context.Context) error { return nil }
+
+func (*contentDeleteFileService) SaveFile(context.Context, *multipart.FileHeader, uint64, string) (string, error) {
+	return "", errors.New("unused")
+}
+
+func (*contentDeleteFileService) SaveBytes(context.Context, []byte, uint64, string, bool) (string, error) {
+	return "", errors.New("unused")
+}
+
+func (*contentDeleteFileService) GetFile(context.Context, string) (io.ReadCloser, error) {
+	return nil, errors.New("unused")
+}
+
+func (*contentDeleteFileService) GetFileURL(context.Context, string) (string, error) {
+	return "", errors.New("unused")
+}
+
+func (f *contentDeleteFileService) DeleteFile(_ context.Context, ref string) error {
+	f.deleted = append(f.deleted, ref)
+	return nil
+}
+
+func (*contentDeleteFileService) CopyFile(context.Context, string, uint64, string) (string, error) {
+	return "", errors.New("unused")
+}
+
+func TestSyncContentResourcesReleasesOnlyRemovedHandles(t *testing.T) {
+	removed := contentRef("g")
+	kept := contentRef("h")
+	added := contentRef("i")
+	catalog := &resolvingCatalog{
+		tenantByRef: map[string]uint64{removed: 7, kept: 7, added: 7},
+		remaining:   map[string]int64{removed: 0},
+	}
+	files := &contentDeleteFileService{}
+	svc := &knowledgeService{resourceCatalog: catalog}
+
+	svc.syncContentResources(
+		context.Background(), 7, "kn-1",
+		"![removed]("+removed+") ![kept]("+kept+")",
+		"![kept]("+kept+") ![added]("+added+")",
+		files,
+	)
+
+	if len(catalog.releases) != 1 || catalog.releases[0] != removed {
+		t.Fatalf("releases = %v, want only %q", catalog.releases, removed)
+	}
+	if len(files.deleted) != 1 || files.deleted[0] != removed {
+		t.Fatalf("deleted = %v, want only %q", files.deleted, removed)
+	}
+	if len(catalog.binds) != 2 {
+		t.Fatalf("binds = %v, want kept and added handles", catalog.binds)
+	}
 }

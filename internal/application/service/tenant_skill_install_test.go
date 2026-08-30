@@ -564,9 +564,27 @@ func TestInstallSkillRefusesWhenBundleCannotBeStored(t *testing.T) {
 	require.ErrorContains(t, err, "store bundle")
 	skill, getErr := fx.skillRepo.GetSkill(context.Background(), 7, "cfg-1", "sk-1")
 	require.NoError(t, getErr)
-	require.Equal(t, types.SkillStatusFailed, skill.Status,
-		"a skill whose archive never landed must not sit at installing")
+	require.Equal(t, types.SkillStatusInstalling, skill.Status,
+		"storage failure must not claim or rewrite the pre-existing row")
 	require.NotContains(t, fx.events, "create-session")
+}
+
+func TestSaveBundlePathIsQualifiedByOwningSHA(t *testing.T) {
+	fx := newInstallFixture(t)
+	first := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
+	second := zipBundle(t, map[string]string{
+		"SKILL.md": validSkillMD, "scripts/new.py": "print('new')\n",
+	})
+
+	_, err := fx.svc.saveBundle(context.Background(), 7, "sk-1", first)
+	require.NoError(t, err)
+	_, err = fx.svc.saveBundle(context.Background(), 7, "sk-1", second)
+	require.NoError(t, err)
+
+	require.Len(t, fx.savedBundlePaths, 2)
+	require.NotEqual(t, fx.savedBundlePaths[0], fx.savedBundlePaths[1])
+	require.Contains(t, fx.savedBundlePaths[0], skillArchiveSHA256(first))
+	require.Contains(t, fx.savedBundlePaths[1], skillArchiveSHA256(second))
 }
 
 func TestInstallSkillSkipsWhenReadyWithTheSameArchive(t *testing.T) {
@@ -657,7 +675,7 @@ func TestTakingARowForInstallDropsThePreviousRunsTranscript(t *testing.T) {
 		InstallSessionID: "sess-old", InstallMessageID: "msg-old",
 	}
 
-	takeSkillRowForInstall(row, &SkillBundle{Name: "pdf-tools", Version: "2.0.0"}, time.Now())
+	takeSkillRowForInstall(row, &SkillBundle{Name: "pdf-tools", Version: "2.0.0"}, time.Now(), "file://new.zip")
 
 	require.Equal(t, types.SkillStatusInstalling, row.Status)
 	require.Empty(t, row.InstallSessionID, "the retry has no transcript of its own yet")
@@ -1644,12 +1662,14 @@ type installFixture struct {
 	engineModel     chat.Chat
 	// saveErr fails bundle storage so InstallSkill cannot accept a skill
 	// whose archive will later be unreadable.
-	saveErr      error
-	savedBundles int
+	saveErr          error
+	savedBundles     int
+	savedBundlePaths []string
 	// storedBundles is what GetFile serves back, keyed by the SaveBytes
 	// reference, so ListSkillFiles / ReadSkillFile can open a stored archive.
-	storedBundles map[string][]byte
-	getFileCalls  atomic.Int32
+	storedBundles         map[string][]byte
+	getFileCalls          atomic.Int32
+	returnNamedBundleRefs bool
 }
 
 func newInstallFixture(t *testing.T) *installFixture {
@@ -1876,10 +1896,19 @@ func (r *installConfigRepo) Update(ctx context.Context, e *types.TenantSandboxCo
 }
 
 func (r *installConfigRepo) SoftDelete(context.Context, uint64, string) error { return nil }
+
+func (r *installConfigRepo) SoftDeleteCordoned(context.Context, uint64, string, time.Time) error {
+	return nil
+}
+
 func (r *installConfigRepo) SetCordon(context.Context, uint64, string, time.Time) error {
 	return nil
 }
+
 func (r *installConfigRepo) ClearCordon(context.Context, uint64, string) error { return nil }
+func (r *installConfigRepo) ClearCordonIfMatch(context.Context, uint64, string, time.Time) error {
+	return nil
+}
 
 type installSkillRepo struct {
 	mu        sync.Mutex
@@ -2339,6 +2368,20 @@ func (r *installSkillRepo) UpdateCatalog(_ context.Context, e *types.TenantSkill
 	cp := *e
 	r.catalogs[e.ID] = &cp
 	return nil
+}
+
+func (r *installSkillRepo) SetCatalogBundleIfEmpty(
+	_ context.Context, tenantID uint64, catalogID, bundleRef, bundleSHA256 string,
+) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	row := r.catalogs[catalogID]
+	if row == nil || row.TenantID != tenantID || strings.TrimSpace(row.BundleRef) != "" {
+		return false, nil
+	}
+	row.BundleRef = bundleRef
+	row.BundleSHA256 = bundleSHA256
+	return true, nil
 }
 
 func (r *installSkillRepo) DeleteCatalog(_ context.Context, _ uint64, catalogID string) error {
@@ -2950,9 +2993,11 @@ func (installFileService) SaveFile(context.Context, *multipart.FileHeader, uint6
 	return "", nil
 }
 
-func (s installFileService) SaveBytes(_ context.Context, data []byte, _ uint64, _ string, _ bool) (string, error) {
+func (s installFileService) SaveBytes(_ context.Context, data []byte, _ uint64, name string, _ bool) (string, error) {
+	ref := "file://bundle.zip"
 	if s.fx != nil {
 		s.fx.savedBundles++
+		s.fx.savedBundlePaths = append(s.fx.savedBundlePaths, name)
 		if s.fx.saveErr != nil {
 			return "", s.fx.saveErr
 		}
@@ -2961,9 +3006,12 @@ func (s installFileService) SaveBytes(_ context.Context, data []byte, _ uint64, 
 		}
 		copied := make([]byte, len(data))
 		copy(copied, data)
-		s.fx.storedBundles["file://bundle.zip"] = copied
+		if s.fx.returnNamedBundleRefs {
+			ref = "file://" + name
+		}
+		s.fx.storedBundles[ref] = copied
 	}
-	return "file://bundle.zip", nil
+	return ref, nil
 }
 func (s installFileService) GetFile(_ context.Context, ref string) (io.ReadCloser, error) {
 	if s.fx != nil {

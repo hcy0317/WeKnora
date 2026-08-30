@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/google/uuid"
 )
 
 // SessionSandboxBindingVersion is the current persisted binding schema.
@@ -118,8 +120,8 @@ type SessionSandboxBindingStore interface {
 // A resolve that sees a stale binding consults it so an in-flight chat turn
 // keeps its sandbox, and only the first resolve of the next turn rebuilds.
 type sessionTurnLeaseStore interface {
-	BeginTurn(ctx context.Context, key SessionSandboxKey) error
-	EndTurn(ctx context.Context, key SessionSandboxKey) error
+	BeginTurn(ctx context.Context, key SessionSandboxKey) (token string, err error)
+	EndTurn(ctx context.Context, key SessionSandboxKey, token string) error
 	TurnState(ctx context.Context, key SessionSandboxKey) (active, rebuildOnce bool, err error)
 	ConsumeTurnRebuild(ctx context.Context, key SessionSandboxKey) error
 }
@@ -259,7 +261,7 @@ type memoryLifecycleLock struct {
 }
 
 type memoryTurnLease struct {
-	refs        int
+	tokens      map[string]struct{}
 	rebuildOnce bool
 }
 
@@ -472,25 +474,26 @@ func validateBindingMatch(
 func (s *MemorySessionSandboxBindingStore) BeginTurn(
 	ctx context.Context,
 	key SessionSandboxKey,
-) error {
+) (string, error) {
 	if err := key.Validate(); err != nil {
-		return err
+		return "", err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return "", err
 	}
+	token := uuid.NewString()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	lease := s.turns[key]
 	if lease == nil {
-		lease = &memoryTurnLease{}
+		lease = &memoryTurnLease{tokens: make(map[string]struct{})}
 		s.turns[key] = lease
 	}
-	if lease.refs == 0 {
+	if len(lease.tokens) == 0 {
 		lease.rebuildOnce = true
 	}
-	lease.refs++
-	return nil
+	lease.tokens[token] = struct{}{}
+	return token, nil
 }
 
 // EndTurn releases one chat-turn lease. The last release drops the lease so
@@ -498,6 +501,7 @@ func (s *MemorySessionSandboxBindingStore) BeginTurn(
 func (s *MemorySessionSandboxBindingStore) EndTurn(
 	_ context.Context,
 	key SessionSandboxKey,
+	token string,
 ) error {
 	if err := key.Validate(); err != nil {
 		return err
@@ -508,8 +512,8 @@ func (s *MemorySessionSandboxBindingStore) EndTurn(
 	if lease == nil {
 		return nil
 	}
-	lease.refs--
-	if lease.refs <= 0 {
+	delete(lease.tokens, token)
+	if len(lease.tokens) == 0 {
 		delete(s.turns, key)
 	}
 	return nil
@@ -530,7 +534,7 @@ func (s *MemorySessionSandboxBindingStore) TurnState(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	lease := s.turns[key]
-	if lease == nil || lease.refs <= 0 {
+	if lease == nil || len(lease.tokens) == 0 {
 		return false, false, nil
 	}
 	return true, lease.rebuildOnce, nil

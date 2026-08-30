@@ -215,7 +215,7 @@ func TestSQLiteLegacyLocalVersion6ReplaysUpstreamMemory(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	require.Equal(t, uint(17), version)
+	require.Equal(t, uint(expectedSQLiteMigrationVersion), version)
 	require.False(t, dirty)
 
 	for _, table := range []string{
@@ -296,7 +296,7 @@ func TestSQLiteLegacyLocalVersion9ReplaysUpstreamMigrations(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow("SELECT version, dirty FROM schema_migrations").Scan(&version, &dirty))
-	require.Equal(t, uint(17), version)
+	require.Equal(t, uint(expectedSQLiteMigrationVersion), version)
 	require.False(t, dirty)
 
 	for _, table := range []string{

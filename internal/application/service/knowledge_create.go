@@ -17,6 +17,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
@@ -1072,6 +1073,7 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 	if !existing.IsManual() {
 		return nil, werrors.NewBadRequestError("仅支持手工知识的在线编辑")
 	}
+	previousContent := manualKnowledgeContent(existing)
 
 	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, existing.KnowledgeBaseID)
 	if err != nil {
@@ -1115,7 +1117,10 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 			logger.Errorf(ctx, "Failed to persist manual draft: %v", err)
 			return nil, err
 		}
-		s.bindContentResources(ctx, tenantID, existing.ID, cleanContent)
+		s.syncContentResources(
+			ctx, tenantID, existing.ID, previousContent, cleanContent,
+			s.resolveFileService(ctx, kb),
+		)
 		recordKBActivity(ctx, s.audit, tenantID, existing.KnowledgeBaseID, types.AuditActionKnowledgeUpdated,
 			"knowledge", existing.ID, types.AuditOutcomeSuccess, map[string]any{
 				"title": existing.Title, "status": status,
@@ -1209,7 +1214,6 @@ func (s *knowledgeService) UpdateManualKnowledge(ctx context.Context,
 			manualAttempt, existing.ID)
 		return existing, nil
 	}
-
 	logger.Infof(ctx, "Manual knowledge updated, enqueuing async processing task, ID: %s", existing.ID)
 	taskID, err := s.enqueueManualProcessing(ctx, existing, cleanContent, true, manualAttempt)
 	if err != nil {
@@ -1357,6 +1361,69 @@ func (s *knowledgeService) bindContentResources(
 			logger.Warnf(ctx, "Failed to bind resource %s to knowledge %s: %v", ref, knowledgeID, err)
 		}
 	}
+}
+
+func manualKnowledgeContent(knowledge *types.Knowledge) string {
+	if knowledge == nil || !knowledge.IsManual() {
+		return ""
+	}
+	meta, err := knowledge.ManualMetadata()
+	if err != nil || meta == nil {
+		return ""
+	}
+	return meta.Content
+}
+
+// syncContentResources makes a manual document's bindings match its stored
+// body. New claims are established first; removed claims are then released and
+// their bytes are collected only when no other owner remains.
+func (s *knowledgeService) syncContentResources(
+	ctx context.Context,
+	tenantID uint64,
+	knowledgeID, previousContent, nextContent string,
+	fileSvc interfaces.FileService,
+) {
+	if s.resourceCatalog == nil || knowledgeID == "" {
+		return
+	}
+	s.bindContentResources(ctx, tenantID, knowledgeID, nextContent)
+	next := make(map[string]struct{})
+	for _, ref := range types.ScanResourceReferences(nextContent) {
+		next[ref] = struct{}{}
+	}
+	for _, ref := range types.ScanResourceReferences(previousContent) {
+		if _, kept := next[ref]; kept {
+			continue
+		}
+		remaining, claim, err := s.resourceCatalog.Release(
+			ctx, ref, types.ResourceOwnerKnowledge, knowledgeID,
+		)
+		if err != nil {
+			logger.Warnf(ctx, "Failed to release removed resource %s from knowledge %s: %v", ref, knowledgeID, err)
+			continue
+		}
+		if remaining <= 0 && fileSvc != nil {
+			deleteCtx := ctx
+			if !claim.IsZero() {
+				deleteCtx = interfaces.WithResourceDeletionClaim(ctx, ref, claim)
+			}
+			if err := fileSvc.DeleteFile(deleteCtx, ref); err != nil {
+				logger.Warnf(ctx, "Failed to delete unbound resource %s from knowledge %s: %v", ref, knowledgeID, err)
+			}
+		}
+	}
+}
+
+func (s *knowledgeService) releaseManualContentResources(
+	ctx context.Context, knowledge *types.Knowledge, fileSvc interfaces.FileService,
+) {
+	if knowledge == nil || s.resourceCatalog == nil {
+		return
+	}
+	s.syncContentResources(
+		ctx, knowledge.TenantID, knowledge.ID,
+		manualKnowledgeContent(knowledge), "", fileSvc,
+	)
 }
 
 func (s *knowledgeService) triggerManualProcessing(ctx context.Context,

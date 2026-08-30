@@ -946,7 +946,8 @@ func TestResolveRecreatesSandboxAfterImageChange(t *testing.T) {
 func TestResolveKeepsStaleSandboxDuringAnOpenTurn(t *testing.T) {
 	ctx := context.Background()
 	fx := newLifecycleFixture(t)
-	require.NoError(t, fx.bindings.BeginTurn(ctx, fx.key))
+	_, err := fx.bindings.BeginTurn(ctx, fx.key)
+	require.NoError(t, err)
 	first, err := fx.lifecycle.Resolve(ctx, fx.key)
 	require.NoError(t, err)
 
@@ -964,7 +965,8 @@ func TestResolveKeepsStaleSandboxDuringAnOpenTurn(t *testing.T) {
 func TestResolveRebuildsStaleSandboxOnFirstUseOfNextTurn(t *testing.T) {
 	ctx := context.Background()
 	fx := newLifecycleFixture(t)
-	require.NoError(t, fx.bindings.BeginTurn(ctx, fx.key))
+	firstToken, err := fx.bindings.BeginTurn(ctx, fx.key)
+	require.NoError(t, err)
 	first, err := fx.lifecycle.Resolve(ctx, fx.key)
 	require.NoError(t, err)
 
@@ -972,8 +974,9 @@ func TestResolveRebuildsStaleSandboxOnFirstUseOfNextTurn(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 
-	require.NoError(t, fx.bindings.EndTurn(ctx, fx.key))
-	require.NoError(t, fx.bindings.BeginTurn(ctx, fx.key))
+	require.NoError(t, fx.bindings.EndTurn(ctx, fx.key, firstToken))
+	_, err = fx.bindings.BeginTurn(ctx, fx.key)
+	require.NoError(t, err)
 
 	second, err := fx.lifecycle.Resolve(ctx, fx.key)
 	require.NoError(t, err)

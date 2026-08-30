@@ -31,15 +31,16 @@ CREATE INDEX IF NOT EXISTS idx_tenant_skills_catalog
 
 -- One catalog row per (tenant, name). Names are the workspace identity, so
 -- same-name installs on different sandboxes collapse here. Prefer a row that
--- still has a stored archive, then the most recently updated one, so the
--- definition matches what operators last wrote rather than the first upload.
+-- still has a stored archive for metadata/digest selection, but do not copy
+-- its bundle_ref: the catalog must acquire its own object before an install
+-- may delete the last installation-owned archive.
 INSERT INTO tenant_skill_catalog (
     id, tenant_id, name, version, description, instructions,
     bundle_ref, bundle_sha256, created_at, updated_at
 )
 SELECT DISTINCT ON (tenant_id, name)
     id, tenant_id, name, version, description, instructions,
-    bundle_ref, bundle_sha256, created_at, updated_at
+    NULL, bundle_sha256, created_at, updated_at
 FROM tenant_skills
 WHERE deleted_at IS NULL
 ORDER BY tenant_id, name,

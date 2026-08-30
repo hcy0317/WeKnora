@@ -119,6 +119,5 @@ type SessionInstallCapabilityProvider interface {
 // resolve of the turn may rebuild, later resolves of the same turn keep the
 // sandbox so /workspace scratch and in-flight execs survive an admin install.
 type SessionTurnHolder interface {
-	BeginSessionTurn(ctx context.Context, sessionID string) error
-	EndSessionTurn(ctx context.Context, sessionID string) error
+	HoldSessionTurn(ctx context.Context, sessionID string) (release func() error, err error)
 }

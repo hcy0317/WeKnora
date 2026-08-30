@@ -135,6 +135,23 @@ func (s *resourceCatalog) ResolvePath(ctx context.Context, value string) (string
 	return resource.PhysicalPath, resource, nil
 }
 
+func (s *resourceCatalog) ResolvePathForDeletion(
+	ctx context.Context, value string,
+) (string, *types.StoredResource, error) {
+	handle, ok := types.ParseResourcePath(value)
+	if !ok {
+		return value, nil, nil
+	}
+	resource, err := s.repo.GetByHandleIncludingDeleted(ctx, handle)
+	if err != nil {
+		return "", nil, err
+	}
+	if resource == nil {
+		return "", nil, fmt.Errorf("resource not found")
+	}
+	return resource.PhysicalPath, resource, nil
+}
+
 func (s *resourceCatalog) Bind(ctx context.Context, reference, ownerType, ownerID, relation string) error {
 	resource, err := s.Resolve(ctx, reference)
 	if err != nil {
@@ -146,48 +163,118 @@ func (s *resourceCatalog) Bind(ctx context.Context, reference, ownerType, ownerI
 	if relation == "" {
 		relation = "attachment"
 	}
-	return s.repo.CreateBinding(ctx, &types.ResourceBinding{
+	created, err := s.repo.CreateBindingIfActive(ctx, &types.ResourceBinding{
 		ResourceID: resource.ID,
 		TenantID:   resource.TenantID,
 		OwnerType:  ownerType,
 		OwnerID:    ownerID,
 		Relation:   relation,
 	})
+	if err != nil {
+		return err
+	}
+	if !created {
+		active, lookupErr := s.repo.GetByID(ctx, resource.ID)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if active == nil {
+			return fmt.Errorf("resource is being deleted")
+		}
+	}
+	return nil
 }
 
 // Release implements interfaces.ResourceCatalog.
 //
-// Unbinding and counting are deliberately not a single transaction. A racing
-// bind that lands between them makes the count too high, which keeps a live
-// file — the safe direction. The opposite ordering could delete bytes another
-// owner had just claimed.
+// Unbinding, counting and the zero-reference tombstone are one repository
+// transaction. Bind locks the same resource row before accepting a claim, so
+// a binder and a collector cannot both win across processes.
 func (s *resourceCatalog) Release(
 	ctx context.Context, reference, ownerType, ownerID string,
-) (int64, error) {
+) (int64, time.Time, error) {
 	if strings.TrimSpace(ownerType) == "" || strings.TrimSpace(ownerID) == "" {
-		return -1, fmt.Errorf("resource release requires owner type and id")
+		return -1, time.Time{}, fmt.Errorf("resource release requires owner type and id")
 	}
 	if _, ok := types.ParseResourcePath(reference); !ok {
 		// A raw provider path predates the catalog and has no bindings to
 		// account for; the caller keeps its previous delete behaviour.
-		return -1, nil
+		return -1, time.Time{}, nil
 	}
 	resource, err := s.Resolve(ctx, reference)
 	if err != nil {
-		return -1, err
+		return -1, time.Time{}, err
 	}
-	if err := s.repo.DeleteBinding(ctx, resource.ID, ownerType, ownerID); err != nil {
-		return -1, err
-	}
-	return s.repo.CountBindings(ctx, resource.ID)
+	remaining, claim, err := s.repo.ReleaseBindingAndMarkIfUnbound(
+		ctx, resource.ID, ownerType, ownerID,
+	)
+	return remaining, claim, err
 }
 
-func (s *resourceCatalog) MarkDeleted(ctx context.Context, reference string) error {
-	resource, err := s.Resolve(ctx, reference)
+func (s *resourceCatalog) resourceIncludingDeleted(
+	ctx context.Context, reference string,
+) (*types.StoredResource, error) {
+	handle, ok := types.ParseResourcePath(reference)
+	if !ok {
+		return nil, fmt.Errorf("invalid resource reference")
+	}
+	resource, err := s.repo.GetByHandleIncludingDeleted(ctx, handle)
+	if err != nil {
+		return nil, err
+	}
+	if resource == nil {
+		return nil, fmt.Errorf("resource not found")
+	}
+	return resource, nil
+}
+
+func (s *resourceCatalog) RestoreActive(
+	ctx context.Context, reference string, claim time.Time,
+) error {
+	resource, err := s.resourceIncludingDeleted(ctx, reference)
 	if err != nil {
 		return err
 	}
-	return s.repo.MarkDeleted(ctx, resource.ID)
+	restored, err := s.repo.RestoreActiveIfClaim(ctx, resource.ID, claim)
+	if err != nil {
+		return err
+	}
+	if !restored {
+		return fmt.Errorf("resource deletion claim is stale")
+	}
+	return nil
+}
+
+func (s *resourceCatalog) MarkDeleted(ctx context.Context, reference string) (time.Time, error) {
+	resource, err := s.resourceIncludingDeleted(ctx, reference)
+	if err != nil {
+		return time.Time{}, err
+	}
+	claim, err := s.repo.MarkDeletedIfUnbound(ctx, resource.ID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if claim.IsZero() {
+		return time.Time{}, fmt.Errorf("resource is still bound or is no longer active")
+	}
+	return claim, nil
+}
+
+func (s *resourceCatalog) ValidateDeletionClaim(
+	ctx context.Context, reference string, claim time.Time,
+) error {
+	resource, err := s.resourceIncludingDeleted(ctx, reference)
+	if err != nil {
+		return err
+	}
+	valid, err := s.repo.ValidateDeletionClaim(ctx, resource.ID, claim)
+	if err != nil {
+		return err
+	}
+	if !valid {
+		return fmt.Errorf("resource deletion claim is stale")
+	}
+	return nil
 }
 
 func (s *resourceCatalog) CreateAccessGrant(ctx context.Context, reference string, ttl time.Duration) (string, error) {

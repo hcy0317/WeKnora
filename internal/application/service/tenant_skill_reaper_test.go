@@ -108,6 +108,31 @@ func TestReapStuckRunsDeletesAbandonedRemovalAfterPointerMoved(t *testing.T) {
 		"the pointer already left this skill behind; restoring ready would offer files the image no longer has")
 }
 
+func TestReapStuckRunsPreservesSharedBundleWhenCatalogBackfillUnavailable(t *testing.T) {
+	fx := newReaperFixture(t)
+	staleSince := fx.now.Add(-skillInstallStuckTTL - time.Minute)
+	fx.skills.catalogs = map[string]*types.TenantSkillCatalogEntity{
+		"cat-1": {ID: "cat-1", TenantID: 7, Name: "pdf", BundleSHA256: strings.Repeat("a", 64)},
+	}
+	fx.skills.put(&types.TenantSkillEntity{
+		ID: "sk-1", TenantID: 7, SandboxConfigID: "cfg-1", CatalogID: "cat-1",
+		Name: "pdf", Status: types.SkillStatusRemoving,
+		InstalledSnapshotID: "snap-old", BundleRef: "bundle-shared",
+		BundleSHA256: strings.Repeat("a", 64), InstallingSince: &staleSince,
+	})
+	fx.installed("sk-1", "snap-old", "")
+	fx.removed("sk-1", "snap-new", "snap-old")
+	fx.live("snap-new")
+
+	n, err := fx.svc.ReapStuckRuns(context.Background())
+
+	require.NoError(t, err)
+	require.Zero(t, n)
+	require.NotNil(t, fx.skills.rows["sk-1"])
+	require.Equal(t, "bundle-shared", fx.skills.rows["sk-1"].BundleRef,
+		"reaper must retain the shared object until catalog backfill succeeds")
+}
+
 func TestReapStuckRunsDeletesAbandonedRemovalThatNeverReachedAnImage(t *testing.T) {
 	fx := newReaperFixture(t)
 	staleSince := fx.now.Add(-skillInstallStuckTTL - time.Minute)
@@ -740,6 +765,7 @@ var (
 type reaperSkillStore struct {
 	rows      map[string]*types.TenantSkillEntity
 	snapshots []*types.TenantSkillSnapshotEntity
+	catalogs  map[string]*types.TenantSkillCatalogEntity
 }
 
 func (r *reaperSkillStore) put(e *types.TenantSkillEntity) {
@@ -909,21 +935,40 @@ func (r *reaperSkillStore) DeleteUserEnvVarsByConfig(context.Context, uint64, st
 func (r *reaperSkillStore) CreateCatalog(context.Context, *types.TenantSkillCatalogEntity) error {
 	panic("CreateCatalog is outside the reaper surface")
 }
-func (r *reaperSkillStore) GetCatalog(context.Context, uint64, string) (*types.TenantSkillCatalogEntity, error) {
-	panic("GetCatalog is outside the reaper surface")
+
+func (r *reaperSkillStore) GetCatalog(
+	_ context.Context, tenantID uint64, id string,
+) (*types.TenantSkillCatalogEntity, error) {
+	row := r.catalogs[id]
+	if row == nil || row.TenantID != tenantID {
+		return nil, nil
+	}
+	cp := *row
+	return &cp, nil
 }
+
 func (r *reaperSkillStore) GetCatalogByName(context.Context, uint64, string) (*types.TenantSkillCatalogEntity, error) {
 	panic("GetCatalogByName is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) ListCatalogsByTenant(context.Context, uint64) ([]*types.TenantSkillCatalogEntity, error) {
 	panic("ListCatalogsByTenant is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) UpdateCatalog(context.Context, *types.TenantSkillCatalogEntity) error {
 	panic("UpdateCatalog is outside the reaper surface")
 }
+
+func (r *reaperSkillStore) SetCatalogBundleIfEmpty(
+	context.Context, uint64, string, string, string,
+) (bool, error) {
+	panic("SetCatalogBundleIfEmpty is outside the reaper surface")
+}
+
 func (r *reaperSkillStore) DeleteCatalog(context.Context, uint64, string) error {
 	panic("DeleteCatalog is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) ListSkillsByCatalog(context.Context, uint64, string) ([]*types.TenantSkillEntity, error) {
 	panic("ListSkillsByCatalog is outside the reaper surface")
 }
@@ -966,12 +1011,20 @@ func (r *reaperConfigStore) SoftDelete(context.Context, uint64, string) error {
 	panic("SoftDelete is outside the reaper surface")
 }
 
+func (r *reaperConfigStore) SoftDeleteCordoned(context.Context, uint64, string, time.Time) error {
+	panic("SoftDeleteCordoned is outside the reaper surface")
+}
+
 func (r *reaperConfigStore) SetCordon(context.Context, uint64, string, time.Time) error {
 	panic("SetCordon is outside the reaper surface")
 }
 
 func (r *reaperConfigStore) ClearCordon(context.Context, uint64, string) error {
 	panic("ClearCordon is outside the reaper surface")
+}
+
+func (r *reaperConfigStore) ClearCordonIfMatch(context.Context, uint64, string, time.Time) error {
+	panic("ClearCordonIfMatch is outside the reaper surface")
 }
 
 type reaperSandboxResolver struct {

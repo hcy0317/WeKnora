@@ -115,11 +115,49 @@ func fetchSkillArchive(ctx context.Context, source string, client *http.Client) 
 		return nil, err
 	}
 	httpClient := skillSourceHTTPClient(client)
-	fetched, err := fetchSkillSourceBytes(ctx, httpClient, parsed, 0)
-	if err != nil {
-		return nil, err
+	var lastErr error
+	for _, candidate := range gitSourceCandidates(parsed) {
+		fetched, fetchErr := fetchSkillSourceBytes(ctx, httpClient, candidate, 0)
+		if fetchErr != nil {
+			lastErr = fetchErr
+			continue
+		}
+		archive, normalizeErr := normalizeFetchedSkillArchive(
+			fetched.body, fetched.contentType, fetched.subdir,
+		)
+		if normalizeErr == nil {
+			return archive, nil
+		}
+		lastErr = normalizeErr
 	}
-	return normalizeFetchedSkillArchive(fetched.body, fetched.contentType, fetched.subdir)
+	return nil, lastErr
+}
+
+// gitSourceCandidates resolves the intrinsic ambiguity of /tree/<ref>/<path>
+// URLs. Branch and tag names may contain slashes, so it tries every split from
+// the longest ref to the shortest and accepts the first archive that contains
+// the requested skill root. This is deterministic and never guesses a shorter
+// ref while a longer one is actually resolvable.
+func gitSourceCandidates(src parsedSkillSource) []parsedSkillSource {
+	if (src.Kind != skillSourceGitHub && src.Kind != skillSourceGitLab) ||
+		strings.TrimSpace(src.Subdir) == "" || strings.EqualFold(src.Ref, "HEAD") {
+		return []parsedSkillSource{src}
+	}
+	parts := append([]string{src.Ref}, splitPath(src.Subdir)...)
+	out := make([]parsedSkillSource, 0, len(parts))
+	for split := len(parts); split >= 1; split-- {
+		candidate := src
+		candidate.Ref = strings.Join(parts[:split], "/")
+		candidate.Subdir = strings.Join(parts[split:], "/")
+		if strings.EqualFold(path.Base(candidate.Subdir), "SKILL.md") {
+			candidate.Subdir = path.Dir(candidate.Subdir)
+			if candidate.Subdir == "." {
+				candidate.Subdir = ""
+			}
+		}
+		out = append(out, candidate)
+	}
+	return out
 }
 
 // parseSkillSource maps one paste onto exactly one kind. It does not probe
