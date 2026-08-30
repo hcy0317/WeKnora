@@ -578,6 +578,25 @@ func TestInstallSkillRefusesWhenBundleCannotBeStored(t *testing.T) {
 	require.NotContains(t, fx.events, "create-session")
 }
 
+func TestInstallSkillAcceptsStorageReturningUniqueRefPerSave(t *testing.T) {
+	fx := newInstallFixture(t)
+	fx.returnUniqueBundleRefs = true
+	archive := zipBundle(t, map[string]string{
+		"SKILL.md": validSkillMD, "scripts/unique.py": "print('unique')\n",
+	})
+
+	_, err := fx.svc.InstallSkill(context.Background(), 7, "cfg-1", archive)
+	require.NoError(t, err)
+	require.Equal(t, 2, fx.savedBundles,
+		"catalog and installation must each save once; neither may probe by saving twice")
+	skill, err := fx.skillRepo.GetSkill(context.Background(), 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	require.Contains(t, skill.BundleRef, "opaque-save-2")
+	catalog, err := fx.skillRepo.GetCatalog(context.Background(), 7, skill.CatalogID)
+	require.NoError(t, err)
+	require.Contains(t, catalog.BundleRef, "opaque-save-1")
+}
+
 func TestInstallSkillUpgradeDeletesSupersededUnreferencedArchive(t *testing.T) {
 	fx := newInstallFixture(t)
 	fx.returnNamedBundleRefs = true
@@ -636,88 +655,21 @@ func TestInstallSkillUpgradeFailureDeletesOnlyNewUnreferencedArchive(t *testing.
 		"SKILL.md": validSkillMD, "scripts/new.py": "print('upgrade')\n",
 	})
 	newSHA := skillArchiveSHA256(archive)
-	newRef := "file://tenant-skills/sk-1/" + newSHA + ".zip"
 	fx.skillRepo.updateFailsWhen = func(row *types.TenantSkillEntity) bool {
 		return row.ID == "sk-1" && row.BundleSHA256 == newSHA
 	}
 
 	_, err = fx.svc.InstallSkill(ctx, 7, "cfg-1", archive)
 	require.ErrorIs(t, err, errUpdateBoom)
-	require.Contains(t, fx.deletedBundles, newRef)
+	require.Len(t, fx.deletedBundles, 1)
+	require.Contains(t, fx.deletedBundles[0], "tenant-skills/sk-1/"+newSHA+"/")
 	require.NotContains(t, fx.deletedBundles, oldRef)
 	stored, getErr := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
 	require.NoError(t, getErr)
 	require.Equal(t, oldRef, stored.BundleRef)
 }
 
-func TestInstallSkillOldBundleDeletionFencesConcurrentReassignment(t *testing.T) {
-	fx := newInstallFixture(t)
-	fx.returnNamedBundleRefs = true
-	ctx := context.Background()
-	oldArchive := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
-	oldSHA := skillArchiveSHA256(oldArchive)
-	oldRef := "file://tenant-skills/sk-1/" + oldSHA + ".zip"
-	fx.storedBundles = map[string][]byte{oldRef: oldArchive}
-	skill, err := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
-	require.NoError(t, err)
-	skill.BundleRef = oldRef
-	skill.BundleSHA256 = oldSHA
-	require.NoError(t, fx.skillRepo.UpdateSkill(ctx, skill))
-
-	deleteClaimed := make(chan struct{})
-	releaseDelete := make(chan struct{})
-	oldWriteClaimed := make(chan struct{}, 1)
-	var deleteOnce sync.Once
-	fx.skillRepo.onBundleDeleteClaim = func(ref string) {
-		if ref == oldRef {
-			deleteOnce.Do(func() { close(deleteClaimed) })
-			<-releaseDelete
-		}
-	}
-	fx.skillRepo.onBundleWriteClaim = func(ref string) {
-		if ref == oldRef {
-			oldWriteClaimed <- struct{}{}
-		}
-	}
-	upgrade := zipBundle(t, map[string]string{
-		"SKILL.md": validSkillMD, "scripts/v2.py": "print('v2')\n",
-	})
-	type installResult struct {
-		id  string
-		err error
-	}
-	aDone := make(chan installResult, 1)
-	go func() {
-		id, installErr := fx.svc.InstallSkill(ctx, 7, "cfg-1", upgrade)
-		aDone <- installResult{id: id, err: installErr}
-	}()
-	<-deleteClaimed
-	bDone := make(chan installResult, 1)
-	go func() {
-		id, installErr := fx.svc.InstallSkill(ctx, 7, "cfg-1", oldArchive)
-		bDone <- installResult{id: id, err: installErr}
-	}()
-	select {
-	case <-oldWriteClaimed:
-		t.Fatal("old ref was reassigned while its deletion claim was active")
-	case <-time.After(100 * time.Millisecond):
-	}
-	close(releaseDelete)
-	require.NoError(t, (<-aDone).err)
-	require.NoError(t, (<-bDone).err)
-	select {
-	case <-oldWriteClaimed:
-	case <-time.After(time.Second):
-		t.Fatal("reassignment did not resume after deletion completed")
-	}
-	require.Equal(t, oldArchive, fx.storedBundles[oldRef],
-		"the reassignment must re-save bytes after the prior deletion")
-	stored, err := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
-	require.NoError(t, err)
-	require.Equal(t, oldRef, stored.BundleRef)
-}
-
-func TestInstallSkillFailedNewBundleCleanupFencesConcurrentClaim(t *testing.T) {
+func TestInstallSkillFailedCleanupCannotDeleteConcurrentUniqueUpload(t *testing.T) {
 	fx := newInstallFixture(t)
 	fx.returnNamedBundleRefs = true
 	ctx := context.Background()
@@ -725,24 +677,23 @@ func TestInstallSkillFailedNewBundleCleanupFencesConcurrentClaim(t *testing.T) {
 		"SKILL.md": validSkillMD, "scripts/v2.py": "print('v2')\n",
 	})
 	sha := skillArchiveSHA256(archive)
-	ref := "file://tenant-skills/sk-1/" + sha + ".zip"
 	var failed atomic.Bool
 	fx.skillRepo.updateFailsWhen = func(row *types.TenantSkillEntity) bool {
 		return row.BundleSHA256 == sha && failed.CompareAndSwap(false, true)
 	}
-	deleteClaimed := make(chan struct{})
+	deleteClaimed := make(chan string, 1)
 	releaseDelete := make(chan struct{})
-	writeClaimed := make(chan struct{}, 1)
+	writeClaimed := make(chan string, 1)
 	var deleteOnce sync.Once
 	fx.skillRepo.onBundleDeleteClaim = func(got string) {
-		if got == ref {
-			deleteOnce.Do(func() { close(deleteClaimed) })
+		if strings.Contains(got, "tenant-skills/sk-1/") {
+			deleteOnce.Do(func() { deleteClaimed <- got })
 			<-releaseDelete
 		}
 	}
 	fx.skillRepo.onBundleWriteClaim = func(got string) {
-		if got == ref && failed.Load() {
-			writeClaimed <- struct{}{}
+		if strings.Contains(got, "tenant-skills/sk-1/") && failed.Load() {
+			writeClaimed <- got
 		}
 	}
 	aDone := make(chan error, 1)
@@ -750,27 +701,27 @@ func TestInstallSkillFailedNewBundleCleanupFencesConcurrentClaim(t *testing.T) {
 		_, installErr := fx.svc.InstallSkill(ctx, 7, "cfg-1", archive)
 		aDone <- installErr
 	}()
-	<-deleteClaimed
+	failedRef := <-deleteClaimed
 	bDone := make(chan error, 1)
 	go func() {
 		_, installErr := fx.svc.InstallSkill(ctx, 7, "cfg-1", archive)
 		bDone <- installErr
 	}()
 	select {
-	case <-writeClaimed:
-		t.Fatal("new ref was claimed while failed-write cleanup was deleting it")
-	case <-time.After(100 * time.Millisecond):
+	case concurrentRef := <-writeClaimed:
+		require.NotEqual(t, failedRef, concurrentRef,
+			"the claim token in the object path must make equal-byte uploads unique")
+		require.Contains(t, concurrentRef, "/"+sha+"/")
+	case <-time.After(time.Second):
+		t.Fatal("concurrent unique upload was incorrectly blocked by another ref's deletion")
 	}
 	close(releaseDelete)
 	require.ErrorIs(t, <-aDone, errUpdateBoom)
 	require.NoError(t, <-bDone)
-	select {
-	case <-writeClaimed:
-	case <-time.After(time.Second):
-		t.Fatal("concurrent claimant did not resume after cleanup completed")
-	}
-	require.Equal(t, archive, fx.storedBundles[ref],
-		"the winner must re-save the archive after failed-run cleanup")
+	stored, err := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	require.NotEqual(t, failedRef, stored.BundleRef)
+	require.Equal(t, archive, fx.storedBundles[stored.BundleRef])
 }
 
 func TestSaveBundlePathIsQualifiedByOwningSHA(t *testing.T) {
@@ -780,15 +731,17 @@ func TestSaveBundlePathIsQualifiedByOwningSHA(t *testing.T) {
 		"SKILL.md": validSkillMD, "scripts/new.py": "print('new')\n",
 	})
 
-	_, err := fx.svc.saveBundle(context.Background(), 7, "sk-1", first)
+	_, err := fx.svc.saveBundle(context.Background(), 7, "sk-1", "claim-first", first)
 	require.NoError(t, err)
-	_, err = fx.svc.saveBundle(context.Background(), 7, "sk-1", second)
+	_, err = fx.svc.saveBundle(context.Background(), 7, "sk-1", "claim-second", second)
 	require.NoError(t, err)
 
 	require.Len(t, fx.savedBundlePaths, 2)
 	require.NotEqual(t, fx.savedBundlePaths[0], fx.savedBundlePaths[1])
 	require.Contains(t, fx.savedBundlePaths[0], skillArchiveSHA256(first))
 	require.Contains(t, fx.savedBundlePaths[1], skillArchiveSHA256(second))
+	require.Contains(t, fx.savedBundlePaths[0], "claim-first")
+	require.Contains(t, fx.savedBundlePaths[1], "claim-second")
 }
 
 func TestInstallSkillSkipsWhenReadyWithTheSameArchive(t *testing.T) {
@@ -1871,9 +1824,10 @@ type installFixture struct {
 	savedBundlePaths []string
 	// storedBundles is what GetFile serves back, keyed by the SaveBytes
 	// reference, so ListSkillFiles / ReadSkillFile can open a stored archive.
-	storedBundles         map[string][]byte
-	getFileCalls          atomic.Int32
-	returnNamedBundleRefs bool
+	storedBundles          map[string][]byte
+	getFileCalls           atomic.Int32
+	returnNamedBundleRefs  bool
+	returnUniqueBundleRefs bool
 }
 
 func newInstallFixture(t *testing.T) *installFixture {
@@ -3441,6 +3395,8 @@ func (s installFileService) SaveBytes(_ context.Context, data []byte, _ uint64, 
 		copy(copied, data)
 		if s.fx.returnNamedBundleRefs {
 			ref = "file://" + name
+		} else if s.fx.returnUniqueBundleRefs {
+			ref = fmt.Sprintf("file://opaque-save-%d", s.fx.savedBundles)
 		}
 		s.fx.storedBundles[ref] = copied
 	}

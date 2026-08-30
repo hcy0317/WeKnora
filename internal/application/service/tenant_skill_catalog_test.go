@@ -265,6 +265,23 @@ func TestMigratedCatalogBackfillsBeforeLastRemovalAndCanReinstall(t *testing.T) 
 	require.NotEmpty(t, result.Installs["cfg-1"])
 }
 
+func TestCatalogBundleArchiveReturnsTemporaryStorageError(t *testing.T) {
+	fx := newInstallFixture(t)
+	ctx := context.Background()
+	archive := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
+	sha := skillArchiveSHA256(archive)
+	catalog := &types.TenantSkillCatalogEntity{
+		ID: "cat-temporary", TenantID: 7, Name: "pdf-tools",
+		BundleRef: "file://temporarily-unavailable.zip", BundleSHA256: sha,
+	}
+
+	_, err := fx.svc.catalogBundleArchive(ctx, 7, catalog)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "bundle not found")
+	require.NotContains(t, err.Error(), "no longer stored",
+		"a temporary object-store read failure must not be rewritten as permanent absence")
+}
+
 func TestInstallCatalogToConfigsReportsPartialFailure(t *testing.T) {
 	fx := newInstallFixture(t)
 	ctx := context.Background()

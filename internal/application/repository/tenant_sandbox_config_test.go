@@ -158,7 +158,7 @@ func TestSandboxConfigRepoStaleDeleteCannotRemoveRowAfterCordonTakeover(t *testi
 }
 
 func TestSandboxConfigRepoCordonFencesOrdinaryUpdateAndOwnedUpdateIsABASafe(t *testing.T) {
-	repo, _ := newSandboxConfigTestRepo(t)
+	repo, db := newSandboxConfigTestRepo(t)
 	ctx := context.Background()
 	require.NoError(t, repo.Create(ctx, &types.TenantSandboxConfigEntity{
 		ID: "cfg-a", TenantID: 1, Name: "prod", Description: "before", SandboxType: "e2b",
@@ -175,8 +175,21 @@ func TestSandboxConfigRepoCordonFencesOrdinaryUpdateAndOwnedUpdateIsABASafe(t *t
 	stored, err := repo.GetByID(ctx, 1, "cfg-a")
 	require.NoError(t, err)
 	require.Equal(t, "before", stored.Description)
+	expiredAt := time.Now().Add(-types.SandboxCordonLease - time.Second).UTC().Truncate(time.Second)
+	require.NoError(t, db.Model(&types.TenantSandboxConfigEntity{}).
+		Where("tenant_id = ? AND id = ?", 1, "cfg-a").
+		Update("cordoned_at", expiredAt).Error)
+	row.Description = "expired ordinary takeover"
+	require.NoError(t, repo.Update(ctx, row))
+	stored, err = repo.GetByID(ctx, 1, "cfg-a")
+	require.NoError(t, err)
+	require.Equal(t, "expired ordinary takeover", stored.Description)
+	require.Nil(t, stored.CordonedAt,
+		"ordinary update must atomically clear the expired delete token it takes over")
+	require.ErrorIs(t, repo.SoftDeleteCordoned(ctx, 1, "cfg-a", expiredAt),
+		ErrSandboxConfigDeleteOwnerLost)
 
-	updateAt := deleteAt.Add(types.SandboxCordonLease + time.Second)
+	updateAt := time.Now().Add(time.Second).UTC().Truncate(time.Second)
 	require.NoError(t, repo.SetCordon(ctx, 1, "cfg-a", updateAt))
 	row.Description = "stale owner must not pass"
 	require.ErrorIs(t, repo.UpdateCordoned(ctx, row, deleteAt), ErrSandboxConfigCordoned)

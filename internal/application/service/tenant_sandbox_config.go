@@ -1335,17 +1335,23 @@ func (s *TenantSandboxConfigService) deleteSkillBundleBestEffort(
 	}
 	fs, _, err := s.files.ResolveFileService(ctx, &types.Tenant{ID: tenantID}, "", "", "")
 	if err != nil || fs == nil {
-		_ = s.skills.ReleaseSkillBundleDelete(ctx, tenantID, bundleRef, token)
+		finalCtx, finalCancel := bundleClaimFinalizationContext(ctx)
+		_ = s.skills.ReleaseSkillBundleDelete(finalCtx, tenantID, bundleRef, token)
+		finalCancel()
 		logger.Warnf(ctx, "[sandbox] resolve file service to delete bundle %s failed: %v",
 			bundleRef, err)
 		return
 	}
 	if err := fs.DeleteFile(ctx, bundleRef); err != nil {
-		_ = s.skills.ReleaseSkillBundleDelete(ctx, tenantID, bundleRef, token)
+		finalCtx, finalCancel := bundleClaimFinalizationContext(ctx)
+		_ = s.skills.ReleaseSkillBundleDelete(finalCtx, tenantID, bundleRef, token)
+		finalCancel()
 		logger.Warnf(ctx, "[sandbox] delete bundle %s failed: %v", bundleRef, err)
 		return
 	}
-	if err := s.skills.CompleteSkillBundleDelete(ctx, tenantID, bundleRef, token); err != nil {
+	finalCtx, finalCancel := bundleClaimFinalizationContext(ctx)
+	defer finalCancel()
+	if err := s.skills.CompleteSkillBundleDelete(finalCtx, tenantID, bundleRef, token); err != nil {
 		logger.Warnf(ctx, "[sandbox] complete bundle %s deletion claim failed: %v", bundleRef, err)
 	}
 }

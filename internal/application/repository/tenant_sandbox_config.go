@@ -97,16 +97,19 @@ func (r *tenantSandboxConfigRepository) ListAll(
 func (r *tenantSandboxConfigRepository) Update(
 	ctx context.Context, e *types.TenantSandboxConfigEntity,
 ) error {
+	now := time.Now()
 	result := r.db.WithContext(ctx).
 		Model(&types.TenantSandboxConfigEntity{}).
-		Where("tenant_id = ? AND id = ? AND cordoned_at IS NULL", e.TenantID, e.ID).
-		Select("name", "description", "sandbox_type", "config", "updated_at").
+		Where("tenant_id = ? AND id = ?", e.TenantID, e.ID).
+		Where("cordoned_at IS NULL OR cordoned_at < ?", now.Add(-types.SandboxCordonLease)).
+		Select("name", "description", "sandbox_type", "config", "cordoned_at", "updated_at").
 		Updates(map[string]any{
 			"name":         e.Name,
 			"description":  e.Description,
 			"sandbox_type": e.SandboxType,
 			"config":       e.Config,
-			"updated_at":   time.Now(),
+			"cordoned_at":  nil,
+			"updated_at":   now,
 		})
 	if result.Error != nil {
 		return result.Error

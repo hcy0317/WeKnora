@@ -1611,6 +1611,29 @@ func TestDeleteSkillMetadataRetainsCatalogOwnedBundle(t *testing.T) {
 		"the catalog's live reference must prevent a deletion claim")
 }
 
+func TestDeleteSkillBundleFinalizesOnFreshContext(t *testing.T) {
+	fx := newSnapshotReleaseFixture(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	fx.files.afterDelete = cancel
+	fx.skills.skills = nil // the DB row was already deleted before physical cleanup
+
+	fx.svc.deleteSkillBundleBestEffort(ctx, 7, "bundle://skill-a.zip")
+	require.Error(t, ctx.Err(), "the file operation must expire the request context")
+	require.NoError(t, fx.skills.completeCtxErr,
+		"claim completion must use an independent finalization context")
+}
+
+func TestDeleteSkillBundleReleaseUsesFreshContextAfterResolveFailure(t *testing.T) {
+	fx := newSnapshotReleaseFixture(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	fx.svc.deleteSkillBundleBestEffort(ctx, 7, "bundle://skill-a.zip")
+	require.NoError(t, fx.skills.releaseCtxErr,
+		"claim release must not reuse the cancelled storage context")
+	require.Empty(t, fx.skills.bundleClaims)
+}
+
 func TestDeleteRefusesWhenSnapshotReleaseFailsWithoutForce(t *testing.T) {
 	fx := newSnapshotReleaseFixture(t, map[string]error{
 		"snap-2": stderrors.New("provider unavailable"),
@@ -1862,6 +1885,8 @@ type deleteSkillStore struct {
 	catalogBundleRefs map[string]bool
 	bundleClaims      map[string]string
 	completedClaims   []string
+	completeCtxErr    error
+	releaseCtxErr     error
 }
 
 func (s *deleteSkillStore) snapshot(id string) *types.TenantSkillSnapshotEntity {
@@ -1963,8 +1988,9 @@ func (s *deleteSkillStore) ClaimUnreferencedSkillBundleDelete(
 }
 
 func (s *deleteSkillStore) CompleteSkillBundleDelete(
-	_ context.Context, _ uint64, ref, token string,
+	ctx context.Context, _ uint64, ref, token string,
 ) error {
+	s.completeCtxErr = ctx.Err()
 	if s.bundleClaims[ref] != token {
 		return stderrors.New("claim token mismatch")
 	}
@@ -1974,8 +2000,9 @@ func (s *deleteSkillStore) CompleteSkillBundleDelete(
 }
 
 func (s *deleteSkillStore) ReleaseSkillBundleDelete(
-	_ context.Context, _ uint64, ref, token string,
+	ctx context.Context, _ uint64, ref, token string,
 ) error {
+	s.releaseCtxErr = ctx.Err()
 	if s.bundleClaims[ref] != token {
 		return stderrors.New("claim token mismatch")
 	}
@@ -2010,7 +2037,8 @@ func (s *deleteSkillStore) DeleteUserEnvVarsByConfig(
 }
 
 type deleteBundleResolver struct {
-	deleted []string
+	deleted     []string
+	afterDelete func()
 }
 
 func (r *deleteBundleResolver) ResolveFileService(
@@ -2039,6 +2067,9 @@ func (s deleteFileService) DeleteFile(ctx context.Context, ref string) error {
 		return err
 	}
 	s.r.deleted = append(s.r.deleted, ref)
+	if s.r.afterDelete != nil {
+		s.r.afterDelete()
+	}
 	return nil
 }
 

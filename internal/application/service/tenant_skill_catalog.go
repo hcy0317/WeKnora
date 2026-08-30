@@ -383,8 +383,10 @@ func (s *TenantSkillService) storeCatalogBundle(
 		logger.Warnf(ctx, "[skill] catalog bundle storage unavailable: %v", err)
 		return false, "", nil
 	}
+	token := uuid.NewString()
 	ref, err := fs.SaveBytes(ctx, archive, tenantID,
-		fmt.Sprintf("tenant-skills/catalog/%s/%s.zip", catalog.ID, skillArchiveSHA256(archive)), false)
+		fmt.Sprintf("tenant-skills/catalog/%s/%s/%s.zip",
+			catalog.ID, skillArchiveSHA256(archive), token), false)
 	if err != nil {
 		if requireStore {
 			return false, "", fmt.Errorf("store catalog bundle: %w", err)
@@ -392,22 +394,12 @@ func (s *TenantSkillService) storeCatalogBundle(
 		logger.Warnf(ctx, "[skill] catalog bundle store failed: %v", err)
 		return false, "", nil
 	}
-	token := uuid.NewString()
 	if err := s.claimSkillBundleWrite(ctx, tenantID, ref, token); err != nil {
 		if requireStore {
 			return false, "", fmt.Errorf("claim catalog bundle: %w", err)
 		}
 		logger.Warnf(ctx, "[skill] catalog bundle claim failed: %v", err)
 		return false, "", nil
-	}
-	confirmedRef, err := fs.SaveBytes(ctx, archive, tenantID,
-		fmt.Sprintf("tenant-skills/catalog/%s/%s.zip", catalog.ID, skillArchiveSHA256(archive)), false)
-	if err != nil || confirmedRef != ref {
-		s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, ref, token, true)
-		if err != nil {
-			return false, "", fmt.Errorf("store claimed catalog bundle: %w", err)
-		}
-		return false, "", errors.New("store claimed catalog bundle returned unstable reference")
 	}
 	catalog.BundleRef = ref
 	return true, token, nil
@@ -530,6 +522,7 @@ func (s *TenantSkillService) catalogBundleArchive(
 		return nil, apperrors.NewNotFoundError("skill not found")
 	}
 	wantSHA := strings.TrimSpace(catalog.BundleSHA256)
+	var lastCandidateErr error
 	finishFallback := func(archive []byte) ([]byte, error) {
 		if err := s.ensureCatalogOwnedBundle(ctx, tenantID, catalog.ID, wantSHA, archive); err != nil {
 			return nil, err
@@ -544,7 +537,11 @@ func (s *TenantSkillService) catalogBundleArchive(
 			return nil, false
 		}
 		archive, err := s.downloadSkillBundle(ctx, tenantID, row)
-		if err != nil || len(archive) == 0 {
+		if err != nil {
+			lastCandidateErr = err
+			return nil, false
+		}
+		if len(archive) == 0 {
 			return nil, false
 		}
 		if wantSHA != "" && !archiveMatchesSHA(archive, wantSHA) {
@@ -583,6 +580,9 @@ func (s *TenantSkillService) catalogBundleArchive(
 		if archive, ok := tryRow(row); ok {
 			return finishFallback(archive)
 		}
+	}
+	if lastCandidateErr != nil {
+		return nil, fmt.Errorf("read catalog bundle candidate: %w", lastCandidateErr)
 	}
 	return nil, apperrors.NewBadRequestError(
 		"the archive of this skill is no longer stored; add it again from the original bundle")
