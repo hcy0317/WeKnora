@@ -4,6 +4,7 @@ ARG GOPROXY_ARG=https://goproxy.cn,direct
 ARG GOSUMDB_ARG=off
 ARG APK_MIRROR_ARG=mirrors.tencent.com
 ARG WITH_ANYDOC=1
+ARG RUSTUP_DIST_SERVER_ARG=
 
 ENV GOPROXY=${GOPROXY_ARG}
 ENV GOSUMDB=${GOSUMDB_ARG}
@@ -23,8 +24,14 @@ RUN if [ -n "$APK_MIRROR_ARG" ]; then \
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     if [ "$WITH_ANYDOC" = "1" ]; then \
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable; \
+        if [ -n "$RUSTUP_DIST_SERVER_ARG" ]; then \
+            export RUSTUP_DIST_SERVER="$RUSTUP_DIST_SERVER_ARG"; \
+        fi; \
+        curl --retry 3 --retry-delay 2 --retry-all-errors \
+            --proto '=https' --tlsv1.2 -sSf \
+            -o /tmp/rustup-init.sh https://sh.rustup.rs && \
+        sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable && \
+        rm -f /tmp/rustup-init.sh; \
     fi
 
 # go.mod replace-points anydoc at ./third_party/anydoc-go, so the local

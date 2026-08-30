@@ -331,6 +331,45 @@ func (c *E2BRemoteClient) EnsureStandardTemplate(ctx context.Context) (*RemoteTe
 			return &items[i], nil
 		}
 	}
+	return c.buildStandardTemplate(ctx)
+}
+
+// ReplaceStandardTemplate starts a new WeKnora-template build from the current
+// spec. E2B resolves builds by name, so this is often a rebuild of the same
+// ID. The previous template stays listed until the caller has persisted a
+// spawnable replacement and called DeleteSupersededStandardTemplates: deleting
+// first left stored template_ids pointing at a missing template, and retrying
+// a refused rebuild by deleting the live ID did the same.
+func (c *E2BRemoteClient) ReplaceStandardTemplate(ctx context.Context) (*RemoteTemplate, error) {
+	return c.buildStandardTemplate(ctx)
+}
+
+// DeleteSupersededStandardTemplates drops WeKnora templates other than keepID.
+func (c *E2BRemoteClient) DeleteSupersededStandardTemplates(ctx context.Context, keepID string) error {
+	keepID = strings.TrimSpace(keepID)
+	if keepID == "" {
+		return e2bInvalidRequest("DeleteSupersededStandardTemplates", "template ID is required", nil)
+	}
+	items, err := c.ListTemplates(ctx)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if !item.Standard || strings.TrimSpace(item.ID) == "" || item.ID == keepID {
+			continue
+		}
+		logger.Infof(ctx, "e2b deleting superseded standard template %s", item.ID)
+		if err := c.client.DeleteTemplate(ctx, item.ID); err != nil {
+			var notFound *e2b.TemplateNotFoundError
+			if !errors.As(err, &notFound) {
+				logger.Warnf(ctx, "e2b delete of replaced template %s failed: %v", item.ID, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *E2BRemoteClient) buildStandardTemplate(ctx context.Context) (*RemoteTemplate, error) {
 	builder := e2b.NewTemplate().FromImage(DefaultDockerImage)
 	build, err := builder.BuildInBackground(ctx, c.client, e2b.BuildConfig{
 		Name: StandardTemplateName,
@@ -870,7 +909,7 @@ func (c *E2BRemoteClient) MakeDir(
 		return e2bInvalidRequest("MakeDir", "path is required", nil)
 	}
 	if err := sandbox.Filesystem.MakeDir(ctx, path, e2b.WithFileUser(DefaultSandboxExecUser)); err != nil {
-		return normalizeE2BError("MakeDir", err)
+		return ignoreExistingDir(normalizeE2BError("MakeDir", err))
 	}
 	return nil
 }
@@ -1235,5 +1274,6 @@ func e2bRemoteEntryType(fileType string) RemoteDirEntryType {
 var (
 	_ RemoteSandboxClient   = (*E2BRemoteClient)(nil)
 	_ RemoteSnapshotManager = (*E2BRemoteClient)(nil)
+	_ RemoteTemplateCatalog = (*E2BRemoteClient)(nil)
 	_ RemoteSandboxHandle   = (*e2bRemoteHandle)(nil)
 )

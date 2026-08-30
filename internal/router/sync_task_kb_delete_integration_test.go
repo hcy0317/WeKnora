@@ -45,7 +45,7 @@ func TestDeleteKnowledgeBaseLiteUsesStableTaskIDAcrossRealEnqueue(t *testing.T) 
 	repo := &syncKBDeleteRepo{kb: &types.KnowledgeBase{ID: "kb-lite", TenantID: 7}}
 	svc := service.NewKnowledgeBaseService(
 		repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
-		executor, nil, nil, nil, nil, nil, nil, nil,
+		executor, nil, nil, nil, nil, nil, nil, nil, nil,
 	)
 	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
 	ctx = context.WithValue(ctx, types.TenantInfoContextKey, &types.Tenant{ID: 7})

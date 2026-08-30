@@ -625,9 +625,7 @@ func (c *StorageEngineConfig) Scan(value interface{}) error {
 // It is self-contained: provider fields are not inherited from process
 // environment. Leaving a required provider field empty is rejected on save.
 type TenantSandboxConfig struct {
-	// SandboxType selects the sandbox backend. Named configs may use "cube",
-	// "e2b", "docker", or "local". "disabled" is reserved for the hidden
-	// workspace policy row.
+	// SandboxType is cube, e2b, or docker; disabled is the hidden policy row.
 	SandboxType string `json:"sandbox_type,omitempty"`
 
 	// ── 通用配置（跨后端生效）──────────────────────────────────
@@ -660,6 +658,13 @@ type TenantSandboxConfig struct {
 	// so a settings-form save cannot wipe or plant the pointer.
 	SkillImage *SkillImageConfig `json:"skill_image,omitempty"`
 
+	// SkillRollout decides whether sessions that already hold a sandbox of
+	// this config rebuild after a skill install or removal. Empty and
+	// SkillRolloutNextTurn rebuild on the next chat turn. SkillRolloutNewSession
+	// leaves those sandboxes on the previous image; only sessions that start
+	// afterwards boot the new snapshot.
+	SkillRollout string `json:"skill_rollout,omitempty"`
+
 	// ── 后端专属配置（同一时刻只有一个生效，由 SandboxType 决定）───
 
 	Cube   *CubeSandboxConfig   `json:"cube,omitempty"`
@@ -682,6 +687,9 @@ type CubeSandboxConfig struct {
 	HTTPTimeoutSec int `json:"http_timeout_sec,omitempty"`
 
 	CubeSandboxTTLSeconds int `json:"cube_sandbox_ttl_seconds,omitempty"`
+
+	// DNSServers are Cube template nameserver IPs. Empty uses Cubelet's default.
+	DNSServers []string `json:"dns_servers,omitempty"`
 }
 
 // E2BSandboxConfig addresses one E2B-protocol control plane: E2B Cloud, a
@@ -791,6 +799,25 @@ type VolumeMountConfig struct {
 	// API key, at which point the volume is no longer reachable and must
 	// be recreated.
 	VolumeOwnerFingerprint string `json:"volume_owner_fingerprint,omitempty"`
+}
+
+const (
+	// SkillRolloutNextTurn rebuilds a live session's sandbox on its next chat
+	// turn after the skill image changes. This is the default.
+	SkillRolloutNextTurn = "next_turn"
+	// SkillRolloutNewSession leaves live sandboxes on the previous image.
+	// Only a session that starts after the install or removal boots the new one.
+	SkillRolloutNewSession = "new_session"
+)
+
+// RebuildsExistingOnSkillChange reports whether an install or removal should
+// mark already-bound sandboxes stale. Unknown values fail toward rebuilding
+// so a corrupted row cannot pin every session on a retired image.
+func (c *TenantSandboxConfig) RebuildsExistingOnSkillChange() bool {
+	if c == nil {
+		return true
+	}
+	return strings.TrimSpace(c.SkillRollout) != SkillRolloutNewSession
 }
 
 // SkillImageConfig is the pointer to the snapshot that carries the skills

@@ -40,16 +40,24 @@ type fakeDockerEngine struct {
 	removeErr   error
 	inspect     map[string]container.InspectResponse
 	inspectErr  error
+	inspectHook func(id string) (container.InspectResponse, error)
 	list        []container.Summary
 	listFilters []client.Filters
 	listErr     error
+
+	// startLeavesState skips the default "start → running" inspect update so
+	// a test can drive waitUntilRunning itself.
+	startLeavesState bool
 
 	execOptions []client.ExecCreateOptions
 	execStdout  string
 	execStderr  string
 	execExit    int
 	execErr     error
-	execStdin   bytes.Buffer
+	// execNotRunningOnce makes the first ExecCreate fail the way the daemon
+	// does when the container has not reached State.Running yet.
+	execNotRunningOnce bool
+	execStdin          bytes.Buffer
 	// execStreamStalls hands back an output stream that never ends on its
 	// own, which is what a long-running exec looks like to a client that
 	// gives up on it. execStream is the stream handed to the last attach.
@@ -65,6 +73,14 @@ type fakeDockerEngine struct {
 	images       []image.Summary
 	imagePresent map[string]bool
 	pulled       []string
+
+	committed          []client.ContainerCommitOptions
+	commitID           string
+	commitErr          error
+	removedImages      []string
+	removeImageOptions []client.ImageRemoveOptions
+	removeImageErr     error
+	listImagesErr      error
 }
 
 func newFakeDockerEngine() *fakeDockerEngine {
@@ -75,6 +91,8 @@ func newFakeDockerEngine() *fakeDockerEngine {
 		imagePresent: make(map[string]bool),
 	}
 }
+
+var _ dockerEngineAPI = (*fakeDockerEngine)(nil)
 
 func (f *fakeDockerEngine) Ping(context.Context, client.PingOptions) (client.PingResult, error) {
 	return client.PingResult{APIVersion: "1.55"}, f.pingErr
@@ -94,13 +112,39 @@ func (f *fakeDockerEngine) ContainerStart(
 	_ context.Context, id string, _ client.ContainerStartOptions,
 ) (client.ContainerStartResult, error) {
 	f.started = append(f.started, id)
-	return client.ContainerStartResult{}, f.startErr
+	if f.startErr != nil {
+		return client.ContainerStartResult{}, f.startErr
+	}
+	if !f.startLeavesState {
+		found := f.inspect[id]
+		if found.ID == "" {
+			found.ID = id
+		}
+		if found.State == nil {
+			found.State = &container.State{}
+		}
+		found.State.Status = "running"
+		if f.inspect == nil {
+			f.inspect = map[string]container.InspectResponse{}
+		}
+		f.inspect[id] = found
+	}
+	return client.ContainerStartResult{}, nil
 }
 
 func (f *fakeDockerEngine) ContainerUnpause(
 	_ context.Context, id string, _ client.ContainerUnpauseOptions,
 ) (client.ContainerUnpauseResult, error) {
 	f.unpaused = append(f.unpaused, id)
+	found := f.inspect[id]
+	if found.State == nil {
+		found.State = &container.State{}
+	}
+	found.State.Status = "running"
+	if f.inspect == nil {
+		f.inspect = map[string]container.InspectResponse{}
+	}
+	f.inspect[id] = found
 	return client.ContainerUnpauseResult{}, nil
 }
 
@@ -109,6 +153,13 @@ func (f *fakeDockerEngine) ContainerInspect(
 ) (client.ContainerInspectResult, error) {
 	if f.inspectErr != nil {
 		return client.ContainerInspectResult{}, f.inspectErr
+	}
+	if f.inspectHook != nil {
+		found, err := f.inspectHook(id)
+		if err != nil {
+			return client.ContainerInspectResult{}, err
+		}
+		return client.ContainerInspectResult{Container: found}, nil
 	}
 	found, ok := f.inspect[id]
 	if !ok {
@@ -138,6 +189,10 @@ func (f *fakeDockerEngine) ExecCreate(
 	_ context.Context, _ string, options client.ExecCreateOptions,
 ) (client.ExecCreateResult, error) {
 	f.execOptions = append(f.execOptions, options)
+	if f.execNotRunningOnce && len(f.execOptions) == 1 {
+		return client.ExecCreateResult{}, cerrdefs.ErrConflict.WithMessage(
+			"container is not running")
+	}
 	if f.execErr != nil {
 		return client.ExecCreateResult{}, f.execErr
 	}
@@ -239,7 +294,80 @@ func (f *fakeDockerEngine) ImagePull(
 func (f *fakeDockerEngine) ImageList(
 	_ context.Context, _ client.ImageListOptions,
 ) (client.ImageListResult, error) {
+	if f.listImagesErr != nil {
+		return client.ImageListResult{}, f.listImagesErr
+	}
 	return client.ImageListResult{Items: f.images}, nil
+}
+
+func (f *fakeDockerEngine) ImageRemove(
+	_ context.Context, imageID string, options client.ImageRemoveOptions,
+) (client.ImageRemoveResult, error) {
+	f.removedImages = append(f.removedImages, imageID)
+	f.removeImageOptions = append(f.removeImageOptions, options)
+	if f.removeImageErr != nil {
+		return client.ImageRemoveResult{}, f.removeImageErr
+	}
+	canonical := dockerCanonicalSnapshotID(imageID)
+	found := f.imagePresent[imageID] || f.imagePresent[canonical]
+	kept := make([]image.Summary, 0, len(f.images))
+	for _, item := range f.images {
+		match := item.ID == imageID || item.ID == canonical
+		for _, tag := range item.RepoTags {
+			if tag == imageID || dockerCanonicalSnapshotID(tag) == canonical {
+				match = true
+				break
+			}
+		}
+		if match {
+			found = true
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if !found {
+		return client.ImageRemoveResult{}, cerrdefs.ErrNotFound.WithMessage("no such image")
+	}
+	f.images = kept
+	delete(f.imagePresent, imageID)
+	delete(f.imagePresent, canonical)
+	return client.ImageRemoveResult{}, nil
+}
+
+func (f *fakeDockerEngine) ContainerCommit(
+	_ context.Context, _ string, options client.ContainerCommitOptions,
+) (client.ContainerCommitResult, error) {
+	f.committed = append(f.committed, options)
+	if f.commitErr != nil {
+		return client.ContainerCommitResult{}, f.commitErr
+	}
+	id := f.commitID
+	if id == "" {
+		id = "sha256:snapshot-1"
+	}
+	labels := map[string]string{}
+	for _, change := range options.Changes {
+		change = strings.TrimSpace(change)
+		if !strings.HasPrefix(strings.ToUpper(change), "LABEL ") {
+			continue
+		}
+		rest := strings.TrimSpace(change[len("LABEL "):])
+		key, value, ok := strings.Cut(rest, "=")
+		if !ok {
+			continue
+		}
+		labels[strings.TrimSpace(key)] = strings.Trim(strings.TrimSpace(value), `"`)
+	}
+	ref := strings.TrimSpace(options.Reference)
+	var tags []string
+	if ref != "" {
+		tags = []string{ref + ":latest"}
+		f.imagePresent[ref] = true
+		f.imagePresent[ref+":latest"] = true
+	}
+	f.imagePresent[id] = true
+	f.images = append(f.images, image.Summary{ID: id, RepoTags: tags, Labels: labels})
+	return client.ContainerCommitResult{ID: id}, nil
 }
 
 // fakePullResponse satisfies the pull-response contract without a registry.
@@ -385,6 +513,55 @@ func TestDockerClientCreateRemovesContainerThatCannotStart(t *testing.T) {
 	})
 	require.Error(t, err)
 	require.Equal(t, []string{"container-1"}, engine.removed)
+}
+
+// ContainerStart returning is not Running. A skill install used to exec
+// immediately and fail with 409 "container is not running"; waiting here is
+// what makes the first attempt succeed.
+func TestDockerClientCreateWaitsUntilTheContainerIsRunning(t *testing.T) {
+	engine := newFakeDockerEngine()
+	engine.imagePresent["weknora/sandbox:test"] = true
+	engine.startLeavesState = true
+	var inspects int
+	engine.inspectHook = func(id string) (container.InspectResponse, error) {
+		inspects++
+		status := "created"
+		if inspects >= 2 {
+			status = "running"
+		}
+		return container.InspectResponse{
+			ID:    id,
+			State: &container.State{Status: container.ContainerState(status)},
+		}, nil
+	}
+	docker := newTestDockerClient(t, engine)
+
+	handle, err := docker.Create(context.Background(), RemoteCreateRequest{
+		TemplateID: "weknora/sandbox:test",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "container-1", handle.ID())
+	require.GreaterOrEqual(t, inspects, 2)
+}
+
+// PID 1 dying right after start is not a race: waiting will never help, and
+// the container has to be removed the same way a failed Start is.
+func TestDockerClientCreateRemovesContainerThatExitsImmediately(t *testing.T) {
+	engine := newFakeDockerEngine()
+	engine.imagePresent["weknora/sandbox:test"] = true
+	engine.startLeavesState = true
+	engine.inspect["container-1"] = container.InspectResponse{
+		ID:    "container-1",
+		State: &container.State{Status: "exited"},
+	}
+	docker := newTestDockerClient(t, engine)
+
+	_, err := docker.Create(context.Background(), RemoteCreateRequest{
+		TemplateID: "weknora/sandbox:test",
+	})
+	require.Error(t, err)
+	require.Equal(t, []string{"container-1"}, engine.removed)
+	require.Contains(t, err.Error(), "not running")
 }
 
 func TestDockerClientCreateRefusesVolumeMounts(t *testing.T) {
@@ -655,6 +832,36 @@ func TestDockerClientExecWritesStdin(t *testing.T) {
 	require.True(t, engine.execOptions[0].AttachStdin)
 }
 
+func TestDockerContainerNotRunning(t *testing.T) {
+	require.False(t, dockerContainerNotRunning(nil))
+	require.False(t, dockerContainerNotRunning(errors.New("already exists")))
+	require.True(t, dockerContainerNotRunning(
+		cerrdefs.ErrConflict.WithMessage("container abc is not running")))
+}
+
+// ExecCreate 409 "container is not running" is not a failed command: Connect
+// already resumes an exited container, and the first exec of a new sandbox
+// used to hit this before PID 1 was up. Resume once, then retry.
+func TestDockerClientExecResumesAStoppedContainerAndRetries(t *testing.T) {
+	engine := newFakeDockerEngine()
+	engine.inspect["container-1"] = container.InspectResponse{
+		ID:    "container-1",
+		State: &container.State{Status: "exited"},
+	}
+	engine.execNotRunningOnce = true
+	engine.execStdout = "ok\n"
+	docker := newTestDockerClient(t, engine)
+
+	result, err := docker.Exec(context.Background(), testHandle("container-1"), RemoteExecRequest{
+		Command: "true",
+		Timeout: time.Second,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "ok\n", result.Stdout)
+	require.Equal(t, []string{"container-1"}, engine.started)
+	require.Len(t, engine.execOptions, 2)
+}
+
 // The archive endpoint would apply this write as root and resolve symlinks on
 // the way, so a link planted under the writable workspace could redirect an
 // upload onto a file the sandbox account cannot touch. Writing through exec
@@ -853,6 +1060,8 @@ func TestDockerClientCapabilities(t *testing.T) {
 	require.True(t, caps.SupportsFilesystemEnumeration)
 	require.False(t, caps.SupportsTimeoutRefresh,
 		"the daemon has no TTL to refresh; reclamation is WeKnora's own sweep")
+	require.True(t, caps.SupportsSnapshots,
+		"docker commit is the skill-image snapshot; without this flag install is refused")
 	require.False(t, caps.SupportsVolumes)
 }
 

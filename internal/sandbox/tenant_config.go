@@ -74,6 +74,11 @@ func ResolveEffectiveConfig(
 		overrideString(&effective.CubeTemplate, cube.TemplateID)
 		overrideSeconds(&effective.CubeHTTPTimeout, cube.HTTPTimeoutSec)
 		overrideSeconds(&effective.CubeSandboxTTL, cube.CubeSandboxTTLSeconds)
+		dns, err := NormalizeCubeDNSServers(cube.DNSServers)
+		if err != nil {
+			return nil, err
+		}
+		effective.CubeDNSServers = dns
 	}
 
 	if e2bCfg := tenantCfg.E2B; e2bCfg != nil {
@@ -120,10 +125,10 @@ func ResolveEffectiveConfig(
 	case SandboxTypeDocker:
 		applyDockerRuntimeDefaults(&effective)
 	}
-	// A skill snapshot is just a template ID on both providers, so overriding
-	// the template field here is the entire session-side change. Everything
-	// downstream keeps reading CubeTemplate / E2BTemplate and needs no knowledge
-	// of skills.
+	// A skill snapshot is a template ID (Cube/E2B) or an image tag (Docker),
+	// so overriding that field here is the entire session-side change.
+	// Everything downstream keeps reading CubeTemplate / E2BTemplate /
+	// DockerImage and needs no knowledge of skills.
 	switch effective.Type {
 	case SandboxTypeCube:
 		if snapshot := skillImageTemplateOverride(
@@ -136,6 +141,14 @@ func ResolveEffectiveConfig(
 			tenantCfg.SkillImage, "e2b", effective.E2BAPIKey, effective.E2BAPIURL,
 		); snapshot != "" {
 			effective.E2BTemplate = snapshot
+		}
+	case SandboxTypeDocker:
+		// Deliberately computed from the STORED docker block, not from
+		// effective.DockerHost: a blank host is resolved from the environment
+		// by applyDockerRuntimeDefaults, and that resolved value must never
+		// reach the fingerprint (see dockerLocalDaemonIdentity).
+		if snapshot := DockerSkillImageOverride(tenantCfg); snapshot != "" {
+			effective.DockerImage = snapshot
 		}
 	}
 	// Deliberately after the runtime defaults: TTLs and HTTP timeouts have
@@ -190,6 +203,7 @@ func clearProviderFields(cfg *Config) {
 	cfg.CubeTemplate = ""
 	cfg.CubeSandboxTTL = 0
 	cfg.CubeHTTPTimeout = 0
+	cfg.CubeDNSServers = nil
 
 	cfg.E2BAPIURL = ""
 	cfg.E2BProxyURL = ""
@@ -216,8 +230,6 @@ func ParseSandboxType(raw string) (SandboxType, error) {
 		return SandboxTypeE2B, nil
 	case SandboxTypeDocker:
 		return SandboxTypeDocker, nil
-	case SandboxTypeLocal:
-		return SandboxTypeLocal, nil
 	case SandboxTypeDisabled:
 		return SandboxTypeDisabled, nil
 	default:

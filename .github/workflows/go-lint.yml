@@ -1,10 +1,11 @@
 name: Go Lint
 
 # The repository carries a large backlog of pre-existing golangci-lint findings,
-# so pull requests are only judged on the code they introduce (`only-new-issues`).
-# That filter needs a pull request diff, which is why this workflow has no other
-# trigger; the companion go-lint-cache.yml keeps the caches this job restores
-# from warm on main.
+# so pull requests are only judged on the code they introduce (`--new-from-rev`).
+# Ordinary PRs use their base SHA. A chore(upstream) compatibility PR treats
+# its reviewed import merge as the baseline when that merge's first parent is
+# exactly the PR base; each parent carries independent historical lint debt,
+# while every compatibility follow-up after the merge remains fully linted.
 
 on:
   pull_request:
@@ -38,6 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       modules: ${{ steps.detect.outputs.modules }}
+      lint-base: ${{ steps.detect.outputs.lint-base }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -45,8 +47,25 @@ jobs:
       - name: Detect changed modules
         id: detect
         shell: bash
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          diff_range="${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+          diff_range="${PR_BASE}...${PR_HEAD}"
+          lint_base="${PR_BASE}"
+          if [[ "${PR_TITLE}" == "chore(upstream):"* ]]; then
+            while read -r merge_commit; do
+              read -ra parents <<< "$(git rev-list --parents -n 1 "${merge_commit}")"
+              if [[ ${#parents[@]} -ge 3 && "${parents[1]}" == "${PR_BASE}" ]]; then
+                lint_base="${merge_commit}"
+                break
+              fi
+            done < <(git rev-list --merges "${PR_BASE}..${PR_HEAD}")
+          fi
+          git merge-base --is-ancestor "${lint_base}" "${PR_HEAD}"
+          echo "lint-base=${lint_base}" >> "$GITHUB_OUTPUT"
+          echo "Lint baseline: ${lint_base}"
           modules=()
           if git diff --name-only --diff-filter=ACMR "$diff_range" -- \
                .golangci.yml .github/workflows/go-lint.yml | grep -q .; then
@@ -101,4 +120,4 @@ jobs:
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
           working-directory: ${{ matrix.module }}
-          only-new-issues: true
+          args: --new-from-rev=${{ needs.changes.outputs.lint-base }}

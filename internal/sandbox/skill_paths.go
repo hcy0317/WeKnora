@@ -49,23 +49,123 @@ func SkillDirFor(skillName string) (string, error) {
 	return path.Join(SkillsImageRoot, skillName), nil
 }
 
+// SkillRequirementsPath is where the installer agent writes what the skill
+// needs at run time. It lives inside the skill's own directory so it travels
+// with the skill into the snapshot, and it is a file rather than a tool call
+// on purpose: the agent reads a third-party SKILL.md, so nothing it produces
+// may reach the database except as bytes the server parses and validates.
+//
+// An invalid skill name yields an empty path, which every caller treats as
+// "no declaration": the name is already validated before an install starts,
+// and a best-effort read is not a place to fail an install.
+func SkillRequirementsPath(skillName string) string {
+	dir, err := SkillDirFor(skillName)
+	if err != nil {
+		return ""
+	}
+	return path.Join(dir, ".weknora", "requirements.json")
+}
+
+// RunnableWorkspaceScript reports whether scriptPath is a session-writable
+// file under /workspace that may be executed with an installed skill's
+// interpreter. /workspace/input is reserved for attachments and is excluded;
+// so are the workspace directory roots themselves.
+func RunnableWorkspaceScript(scriptPath string) (string, bool) {
+	clean := path.Clean(strings.TrimSpace(scriptPath))
+	if clean == SessionWorkspaceRoot || clean == SessionOutputRoot || clean == SessionInputRoot {
+		return "", false
+	}
+	if !strings.HasPrefix(clean, SessionWorkspaceRoot+"/") {
+		return "", false
+	}
+	if strings.HasPrefix(clean, SessionInputRoot+"/") {
+		return "", false
+	}
+	return clean, true
+}
+
+// ValidatedImageSkillDir reports whether skillDir is exactly one installed
+// skill directory under SkillsImageRoot (for example /opt/weknora/tenant/skills/pdf).
+func ValidatedImageSkillDir(skillDir string) (string, bool) {
+	clean := path.Clean(strings.TrimSpace(skillDir))
+	expected, err := SkillDirFor(path.Base(clean))
+	if err != nil || expected != clean {
+		return "", false
+	}
+	return clean, true
+}
+
+// InterpreterSkillDir chooses the skill directory whose venv/node_modules
+// should run remote. Image-skill scripts always win from the path so a
+// mismatched SkillDir cannot redirect them. Workspace scripts require an
+// explicit, validated SkillDir.
+func InterpreterSkillDir(remotePath, skillDir string) (string, bool) {
+	if dir, ok := SkillDirForImageScript(remotePath); ok {
+		return dir, true
+	}
+	if _, ok := RunnableWorkspaceScript(remotePath); !ok {
+		return "", false
+	}
+	return ValidatedImageSkillDir(skillDir)
+}
+
+// SkillNameFromImagePath reports whether p sits at or under SkillsImageRoot.
+// The skills root itself returns ("", true). A skill directory or a file
+// inside one returns (skillName, true). Paths outside the image return
+// ("", false).
+func SkillNameFromImagePath(p string) (name string, inImage bool) {
+	clean := path.Clean(strings.TrimSpace(p))
+	root := path.Clean(SkillsImageRoot)
+	if clean == root {
+		return "", true
+	}
+	prefix := root + "/"
+	if !strings.HasPrefix(clean, prefix) {
+		return "", false
+	}
+	name = strings.SplitN(strings.TrimPrefix(clean, prefix), "/", 2)[0]
+	if !IsValidSkillName(name) {
+		return "", false
+	}
+	return name, true
+}
+
 // SkillDirForImageScript returns the owning skill directory for an image script.
 // It anchors on SkillsImageRoot so nested script layouts still use the venv that
 // was installed beside the skill, not a shallower scripts directory.
 func SkillDirForImageScript(scriptPath string) (string, bool) {
-	cleanRoot := path.Clean(SkillsImageRoot)
-	cleanScript := path.Clean(scriptPath)
-	prefix := cleanRoot + "/"
-	if !strings.HasPrefix(cleanScript, prefix) {
+	name, inImage := SkillNameFromImagePath(scriptPath)
+	if !inImage || name == "" {
 		return "", false
 	}
+	clean := path.Clean(strings.TrimSpace(scriptPath))
+	dir, err := SkillDirFor(name)
+	if err != nil || clean == dir {
+		return "", false
+	}
+	return dir, true
+}
 
-	rest := strings.TrimPrefix(cleanScript, prefix)
-	parts := strings.SplitN(rest, "/", 2)
-	if len(parts) != 2 || parts[0] == "" || !IsValidSkillName(parts[0]) {
-		return "", false
+// SessionSkillPackageDir is the per-session extra-packages overlay for one
+// skill. The image venv is frozen after install (root-owned, mode 555, and
+// often created with `uv venv` so it has no pip). Skills that lazily
+// `pip install` on first use cannot write there; packages installed with
+// `python3 -m pip install --target` this directory are visible to
+// execute_skill_script via PYTHONPATH / NODE_PATH. The directory is under
+// /workspace so it dies with the session and never mutates the snapshot.
+func SessionSkillPackageDir(skillName string) string {
+	if !IsValidSkillName(skillName) {
+		return path.Join(SessionWorkspaceRoot, ".skill-packages")
 	}
-	return path.Join(cleanRoot, parts[0]), true
+	return path.Join(SessionWorkspaceRoot, ".skill-packages", skillName)
+}
+
+// SkillVenvPython is where a skill's own Python interpreter lives when the
+// install created one. It is exported because the model needs to be told: the
+// system python3 deliberately carries no skill dependencies, so anything that
+// inspects or debugs a Python skill has to name this path.
+func SkillVenvPython(skillDir string) string {
+	return path.Join(skillDir, ".venv", "bin", "python")
 }
 
 // SkillInterpreterCommand picks how to run one script of a skill.
@@ -80,13 +180,13 @@ func SkillDirForImageScript(scriptPath string) (string, bool) {
 func SkillInterpreterCommand(skillDir, scriptPath string) (string, []string) {
 	switch strings.ToLower(path.Ext(scriptPath)) {
 	case ".py":
-		venvPython := path.Join(skillDir, ".venv", "bin", "python")
-		script := shellQuote(scriptPath)
+		venvPython := SkillVenvPython(skillDir)
+		script := ShellQuote(scriptPath)
 		return "/bin/sh", []string{"-c", fmt.Sprintf(
 			`if [ -x %s ]; then exec %s %s "$@"; else exec python3 %s "$@"; fi`,
-			shellQuote(venvPython), shellQuote(venvPython), script, script,
+			ShellQuote(venvPython), ShellQuote(venvPython), script, script,
 		), skillShellArgv0}
-	case ".js", ".mjs":
+	case ".js", ".mjs", ".cjs":
 		return "node", []string{scriptPath}
 	case ".sh":
 		return "/bin/sh", []string{scriptPath}

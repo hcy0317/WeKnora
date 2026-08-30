@@ -110,8 +110,10 @@ const (
 	knowledgeSpanMigrationVersion = 55
 	rootAttemptUniqueVersion      = 85
 	postgresCollisionBaseVersion  = 80
+	postgresUpstreamBaseVersion   = 84
 	sqliteCollisionBaseVersion    = 3
 	sqliteUpstreamBaseVersion     = 4
+	sqliteUpstreamUsageVersion    = 12
 )
 
 type migrationGateSnapshot struct {
@@ -302,25 +304,83 @@ func postgresCollisionMarkers(
 func reconcilePostgresMigrationCollision(
 	ctx context.Context, m *migrate.Migrate, db *sql.DB, version uint, dirty bool,
 ) (uint, error) {
-	if dirty || version < 81 || version > 85 {
+	if dirty {
 		return version, nil
 	}
-	legacyExists, upstreamExists, err := postgresCollisionMarkers(ctx, db, version)
-	if err != nil {
-		return version, fmt.Errorf("inspect PostgreSQL migration collision at version %d: %w", version, err)
+	if version >= 81 && version <= 85 {
+		legacyExists, upstreamExists, err := postgresCollisionMarkers(ctx, db, version)
+		if err != nil {
+			return version, fmt.Errorf("inspect PostgreSQL migration collision at version %d: %w", version, err)
+		}
+		if legacyExists && !upstreamExists {
+			logger.Warnf(ctx,
+				"Detected legacy local PostgreSQL migration version %d; replaying collision range from %d",
+				version, postgresCollisionBaseVersion+1)
+			if err := m.Force(postgresCollisionBaseVersion); err != nil {
+				return version, fmt.Errorf("rewind legacy PostgreSQL migration version %d to %d: %w",
+					version, postgresCollisionBaseVersion, err)
+			}
+			return postgresCollisionBaseVersion, nil
+		}
 	}
-	if !legacyExists || upstreamExists {
+
+	if version < 85 || version > 90 {
+		return version, nil
+	}
+	localExists, upstreamExists, err := postgresUpstreamCollisionMarkers(ctx, db, version)
+	if err != nil {
+		return version, fmt.Errorf("inspect Tencent PostgreSQL migration collision at version %d: %w", version, err)
+	}
+	if localExists || !upstreamExists {
 		return version, nil
 	}
 
 	logger.Warnf(ctx,
-		"Detected legacy local PostgreSQL migration version %d; replaying collision range from %d",
-		version, postgresCollisionBaseVersion+1)
-	if err := m.Force(postgresCollisionBaseVersion); err != nil {
-		return version, fmt.Errorf("rewind legacy PostgreSQL migration version %d to %d: %w",
-			version, postgresCollisionBaseVersion, err)
+		"Detected Tencent PostgreSQL migration version %d; replaying fork compatibility range from %d",
+		version, postgresUpstreamBaseVersion+1)
+	if err := m.Force(postgresUpstreamBaseVersion); err != nil {
+		return version, fmt.Errorf("rewind Tencent PostgreSQL migration version %d to %d: %w",
+			version, postgresUpstreamBaseVersion, err)
 	}
-	return postgresCollisionBaseVersion, nil
+	return postgresUpstreamBaseVersion, nil
+}
+
+func postgresUpstreamCollisionMarkers(
+	ctx context.Context, db *sql.DB, version uint,
+) (localExists, upstreamExists bool, err error) {
+	switch version {
+	case 85:
+		localExists, err = postgresRelationExists(ctx, db, "idx_knowledge_processing_spans_root_attempt_unique")
+		if err == nil {
+			upstreamExists, err = postgresColumnExists(ctx, db, "messages", "usage")
+		}
+	case 86:
+		localExists, err = postgresColumnExists(ctx, db, "task_pending_ops", "claim_token")
+		if err == nil {
+			upstreamExists, err = postgresRelationExists(ctx, db, "tenant_skills")
+		}
+	case 87:
+		localExists, err = postgresRelationExists(ctx, db, "question_generation_manifests")
+		if err == nil {
+			upstreamExists, err = postgresColumnExists(ctx, db, "tenant_skills", "install_session_id")
+		}
+	case 88:
+		localExists, err = postgresRelationExists(ctx, db, "wiki_ingest_work_units")
+		if err == nil {
+			upstreamExists, err = postgresColumnExists(ctx, db, "tenant_skill_snapshots", "planned_name")
+		}
+	case 89:
+		localExists, err = postgresRelationExists(ctx, db, "wiki_canonical_identities")
+		if err == nil {
+			upstreamExists, err = postgresRelationExists(ctx, db, "tenant_user_env_vars")
+		}
+	case 90:
+		localExists, err = postgresRelationExists(ctx, db, "wiki_generation_fragments")
+		if err == nil {
+			upstreamExists, err = postgresRelationExists(ctx, db, "tenant_skill_catalog")
+		}
+	}
+	return localExists, upstreamExists, err
 }
 
 func sqliteTableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
@@ -332,10 +392,58 @@ func sqliteTableExists(ctx context.Context, db *sql.DB, table string) (bool, err
 	return exists, err
 }
 
+func sqliteColumnExistsForMigration(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	var exists bool
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pragma_table_info(?) WHERE name = ?
+		)`, table, column).Scan(&exists)
+	return exists, err
+}
+
 func reconcileSQLiteMigrationCollision(
 	ctx context.Context, m *migrate.Migrate, db *sql.DB, version uint, dirty bool,
 ) (uint, error) {
-	if dirty || version < 4 || version > 9 {
+	if dirty {
+		return version, nil
+	}
+	if version >= sqliteUpstreamUsageVersion && version < 17 {
+		usageExists, err := sqliteColumnExistsForMigration(ctx, db, "messages", "usage")
+		if err != nil {
+			return version, fmt.Errorf("inspect upstream SQLite message usage migration: %w", err)
+		}
+		if usageExists {
+			manifestExists, err := sqliteTableExists(ctx, db, "question_generation_manifests")
+			if err != nil {
+				return version, fmt.Errorf("inspect fork SQLite question manifest migration: %w", err)
+			}
+			resumeVersion := version
+			if !manifestExists {
+				resumeVersion = sqliteUpstreamUsageVersion - 1
+				if err := m.Force(int(resumeVersion)); err != nil {
+					return version, fmt.Errorf("rewind Tencent SQLite migration version %d to %d: %w",
+						version, resumeVersion, err)
+				}
+			}
+			logger.Warnf(ctx,
+				"Detected Tencent SQLite message usage at version %d; completing fork migrations through 16",
+				version)
+			if resumeVersion < 16 {
+				if err := m.Migrate(16); err != nil && err != migrate.ErrNoChange {
+					return version, fmt.Errorf("replay fork SQLite compatibility migrations from %d to 16: %w",
+						resumeVersion, err)
+				}
+			}
+			// Tencent already applied the DDL represented by the fork's v17.
+			// Advance only the clean version marker so the column and its data are
+			// preserved without replaying an unsupported duplicate ADD COLUMN.
+			if err := m.Force(17); err != nil {
+				return version, fmt.Errorf("mark Tencent SQLite message usage as fork migration 17: %w", err)
+			}
+			return 17, nil
+		}
+	}
+	if version < 4 || version > 9 {
 		return version, nil
 	}
 	memoryExists, err := sqliteTableExists(ctx, db, "memory_subjects")
