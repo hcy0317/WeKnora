@@ -1231,6 +1231,12 @@ func (r *reaperConfigStore) SetCordon(context.Context, uint64, string, time.Time
 	panic("SetCordon is outside the reaper surface")
 }
 
+func (r *reaperConfigStore) RenewCordonIfMatch(
+	context.Context, uint64, string, time.Time, time.Time,
+) error {
+	panic("RenewCordonIfMatch is outside the reaper surface")
+}
+
 func (r *reaperConfigStore) ClearCordon(context.Context, uint64, string) error {
 	panic("ClearCordon is outside the reaper surface")
 }

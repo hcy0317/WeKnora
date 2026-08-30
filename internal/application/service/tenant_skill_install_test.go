@@ -2069,6 +2069,12 @@ func (r *installConfigRepo) SetCordon(context.Context, uint64, string, time.Time
 	return nil
 }
 
+func (r *installConfigRepo) RenewCordonIfMatch(
+	context.Context, uint64, string, time.Time, time.Time,
+) error {
+	return nil
+}
+
 func (r *installConfigRepo) ClearCordon(context.Context, uint64, string) error { return nil }
 func (r *installConfigRepo) ClearCordonIfMatch(context.Context, uint64, string, time.Time) error {
 	return nil

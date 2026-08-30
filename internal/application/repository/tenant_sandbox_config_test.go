@@ -110,13 +110,17 @@ func TestSandboxConfigRepoCordonRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got.CordonedAt)
 	require.True(t, got.IsCordoned(at.Add(time.Second), types.SandboxCordonLease))
+	renewed := at.Add(time.Second)
+	require.NoError(t, repo.RenewCordonIfMatch(ctx, 1, "cfg-a", at, renewed))
+	require.ErrorIs(t, repo.RenewCordonIfMatch(ctx, 1, "cfg-a", at, renewed.Add(time.Second)),
+		ErrSandboxConfigDeleteOwnerLost)
 
-	require.NoError(t, repo.ClearCordonIfMatch(ctx, 1, "cfg-a", at.Add(time.Second)))
+	require.NoError(t, repo.ClearCordonIfMatch(ctx, 1, "cfg-a", at))
 	got, err = repo.GetByID(ctx, 1, "cfg-a")
 	require.NoError(t, err)
 	require.NotNil(t, got.CordonedAt, "stale owner must not clear the active cordon")
 
-	require.NoError(t, repo.ClearCordonIfMatch(ctx, 1, "cfg-a", at))
+	require.NoError(t, repo.ClearCordonIfMatch(ctx, 1, "cfg-a", renewed))
 	got, err = repo.GetByID(ctx, 1, "cfg-a")
 	require.NoError(t, err)
 	require.Nil(t, got.CordonedAt)
@@ -189,10 +193,16 @@ func TestSandboxConfigRepoCordonFencesOrdinaryUpdateAndOwnedUpdateIsABASafe(t *t
 	require.ErrorIs(t, repo.SoftDeleteCordoned(ctx, 1, "cfg-a", expiredAt),
 		ErrSandboxConfigDeleteOwnerLost)
 
+	staleLease := time.Now().Add(-types.SandboxCordonLease - time.Minute).UTC().Truncate(time.Second)
+	require.NoError(t, db.Model(&types.TenantSandboxConfigEntity{}).
+		Where("tenant_id = ? AND id = ?", 1, "cfg-a").
+		Update("cordoned_at", staleLease).Error)
 	updateAt := time.Now().Add(time.Second).UTC().Truncate(time.Second)
-	require.NoError(t, repo.SetCordon(ctx, 1, "cfg-a", updateAt))
+	require.NoError(t, repo.RenewCordonIfMatch(ctx, 1, "cfg-a", staleLease, updateAt))
+	row.Description = "ordinary writer blocked by renewed delete"
+	require.ErrorIs(t, repo.Update(ctx, row), ErrSandboxConfigCordoned)
 	row.Description = "stale owner must not pass"
-	require.ErrorIs(t, repo.UpdateCordoned(ctx, row, deleteAt), ErrSandboxConfigCordoned)
+	require.ErrorIs(t, repo.UpdateCordoned(ctx, row, staleLease), ErrSandboxConfigCordoned)
 	row.Description = "owned update"
 	require.NoError(t, repo.UpdateCordoned(ctx, row, updateAt))
 

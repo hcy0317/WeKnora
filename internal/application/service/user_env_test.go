@@ -83,6 +83,12 @@ func (r *userEnvConfigRepo) SetCordon(context.Context, uint64, string, time.Time
 	panic("SetCordon is outside the user env surface")
 }
 
+func (r *userEnvConfigRepo) RenewCordonIfMatch(
+	context.Context, uint64, string, time.Time, time.Time,
+) error {
+	panic("RenewCordonIfMatch is outside the user env surface")
+}
+
 func (r *userEnvConfigRepo) ClearCordon(context.Context, uint64, string) error {
 	panic("ClearCordon is outside the user env surface")
 }

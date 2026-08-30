@@ -215,10 +215,12 @@ type fakeConfigRepo struct {
 	updated *types.TenantSandboxConfigEntity
 	deleted bool
 
-	onSetCordon  func()
-	setCordonErr error
-	onUpdate     func()
-	updateErr    error
+	onSetCordon    func()
+	setCordonErr   error
+	onRenewCordon  func()
+	renewCordonErr error
+	onUpdate       func()
+	updateErr      error
 
 	clearCordonCtxErr error
 	cordonAt          time.Time
@@ -297,6 +299,22 @@ func (f *fakeConfigRepo) SetCordon(_ context.Context, _ uint64, _ string, at tim
 		f.onSetCordon()
 	}
 	return f.setCordonErr
+}
+
+func (f *fakeConfigRepo) RenewCordonIfMatch(
+	_ context.Context, _ uint64, _ string, expected, renewed time.Time,
+) error {
+	if f.onRenewCordon != nil {
+		f.onRenewCordon()
+	}
+	if f.renewCordonErr != nil {
+		return f.renewCordonErr
+	}
+	if !expected.Equal(f.cordonAt) {
+		return repository.ErrSandboxConfigDeleteOwnerLost
+	}
+	f.cordonAt = renewed
+	return nil
 }
 
 func (f *fakeConfigRepo) SoftDeleteCordoned(
@@ -1589,6 +1607,27 @@ func TestDeleteReleasesSkillSnapshotsBeforeSoftDelete(t *testing.T) {
 	require.Equal(t, []string{"7:cfg-a"}, fx.skills.envVarsClearedFor)
 }
 
+func TestDeleteOwnerLossStopsAllLaterDestructiveStages(t *testing.T) {
+	fx := newSnapshotReleaseFixture(t, nil)
+	renewals := 0
+	fx.repo.onRenewCordon = func() {
+		renewals++
+		if renewals == 2 {
+			fx.repo.renewCordonErr = repository.ErrSandboxConfigDeleteOwnerLost
+		}
+	}
+
+	err := fx.svc.Delete(context.Background(), 7, "cfg-a", false)
+	require.ErrorIs(t, err, repository.ErrSandboxConfigDeleteOwnerLost)
+	require.Equal(t, []string{"snap-1"}, fx.events,
+		"owner loss before the snapshot ledger write must stop every later provider deletion")
+	require.NotContains(t, fx.skills.marks, "row-1:"+types.SkillSnapshotStateDeleted)
+	require.Len(t, fx.skills.skills, 1, "skill metadata must remain after owner loss")
+	require.Empty(t, fx.files.deleted, "bundle deletion must not start after owner loss")
+	require.False(t, fx.skills.ledgerCleared)
+	require.Empty(t, fx.skills.envVarsClearedFor)
+}
+
 func TestDeleteSkillMetadataFailureDoesNotDeleteBundle(t *testing.T) {
 	fx := newSnapshotReleaseFixture(t, nil)
 	fx.skills.deleteSkillErr = stderrors.New("database unavailable")
@@ -1616,8 +1655,14 @@ func TestDeleteSkillBundleFinalizesOnFreshContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	fx.files.afterDelete = cancel
 	fx.skills.skills = nil // the DB row was already deleted before physical cleanup
+	cordonAt := fx.svc.now().UTC().Truncate(time.Microsecond)
+	require.NoError(t, fx.repo.SetCordon(context.Background(), 7, "cfg-a", cordonAt))
+	lease := &sandboxDeleteCordon{
+		service: fx.svc, tenantID: 7, configID: "cfg-a", token: cordonAt,
+	}
 
-	fx.svc.deleteSkillBundleBestEffort(ctx, 7, "bundle://skill-a.zip")
+	require.NoError(t, fx.svc.deleteSkillBundleBestEffort(
+		ctx, 7, "bundle://skill-a.zip", lease))
 	require.Error(t, ctx.Err(), "the file operation must expire the request context")
 	require.NoError(t, fx.skills.completeCtxErr,
 		"claim completion must use an independent finalization context")
@@ -1626,9 +1671,17 @@ func TestDeleteSkillBundleFinalizesOnFreshContext(t *testing.T) {
 func TestDeleteSkillBundleReleaseUsesFreshContextAfterResolveFailure(t *testing.T) {
 	fx := newSnapshotReleaseFixture(t, nil)
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	cordonAt := fx.svc.now().UTC().Truncate(time.Microsecond)
+	require.NoError(t, fx.repo.SetCordon(context.Background(), 7, "cfg-a", cordonAt))
+	lease := &sandboxDeleteCordon{
+		service: fx.svc, tenantID: 7, configID: "cfg-a", token: cordonAt,
+	}
+	fx.skills.skills = nil
+	fx.files.onResolve = cancel
+	fx.files.resolveErr = stderrors.New("storage unavailable")
 
-	fx.svc.deleteSkillBundleBestEffort(ctx, 7, "bundle://skill-a.zip")
+	require.NoError(t, fx.svc.deleteSkillBundleBestEffort(
+		ctx, 7, "bundle://skill-a.zip", lease))
 	require.NoError(t, fx.skills.releaseCtxErr,
 		"claim release must not reuse the cancelled storage context")
 	require.Empty(t, fx.skills.bundleClaims)
@@ -2039,6 +2092,8 @@ func (s *deleteSkillStore) DeleteUserEnvVarsByConfig(
 type deleteBundleResolver struct {
 	deleted     []string
 	afterDelete func()
+	onResolve   func()
+	resolveErr  error
 }
 
 func (r *deleteBundleResolver) ResolveFileService(
@@ -2046,6 +2101,12 @@ func (r *deleteBundleResolver) ResolveFileService(
 ) (interfaces.FileService, string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
+	}
+	if r.onResolve != nil {
+		r.onResolve()
+	}
+	if r.resolveErr != nil {
+		return nil, "", r.resolveErr
 	}
 	return deleteFileService{r: r}, "", nil
 }

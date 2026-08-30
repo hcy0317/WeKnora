@@ -28,6 +28,9 @@ type TenantSandboxConfigRepository interface {
 	SoftDelete(ctx context.Context, tenantID uint64, id string) error
 	SoftDeleteCordoned(ctx context.Context, tenantID uint64, id string, cordonedAt time.Time) error
 	SetCordon(ctx context.Context, tenantID uint64, id string, at time.Time) error
+	RenewCordonIfMatch(
+		ctx context.Context, tenantID uint64, id string, expected, renewed time.Time,
+	) error
 	ClearCordon(ctx context.Context, tenantID uint64, id string) error
 	ClearCordonIfMatch(ctx context.Context, tenantID uint64, id string, cordonedAt time.Time) error
 }
@@ -181,6 +184,22 @@ func (r *tenantSandboxConfigRepository) SetCordon(
 	}
 	if result.RowsAffected == 0 {
 		return ErrSandboxConfigCordoned
+	}
+	return nil
+}
+
+func (r *tenantSandboxConfigRepository) RenewCordonIfMatch(
+	ctx context.Context, tenantID uint64, id string, expected, renewed time.Time,
+) error {
+	result := r.db.WithContext(ctx).
+		Model(&types.TenantSandboxConfigEntity{}).
+		Where("tenant_id = ? AND id = ? AND cordoned_at = ?", tenantID, id, expected).
+		Update("cordoned_at", renewed)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrSandboxConfigDeleteOwnerLost
 	}
 	return nil
 }
