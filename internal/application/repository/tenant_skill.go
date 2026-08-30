@@ -113,7 +113,10 @@ type TenantSkillRepository interface {
 
 type tenantSkillRepository struct{ db *gorm.DB }
 
+// ErrSkillBundleRefBusy means another writer or deleter owns this bundle reference.
 var ErrSkillBundleRefBusy = errors.New("skill bundle reference is owned by another operation")
+
+// ErrSkillBundleClaimRequired rejects bundle reference changes that bypass the claim protocol.
 var ErrSkillBundleClaimRequired = errors.New("skill bundle reference changes require a bundle claim")
 
 type skillBundleRefClaim struct {

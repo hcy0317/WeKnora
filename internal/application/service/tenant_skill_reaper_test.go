@@ -867,19 +867,23 @@ func (r *reaperSkillStore) UpdateSkill(_ context.Context, e *types.TenantSkillEn
 func (r *reaperSkillStore) ClaimSkillBundleWrite(context.Context, uint64, string, string) error {
 	panic("ClaimSkillBundleWrite is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) CreateSkillWithBundleClaim(
 	context.Context, *types.TenantSkillEntity, string,
 ) error {
 	panic("CreateSkillWithBundleClaim is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) UpdateSkillWithBundleClaim(
 	context.Context, *types.TenantSkillEntity, string,
 ) error {
 	panic("UpdateSkillWithBundleClaim is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) ReleaseSkillBundleWrite(context.Context, uint64, string, string) error {
 	panic("ReleaseSkillBundleWrite is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) ClaimUnreferencedSkillBundleDelete(
 	context.Context, uint64, string, string, bool,
 ) (bool, error) {

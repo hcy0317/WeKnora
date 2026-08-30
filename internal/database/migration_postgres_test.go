@@ -104,8 +104,9 @@ func TestPostgresMigration80To99AndIdempotentSQL(t *testing.T) {
 	assert.Equal(t, uint(99), version)
 	assert.False(t, dirty)
 	var bundleClaimTables int
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM information_schema.tables
-		WHERE table_schema = current_schema() AND table_name = 'tenant_skill_bundle_ref_claims'`).Scan(&bundleClaimTables))
+	bundleClaimRow := db.QueryRow(`SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = current_schema() AND table_name = 'tenant_skill_bundle_ref_claims'`)
+	require.NoError(t, bundleClaimRow.Scan(&bundleClaimTables))
 	assert.Equal(t, 1, bundleClaimTables)
 	var definition string
 	require.NoError(t, db.QueryRow(`SELECT indexdef FROM pg_indexes
