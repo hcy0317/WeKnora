@@ -157,6 +157,7 @@ import { useKnowledgeBaseCreationNavigation } from '@/hooks/useKnowledgeBaseCrea
 import { useChatStreamHandler } from '@/composables/useChatStreamHandler';
 import { useStickyBottomOnResize } from '@/composables/useStickyBottomOnResize';
 import { clearCitationChunkCache } from '@/utils/citationChunkCache';
+import { disposeArtifactBlobURLsForSession } from '@/utils/sandboxArtifactRefs';
 import ChatReferencesDrawer from '@/components/ChatReferencesDrawer.vue';
 import ChatAttachmentPreviewDrawer from '@/components/ChatAttachmentPreviewDrawer.vue';
 import FollowUpSuggestions from '@/components/chat/FollowUpSuggestions.vue';
@@ -1041,6 +1042,7 @@ onMounted(async () => {
     }
 })
 const clearData = () => {
+    if (session_id.value) disposeArtifactBlobURLsForSession(session_id.value);
     stopStream();
     referencesDrawer.close();
     isReplying.value = false;

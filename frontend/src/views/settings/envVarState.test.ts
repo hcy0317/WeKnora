@@ -110,12 +110,16 @@ test('isValidEnvName accepts UPPER_SNAKE_CASE names', () => {
   assert.equal(isValidEnvName('K'), true)
   assert.equal(isValidEnvName('_LEADING'), true)
   assert.equal(isValidEnvName('A1_B2'), true)
+  assert.equal(isValidEnvName('WEKNORA_API_KEY'), true)
+  assert.equal(isValidEnvName('WEKNORA_BASE_URL'), true)
 })
 
 test('isValidEnvName rejects what the server rejects', () => {
   assert.equal(isValidEnvName('PATH'), false)
   assert.equal(isValidEnvName('LD_PRELOAD'), false)
-  assert.equal(isValidEnvName('WEKNORA_ANYTHING'), false)
+  assert.equal(isValidEnvName('WEKNORA_SKILL_ANYTHING'), false)
+  assert.equal(isValidEnvName('WEKNORA_SESSION_INPUT_DIR'), false)
+  assert.equal(isValidEnvName('NODE_PATH'), false)
   assert.equal(isValidEnvName('my_key'), false)
   assert.equal(isValidEnvName('MY KEY'), false)
   assert.equal(isValidEnvName(''), false)
@@ -130,11 +134,16 @@ test('RESERVED_ENV_NAMES mirrors the sandbox reserved list', () => {
     'LD_LIBRARY_PATH',
     'LD_PRELOAD',
     'NODE_OPTIONS',
+    'NODE_PATH',
     'PATH',
     'PYTHONHOME',
     'PYTHONPATH',
     'SHELL',
     'USER',
+    'WEKNORA_SESSION_INPUT_DIR',
+    'WEKNORA_SKILL_DIR',
+    'WEKNORA_SKILL_HISTORY_ROOT',
+    'WEKNORA_SKILL_OUTPUT_DIR',
   ])
 })
 

@@ -27,7 +27,7 @@ export interface SkillCatalogItem {
   bundle_sha256?: string;
   created_at: string;
   updated_at: string;
-  installations: SkillCatalogInstall[];
+  installations?: SkillCatalogInstall[];
 }
 
 export interface SkillCatalogRegisterResult {

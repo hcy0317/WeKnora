@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  ArtifactBlobURLCache,
   isArtifactRefHref,
   normalizeSandboxArtifactRefs,
   renderArtifactReference,
@@ -188,4 +189,40 @@ test('artifact names are HTML-escaped', () => {
   })
   assert.ok(!html?.includes('<img src=x'))
   assert.ok(html?.includes('&lt;img'))
+})
+
+test('artifact blob cache is LRU-bounded and revokes evicted URLs', () => {
+  const revoked: string[] = []
+  const cache = new ArtifactBlobURLCache(2, (url) => revoked.push(url))
+  const ctx = { sessionId: 'session-a', messageId: 'message-a' }
+
+  cache.set(ctx, 0, 'blob:first')
+  cache.set(ctx, 1, 'blob:second')
+  assert.equal(cache.get(ctx, 0), 'blob:first')
+  cache.set(ctx, 2, 'blob:third')
+
+  assert.equal(cache.size, 2)
+  assert.equal(cache.get(ctx, 1), undefined)
+  assert.deepEqual(revoked, ['blob:second'])
+})
+
+test('artifact blob cache disposes one message or a whole session', () => {
+  const revoked: string[] = []
+  const cache = new ArtifactBlobURLCache(10, (url) => revoked.push(url))
+  const firstMessage = { sessionId: 'session-a', messageId: 'message-a' }
+  const secondMessage = { sessionId: 'session-a', messageId: 'message-b' }
+  const otherSession = { sessionId: 'session-b', messageId: 'message-a' }
+
+  cache.set(firstMessage, 0, 'blob:first-message')
+  cache.set(secondMessage, 0, 'blob:second-message')
+  cache.set(otherSession, 0, 'blob:other-session')
+
+  cache.disposeMessage(firstMessage)
+  assert.equal(cache.get(firstMessage, 0), undefined)
+  assert.equal(cache.get(secondMessage, 0), 'blob:second-message')
+
+  cache.disposeSession('session-a')
+  assert.equal(cache.get(secondMessage, 0), undefined)
+  assert.equal(cache.get(otherSession, 0), 'blob:other-session')
+  assert.deepEqual(revoked, ['blob:first-message', 'blob:second-message'])
 })

@@ -122,10 +122,15 @@ export const RESERVED_ENV_NAMES: Set<string> = new Set([
   'PYTHONPATH',
   'PYTHONHOME',
   'NODE_OPTIONS',
+  'NODE_PATH',
+  'WEKNORA_SKILL_OUTPUT_DIR',
+  'WEKNORA_SESSION_INPUT_DIR',
+  'WEKNORA_SKILL_HISTORY_ROOT',
+  'WEKNORA_SKILL_DIR',
 ])
 
-/** The sandbox hands the skill its artifact directory through this prefix. */
-const RESERVED_ENV_PREFIX = 'WEKNORA_'
+/** Future sandbox-injected skill paths are reserved without blocking credentials. */
+const RESERVED_ENV_PREFIX = 'WEKNORA_SKILL_'
 
 /** Mirrors `envNamePattern` server-side: UPPER_SNAKE_CASE, at most 128 chars. */
 const ENV_NAME_PATTERN = /^[A-Z_][A-Z0-9_]{0,127}$/

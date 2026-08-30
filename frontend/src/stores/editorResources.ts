@@ -15,6 +15,7 @@ import { listMCPServices, type MCPService } from '@/api/mcp-service'
 import { listSkillCatalog, listSkills, type SkillCatalogItem, type SkillInfo } from '@/api/skill'
 import { getAgentTypePresets, getPlaceholders, type AgentTypePreset, type PlaceholdersResponse } from '@/api/agent'
 import { getTenantRetrievalConfig } from '@/api/retrieval'
+import { createLatestKeyedRequestCoordinator } from './editorResourcesCoordinator'
 
 const CACHE_TTL_MS = 60_000
 
@@ -70,6 +71,27 @@ export const useEditorResourcesStore = defineStore('editorResources', () => {
   const loadedAt = ref<Partial<Record<EditorResourceKey, number>>>({})
   const inflight = new Map<EditorResourceKey, Promise<void>>()
 
+  const skillsCoordinator = createLatestKeyedRequestCoordinator(
+    async (configId: string) => {
+      if (!configId) return { available: false, skills: [] as SkillInfo[] }
+      try {
+        const response = await listSkills(configId)
+        return {
+          available: response.skills_available !== false,
+          skills: response.data && response.data.length > 0 ? response.data : [],
+        }
+      } catch {
+        return { available: false, skills: [] as SkillInfo[] }
+      }
+    },
+    (configId, result) => {
+      if (configId !== skillsConfigId.value) return
+      skillsAvailable.value = result.available
+      skills.value = result.skills
+      loadedAt.value.skills = Date.now()
+    },
+  )
+
   function isFresh(key: EditorResourceKey): boolean {
     const at = loadedAt.value[key]
     return !!at && Date.now() - at < CACHE_TTL_MS
@@ -115,27 +137,15 @@ export const useEditorResourcesStore = defineStore('editorResources', () => {
 
   async function ensureSkills(sandboxConfigId?: string, force = false): Promise<void> {
     const configId = sandboxConfigId?.trim() || ''
-    if (configId !== skillsConfigId.value) {
-      force = true
-    }
-    return runOnce('skills', force, async () => {
+    const configChanged = configId !== skillsConfigId.value
+    if (!force && !configChanged && isFresh('skills')) return
+    if (configChanged) {
       skillsConfigId.value = configId
-      if (!configId) {
-        skillsAvailable.value = false
-        skills.value = []
-        loadedAt.value.skills = Date.now()
-        return
-      }
-      try {
-        const skillsRes = await listSkills(configId)
-        skillsAvailable.value = skillsRes.skills_available !== false
-        skills.value = skillsRes.data && skillsRes.data.length > 0 ? skillsRes.data : []
-      } catch {
-        skillsAvailable.value = false
-        skills.value = []
-      }
-      loadedAt.value.skills = Date.now()
-    })
+      skillsAvailable.value = false
+      skills.value = []
+      delete loadedAt.value.skills
+    }
+    return skillsCoordinator.fetch(configId, force || configChanged)
   }
 
   async function ensureSkillCatalog(force = false): Promise<void> {
@@ -208,6 +218,7 @@ export const useEditorResourcesStore = defineStore('editorResources', () => {
 
   function invalidate(...keys: EditorResourceKey[]) {
     if (keys.length === 0) {
+      skillsCoordinator.invalidate()
       loadedAt.value = {}
       storageConfig.value = null
       storageStatus.value = []
@@ -229,6 +240,7 @@ export const useEditorResourcesStore = defineStore('editorResources', () => {
     keys.forEach((k) => {
       delete loadedAt.value[k]
       inflight.delete(k)
+      if (k === 'skills') skillsCoordinator.invalidate()
     })
   }
 
