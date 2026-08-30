@@ -889,9 +889,11 @@ func (r *reaperSkillStore) ClaimUnreferencedSkillBundleDelete(
 ) (bool, error) {
 	panic("ClaimUnreferencedSkillBundleDelete is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) CompleteSkillBundleDelete(context.Context, uint64, string, string) error {
 	panic("CompleteSkillBundleDelete is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) ReleaseSkillBundleDelete(context.Context, uint64, string, string) error {
 	panic("ReleaseSkillBundleDelete is outside the reaper surface")
 }
