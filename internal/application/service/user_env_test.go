@@ -65,6 +65,12 @@ func (r *userEnvConfigRepo) Update(context.Context, *types.TenantSandboxConfigEn
 	panic("Update is outside the user env surface")
 }
 
+func (r *userEnvConfigRepo) UpdateCordoned(
+	context.Context, *types.TenantSandboxConfigEntity, time.Time,
+) error {
+	panic("UpdateCordoned is outside the user env surface")
+}
+
 func (r *userEnvConfigRepo) SoftDelete(context.Context, uint64, string) error {
 	panic("SoftDelete is outside the user env surface")
 }

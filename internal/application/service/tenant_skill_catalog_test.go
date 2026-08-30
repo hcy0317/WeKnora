@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -118,6 +119,38 @@ func TestListCatalogViewerDoesNotExposeOperationalState(t *testing.T) {
 	require.Len(t, list, 1)
 	require.Empty(t, list[0].BundleSHA256)
 	require.Nil(t, list[0].Installations)
+}
+
+func TestListCatalogContributorCanSelectInstalledSkillWithoutOperationalSecrets(t *testing.T) {
+	repo := catalogTestRepo(t, "file:catalog-contributor?mode=memory&cache=shared")
+	ctx := context.WithValue(context.Background(), types.TenantRoleContextKey, types.TenantRoleContributor)
+	require.NoError(t, repo.CreateCatalog(ctx, &types.TenantSkillCatalogEntity{
+		ID: "cat-pdf", TenantID: 7, Name: "pdf", BundleSHA256: strings.Repeat("a", 64),
+	}))
+	require.NoError(t, repo.CreateSkill(ctx, &types.TenantSkillEntity{
+		ID: "sk-1", TenantID: 7, SandboxConfigID: "cfg-a", CatalogID: "cat-pdf",
+		Name: "pdf", Status: types.SkillStatusReady, Error: "private provider detail",
+		BundleSHA256: strings.Repeat("b", 64), Enabled: true,
+	}))
+
+	svc := NewTenantSkillService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	list, err := svc.ListCatalog(ctx, 7)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.Empty(t, list[0].BundleSHA256)
+	require.Len(t, list[0].Installations, 1)
+	install := list[0].Installations[0]
+	require.Equal(t, "cfg-a", install.SandboxConfigID)
+	require.Equal(t, types.SkillStatusReady, install.Status)
+	require.True(t, install.Enabled)
+	require.Empty(t, install.SkillID)
+	require.Empty(t, install.Error)
+	require.Empty(t, install.BundleSHA256)
+	encoded, err := json.Marshal(list[0])
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "bundle_sha256")
+	require.NotContains(t, string(encoded), "skill_id")
+	require.NotContains(t, string(encoded), "private provider detail")
 }
 
 func TestDeleteCatalogRefusesWhileARemovalIsInFlight(t *testing.T) {

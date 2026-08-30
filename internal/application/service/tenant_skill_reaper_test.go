@@ -133,6 +133,54 @@ func TestReapStuckRunsPreservesSharedBundleWhenCatalogBackfillUnavailable(t *tes
 		"reaper must retain the shared object until catalog backfill succeeds")
 }
 
+func TestReapStuckRunsBackfillsCatalogFromMatchingVersion(t *testing.T) {
+	fx := newReaperFixture(t)
+	archiveStore := &installFixture{returnNamedBundleRefs: true}
+	fx.svc.resolver = &installStorageResolver{fx: archiveStore}
+	staleSince := fx.now.Add(-skillInstallStuckTTL - time.Minute)
+	oldArchive := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
+	newArchive := zipBundle(t, map[string]string{
+		"SKILL.md": validSkillMD, "scripts/v2.py": "print('v2')\n",
+	})
+	oldSHA := skillArchiveSHA256(oldArchive)
+	newSHA := skillArchiveSHA256(newArchive)
+	oldRef := "file://old.zip"
+	newRef := "file://new.zip"
+	archiveStore.storedBundles = map[string][]byte{oldRef: oldArchive, newRef: newArchive}
+	fx.skills.catalogs = map[string]*types.TenantSkillCatalogEntity{
+		"cat-1": {
+			ID: "cat-1", TenantID: 7, Name: "pdf", Version: "2.0.0", BundleSHA256: newSHA,
+		},
+	}
+	fx.skills.put(&types.TenantSkillEntity{
+		ID: "sk-old", TenantID: 7, SandboxConfigID: "cfg-1", CatalogID: "cat-1",
+		Name: "pdf", Version: "1.0.0", Status: types.SkillStatusRemoving,
+		InstalledSnapshotID: "snap-old", BundleRef: oldRef, BundleSHA256: oldSHA,
+		InstallingSince: &staleSince,
+	})
+	fx.skills.put(&types.TenantSkillEntity{
+		ID: "sk-new", TenantID: 7, SandboxConfigID: "cfg-2", CatalogID: "cat-1",
+		Name: "pdf", Version: "2.0.0", Status: types.SkillStatusReady,
+		BundleRef: newRef, BundleSHA256: newSHA,
+	})
+	fx.installed("sk-old", "snap-old", "")
+	fx.removed("sk-old", "snap-new", "snap-old")
+	fx.live("snap-new")
+
+	n, err := fx.svc.ReapStuckRuns(context.Background())
+
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	require.Nil(t, fx.skills.rows["sk-old"])
+	require.NotNil(t, fx.skills.rows["sk-new"])
+	catalog := fx.skills.catalogs["cat-1"]
+	require.NotEmpty(t, catalog.BundleRef)
+	require.Equal(t, newSHA, catalog.BundleSHA256)
+	require.Equal(t, newArchive, archiveStore.storedBundles[catalog.BundleRef])
+	require.Contains(t, archiveStore.deletedBundles, oldRef)
+	require.NotContains(t, archiveStore.deletedBundles, newRef)
+}
+
 func TestReapStuckRunsDeletesAbandonedRemovalThatNeverReachedAnImage(t *testing.T) {
 	fx := newReaperFixture(t)
 	staleSince := fx.now.Add(-skillInstallStuckTTL - time.Minute)
@@ -907,8 +955,15 @@ func (r *reaperSkillStore) MarkSnapshotState(
 func (r *reaperSkillStore) DeleteSnapshotRowsByConfig(context.Context, uint64, string) error {
 	panic("DeleteSnapshotRowsByConfig is outside the reaper surface")
 }
-func (r *reaperSkillStore) ListSkillsByTenant(context.Context, uint64) ([]*types.TenantSkillEntity, error) {
-	panic("ListSkillsByTenant is outside the reaper surface")
+func (r *reaperSkillStore) ListSkillsByTenant(_ context.Context, tenantID uint64) ([]*types.TenantSkillEntity, error) {
+	var out []*types.TenantSkillEntity
+	for _, e := range r.rows {
+		if e != nil && e.TenantID == tenantID {
+			cp := *e
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
 }
 func (r *reaperSkillStore) ListUserEnvVars(
 	context.Context, uint64, types.Principal, string, string,
@@ -960,17 +1015,32 @@ func (r *reaperSkillStore) UpdateCatalog(context.Context, *types.TenantSkillCata
 }
 
 func (r *reaperSkillStore) SetCatalogBundleIfEmpty(
-	context.Context, uint64, string, string, string,
+	_ context.Context, tenantID uint64, catalogID, bundleRef, bundleSHA256 string,
 ) (bool, error) {
-	panic("SetCatalogBundleIfEmpty is outside the reaper surface")
+	row := r.catalogs[catalogID]
+	if row == nil || row.TenantID != tenantID || strings.TrimSpace(row.BundleRef) != "" {
+		return false, nil
+	}
+	row.BundleRef = bundleRef
+	row.BundleSHA256 = bundleSHA256
+	return true, nil
 }
 
 func (r *reaperSkillStore) DeleteCatalog(context.Context, uint64, string) error {
 	panic("DeleteCatalog is outside the reaper surface")
 }
 
-func (r *reaperSkillStore) ListSkillsByCatalog(context.Context, uint64, string) ([]*types.TenantSkillEntity, error) {
-	panic("ListSkillsByCatalog is outside the reaper surface")
+func (r *reaperSkillStore) ListSkillsByCatalog(
+	_ context.Context, tenantID uint64, catalogID string,
+) ([]*types.TenantSkillEntity, error) {
+	var out []*types.TenantSkillEntity
+	for _, e := range r.rows {
+		if e != nil && e.TenantID == tenantID && e.CatalogID == catalogID {
+			cp := *e
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
 }
 
 type reaperConfigStore struct {
@@ -1005,6 +1075,12 @@ func (r *reaperConfigStore) ListByTenant(context.Context, uint64) ([]*types.Tena
 
 func (r *reaperConfigStore) Update(context.Context, *types.TenantSandboxConfigEntity) error {
 	panic("Update is outside the reaper surface")
+}
+
+func (r *reaperConfigStore) UpdateCordoned(
+	context.Context, *types.TenantSandboxConfigEntity, time.Time,
+) error {
+	panic("UpdateCordoned is outside the reaper surface")
 }
 
 func (r *reaperConfigStore) SoftDelete(context.Context, uint64, string) error {

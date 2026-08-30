@@ -16,7 +16,7 @@ import (
 
 // SkillCatalogInstallView is one installation of a catalog skill onto a sandbox.
 type SkillCatalogInstallView struct {
-	SkillID           string    `json:"skill_id"`
+	SkillID           string    `json:"skill_id,omitempty"`
 	SandboxConfigID   string    `json:"sandbox_config_id"`
 	SandboxConfigName string    `json:"sandbox_config_name,omitempty"`
 	SandboxType       string    `json:"sandbox_type,omitempty"`
@@ -44,7 +44,7 @@ type SkillCatalogView struct {
 func (s *TenantSkillService) ListCatalog(
 	ctx context.Context, tenantID uint64,
 ) ([]SkillCatalogView, error) {
-	includeOperationalState := types.TenantRoleFromContext(ctx).HasPermission(types.TenantRoleAdmin)
+	role := types.TenantRoleFromContext(ctx)
 	catalogs, err := s.skills.ListCatalogsByTenant(ctx, tenantID)
 	if err != nil {
 		return nil, err
@@ -121,7 +121,24 @@ func (s *TenantSkillService) ListCatalog(
 		}
 		out = append(out, catalogView(synthetic, []*types.TenantSkillEntity{row}, configByID))
 	}
-	if !includeOperationalState {
+	switch {
+	case role.HasPermission(types.TenantRoleAdmin):
+		// Administrators need the complete operational record to diagnose and
+		// repair installs.
+	case role.HasPermission(types.TenantRoleContributor):
+		// Contributors can author agents. AgentEditor needs per-sandbox status
+		// and enabled state to decide which catalog skills are selectable, but
+		// neither the bundle digest nor provider failures belong in that read
+		// surface.
+		for i := range out {
+			out[i].BundleSHA256 = ""
+			for j := range out[i].Installations {
+				out[i].Installations[j].SkillID = ""
+				out[i].Installations[j].Error = ""
+				out[i].Installations[j].BundleSHA256 = ""
+			}
+		}
+	default:
 		for i := range out {
 			out[i].BundleSHA256 = ""
 			out[i].Installations = nil
@@ -506,6 +523,9 @@ func (s *TenantSkillService) catalogBundleArchive(
 	}
 	tryRow := func(row *types.TenantSkillEntity) ([]byte, bool) {
 		if row == nil || strings.TrimSpace(row.BundleRef) == "" {
+			return nil, false
+		}
+		if wantSHA != "" && !strings.EqualFold(strings.TrimSpace(row.BundleSHA256), wantSHA) {
 			return nil, false
 		}
 		archive, err := s.downloadSkillBundle(ctx, tenantID, row)

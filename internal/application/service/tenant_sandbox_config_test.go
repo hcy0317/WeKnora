@@ -272,6 +272,15 @@ func (f *fakeConfigRepo) Update(
 	return nil
 }
 
+func (f *fakeConfigRepo) UpdateCordoned(
+	ctx context.Context, e *types.TenantSandboxConfigEntity, cordonedAt time.Time,
+) error {
+	if !cordonedAt.Equal(f.cordonAt) {
+		return repository.ErrSandboxConfigCordoned
+	}
+	return f.Update(ctx, e)
+}
+
 func (f *fakeConfigRepo) SoftDelete(_ context.Context, _ uint64, id string) error {
 	f.events = append(f.events, "delete")
 	if f.policy != nil && f.policy.ID == id {

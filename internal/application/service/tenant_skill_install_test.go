@@ -539,6 +539,13 @@ func TestFailSkillDoesNotStampANewerBundle(t *testing.T) {
 
 func TestInstallSkillRecoversFromNameConflict(t *testing.T) {
 	fx := newInstallFixture(t)
+	fx.returnNamedBundleRefs = true
+	oldRef := "file://tenant-skills/sk-1/old-conflict.zip"
+	skill, err := fx.skillRepo.GetSkill(context.Background(), 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	skill.BundleRef = oldRef
+	skill.BundleSHA256 = strings.Repeat("b", 64)
+	require.NoError(t, fx.skillRepo.UpdateSkill(context.Background(), skill))
 	fx.skillRepo.getByNameMisses = 1
 	fx.skillRepo.createErr = errors.New("UNIQUE constraint failed: tenant_skills.sandbox_config_id")
 	archive := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
@@ -551,6 +558,8 @@ func TestInstallSkillRecoversFromNameConflict(t *testing.T) {
 	skill, getErr := fx.skillRepo.GetSkill(context.Background(), 7, "cfg-1", "sk-1")
 	require.NoError(t, getErr)
 	require.Equal(t, types.SkillStatusInstalling, skill.Status)
+	require.Contains(t, fx.deletedBundles, oldRef,
+		"the unique-index winner's replaced archive must be reclaimed too")
 }
 
 func TestInstallSkillRefusesWhenBundleCannotBeStored(t *testing.T) {
@@ -567,6 +576,78 @@ func TestInstallSkillRefusesWhenBundleCannotBeStored(t *testing.T) {
 	require.Equal(t, types.SkillStatusInstalling, skill.Status,
 		"storage failure must not claim or rewrite the pre-existing row")
 	require.NotContains(t, fx.events, "create-session")
+}
+
+func TestInstallSkillUpgradeDeletesSupersededUnreferencedArchive(t *testing.T) {
+	fx := newInstallFixture(t)
+	fx.returnNamedBundleRefs = true
+	ctx := context.Background()
+	oldRef := "file://tenant-skills/sk-1/old.zip"
+	skill, err := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	skill.BundleRef = oldRef
+	skill.BundleSHA256 = strings.Repeat("b", 64)
+	require.NoError(t, fx.skillRepo.UpdateSkill(ctx, skill))
+	archive := zipBundle(t, map[string]string{
+		"SKILL.md": validSkillMD, "scripts/new.py": "print('upgrade')\n",
+	})
+
+	_, err = fx.svc.InstallSkill(ctx, 7, "cfg-1", archive)
+	require.NoError(t, err)
+	require.Contains(t, fx.deletedBundles, oldRef)
+	updated, err := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	require.NotEqual(t, oldRef, updated.BundleRef)
+}
+
+func TestInstallSkillUpgradeRetainsSharedOrCatalogOwnedArchive(t *testing.T) {
+	fx := newInstallFixture(t)
+	fx.returnNamedBundleRefs = true
+	ctx := context.Background()
+	sharedRef := "file://tenant-skills/shared/old.zip"
+	skill, err := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	skill.BundleRef = sharedRef
+	skill.BundleSHA256 = strings.Repeat("b", 64)
+	require.NoError(t, fx.skillRepo.UpdateSkill(ctx, skill))
+	require.NoError(t, fx.skillRepo.CreateCatalog(ctx, &types.TenantSkillCatalogEntity{
+		ID: "cat-shared", TenantID: 7, Name: "another-skill", BundleRef: sharedRef,
+	}))
+	archive := zipBundle(t, map[string]string{
+		"SKILL.md": validSkillMD, "scripts/new.py": "print('upgrade')\n",
+	})
+
+	_, err = fx.svc.InstallSkill(ctx, 7, "cfg-1", archive)
+	require.NoError(t, err)
+	require.NotContains(t, fx.deletedBundles, sharedRef)
+}
+
+func TestInstallSkillUpgradeFailureDeletesOnlyNewUnreferencedArchive(t *testing.T) {
+	fx := newInstallFixture(t)
+	fx.returnNamedBundleRefs = true
+	ctx := context.Background()
+	oldRef := "file://tenant-skills/sk-1/old.zip"
+	skill, err := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	skill.BundleRef = oldRef
+	skill.BundleSHA256 = strings.Repeat("b", 64)
+	require.NoError(t, fx.skillRepo.UpdateSkill(ctx, skill))
+	archive := zipBundle(t, map[string]string{
+		"SKILL.md": validSkillMD, "scripts/new.py": "print('upgrade')\n",
+	})
+	newSHA := skillArchiveSHA256(archive)
+	newRef := "file://tenant-skills/sk-1/" + newSHA + ".zip"
+	fx.skillRepo.updateFailsWhen = func(row *types.TenantSkillEntity) bool {
+		return row.ID == "sk-1" && row.BundleSHA256 == newSHA
+	}
+
+	_, err = fx.svc.InstallSkill(ctx, 7, "cfg-1", archive)
+	require.ErrorIs(t, err, errUpdateBoom)
+	require.Contains(t, fx.deletedBundles, newRef)
+	require.NotContains(t, fx.deletedBundles, oldRef)
+	stored, getErr := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
+	require.NoError(t, getErr)
+	require.Equal(t, oldRef, stored.BundleRef)
 }
 
 func TestSaveBundlePathIsQualifiedByOwningSHA(t *testing.T) {
@@ -1893,6 +1974,12 @@ func (r *installConfigRepo) Update(ctx context.Context, e *types.TenantSandboxCo
 	r.saved = &cp
 	r.entity = &cp
 	return nil
+}
+
+func (r *installConfigRepo) UpdateCordoned(
+	ctx context.Context, e *types.TenantSandboxConfigEntity, _ time.Time,
+) error {
+	return r.Update(ctx, e)
 }
 
 func (r *installConfigRepo) SoftDelete(context.Context, uint64, string) error { return nil }

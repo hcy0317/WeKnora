@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  ArtifactBlobRequestCoordinator,
   ArtifactBlobURLCache,
   isArtifactRefHref,
   normalizeSandboxArtifactRefs,
@@ -225,4 +226,48 @@ test('artifact blob cache disposes one message or a whole session', () => {
   assert.equal(cache.get(secondMessage, 0), undefined)
   assert.equal(cache.get(otherSession, 0), 'blob:other-session')
   assert.deepEqual(revoked, ['blob:first-message', 'blob:second-message'])
+})
+
+test('artifact blob request disposal detaches only the obsolete generation', async () => {
+  const coordinator = new ArtifactBlobRequestCoordinator<string>()
+  const accepted: string[] = []
+  const discarded: string[] = []
+  let resolveFirst!: (value: string) => void
+  let resolveSecond!: (value: string) => void
+  const firstValue = new Promise<string>((resolve) => { resolveFirst = resolve })
+  const secondValue = new Promise<string>((resolve) => { resolveSecond = resolve })
+  const key = 'session-a\u0000message-a\u00000'
+
+  const first = coordinator.load(
+    key,
+    () => firstValue,
+    (value) => accepted.push(value),
+    (value) => discarded.push(value),
+  )
+  coordinator.detachMatching((candidate) => candidate.startsWith('session-a\u0000message-a\u0000'))
+  const second = coordinator.load(
+    key,
+    () => secondValue,
+    (value) => accepted.push(value),
+    (value) => discarded.push(value),
+  )
+
+  resolveFirst('blob:obsolete')
+  assert.equal(await first, null)
+  assert.deepEqual(discarded, ['blob:obsolete'])
+
+  // The obsolete request's finally block must not remove the remounted
+  // generation: a concurrent consumer still shares the second promise.
+  const sharedSecond = coordinator.load(
+    key,
+    async () => 'blob:unexpected-third',
+    (value) => accepted.push(value),
+    (value) => discarded.push(value),
+  )
+  assert.equal(sharedSecond, second)
+
+  resolveSecond('blob:current')
+  assert.equal(await second, 'blob:current')
+  assert.deepEqual(accepted, ['blob:current'])
+  assert.deepEqual(discarded, ['blob:obsolete'])
 })

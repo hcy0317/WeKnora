@@ -24,6 +24,7 @@ type TenantSandboxConfigRepository interface {
 	// every workspace. Do not use it on a request path.
 	ListAll(ctx context.Context) ([]*types.TenantSandboxConfigEntity, error)
 	Update(ctx context.Context, e *types.TenantSandboxConfigEntity) error
+	UpdateCordoned(ctx context.Context, e *types.TenantSandboxConfigEntity, cordonedAt time.Time) error
 	SoftDelete(ctx context.Context, tenantID uint64, id string) error
 	SoftDeleteCordoned(ctx context.Context, tenantID uint64, id string, cordonedAt time.Time) error
 	SetCordon(ctx context.Context, tenantID uint64, id string, at time.Time) error
@@ -96,9 +97,9 @@ func (r *tenantSandboxConfigRepository) ListAll(
 func (r *tenantSandboxConfigRepository) Update(
 	ctx context.Context, e *types.TenantSandboxConfigEntity,
 ) error {
-	return r.db.WithContext(ctx).
+	result := r.db.WithContext(ctx).
 		Model(&types.TenantSandboxConfigEntity{}).
-		Where("tenant_id = ? AND id = ?", e.TenantID, e.ID).
+		Where("tenant_id = ? AND id = ? AND cordoned_at IS NULL", e.TenantID, e.ID).
 		Select("name", "description", "sandbox_type", "config", "updated_at").
 		Updates(map[string]any{
 			"name":         e.Name,
@@ -106,7 +107,40 @@ func (r *tenantSandboxConfigRepository) Update(
 			"sandbox_type": e.SandboxType,
 			"config":       e.Config,
 			"updated_at":   time.Now(),
-		}).Error
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrSandboxConfigCordoned
+	}
+	return nil
+}
+
+// UpdateCordoned writes a config only while the caller still owns the exact
+// cordon acquired before provider inventory. Keeping the token in the WHERE
+// clause makes a stale updater harmless after lease expiry and takeover.
+func (r *tenantSandboxConfigRepository) UpdateCordoned(
+	ctx context.Context, e *types.TenantSandboxConfigEntity, cordonedAt time.Time,
+) error {
+	result := r.db.WithContext(ctx).
+		Model(&types.TenantSandboxConfigEntity{}).
+		Where("tenant_id = ? AND id = ? AND cordoned_at = ?", e.TenantID, e.ID, cordonedAt).
+		Select("name", "description", "sandbox_type", "config", "updated_at").
+		Updates(map[string]any{
+			"name":         e.Name,
+			"description":  e.Description,
+			"sandbox_type": e.SandboxType,
+			"config":       e.Config,
+			"updated_at":   time.Now(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrSandboxConfigCordoned
+	}
+	return nil
 }
 
 func (r *tenantSandboxConfigRepository) SoftDelete(

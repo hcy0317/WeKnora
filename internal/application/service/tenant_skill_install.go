@@ -112,10 +112,15 @@ func (s *TenantSkillService) InstallSkill(
 	}
 	now := s.now()
 	if existing != nil {
+		oldRef := strings.TrimSpace(existing.BundleRef)
 		takeSkillRowForInstall(existing, bundle, now, ref)
 		existing.CatalogID = catalogID
 		if err := s.skills.UpdateSkill(ctx, existing); err != nil {
+			s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, ref)
 			return "", err
+		}
+		if oldRef != "" && oldRef != strings.TrimSpace(ref) {
+			s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, oldRef)
 		}
 	} else {
 		if err := s.skills.CreateSkill(ctx, &types.TenantSkillEntity{
@@ -127,24 +132,30 @@ func (s *TenantSkillService) InstallSkill(
 			Status: types.SkillStatusInstalling, InstallingSince: &now,
 		}); err != nil {
 			if !isSkillNameConflict(err) {
-				s.deleteStoredBundleBestEffort(ctx, tenantID, ref)
+				s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, ref)
 				return "", err
 			}
 			// Two first-time uploads of the same name raced the unique index.
 			// Take the row that won rather than surfacing a 500.
 			winner, lookupErr := s.skills.GetSkillByName(ctx, tenantID, configID, bundle.Name)
 			if lookupErr != nil {
+				s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, ref)
 				return "", lookupErr
 			}
 			if winner == nil {
+				s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, ref)
 				return "", err
 			}
 			skillID = winner.ID
+			oldRef := strings.TrimSpace(winner.BundleRef)
 			takeSkillRowForInstall(winner, bundle, now, ref)
 			winner.CatalogID = catalogID
 			if err := s.skills.UpdateSkill(ctx, winner); err != nil {
-				s.deleteStoredBundleBestEffort(ctx, tenantID, ref)
+				s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, ref)
 				return "", err
+			}
+			if oldRef != "" && oldRef != strings.TrimSpace(ref) {
+				s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, oldRef)
 			}
 		}
 	}
@@ -166,6 +177,43 @@ func (s *TenantSkillService) InstallSkill(
 	}()
 
 	return skillID, nil
+}
+
+// deleteUnreferencedSkillBundleBestEffort removes an immutable installation
+// archive only after the database no longer points at it. Old deployments may
+// still contain refs shared by multiple installs or owned by the catalog, so
+// failure to prove exclusivity deliberately leaks bytes instead of breaking a
+// live install or reinstall source.
+func (s *TenantSkillService) deleteUnreferencedSkillBundleBestEffort(
+	ctx context.Context, tenantID uint64, ref string,
+) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), installCleanupTimeout)
+	defer cancel()
+	installed, err := s.skills.ListSkillsByTenant(cleanupCtx, tenantID)
+	if err != nil {
+		logger.Warnf(cleanupCtx, "[skill] retain bundle %s: cannot prove install ownership: %v", ref, err)
+		return
+	}
+	for _, row := range installed {
+		if row != nil && strings.TrimSpace(row.BundleRef) == ref {
+			return
+		}
+	}
+	catalogs, err := s.skills.ListCatalogsByTenant(cleanupCtx, tenantID)
+	if err != nil {
+		logger.Warnf(cleanupCtx, "[skill] retain bundle %s: cannot prove catalog ownership: %v", ref, err)
+		return
+	}
+	for _, row := range catalogs {
+		if row != nil && strings.TrimSpace(row.BundleRef) == ref {
+			return
+		}
+	}
+	s.deleteStoredBundleBestEffort(cleanupCtx, tenantID, ref)
 }
 
 // takeSkillRowForInstall hands an existing row to the run about to start.

@@ -156,3 +156,35 @@ func TestSandboxConfigRepoStaleDeleteCannotRemoveRowAfterCordonTakeover(t *testi
 	require.NoError(t, getErr)
 	require.NotNil(t, got)
 }
+
+func TestSandboxConfigRepoCordonFencesOrdinaryUpdateAndOwnedUpdateIsABASafe(t *testing.T) {
+	repo, _ := newSandboxConfigTestRepo(t)
+	ctx := context.Background()
+	require.NoError(t, repo.Create(ctx, &types.TenantSandboxConfigEntity{
+		ID: "cfg-a", TenantID: 1, Name: "prod", Description: "before", SandboxType: "e2b",
+		Config: &types.TenantSandboxConfig{SandboxType: "e2b"},
+	}))
+
+	deleteAt := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, repo.SetCordon(ctx, 1, "cfg-a", deleteAt))
+	row, err := repo.GetByID(ctx, 1, "cfg-a")
+	require.NoError(t, err)
+	row.Description = "ordinary update must not pass"
+	require.ErrorIs(t, repo.Update(ctx, row), ErrSandboxConfigCordoned)
+
+	stored, err := repo.GetByID(ctx, 1, "cfg-a")
+	require.NoError(t, err)
+	require.Equal(t, "before", stored.Description)
+
+	updateAt := deleteAt.Add(types.SandboxCordonLease + time.Second)
+	require.NoError(t, repo.SetCordon(ctx, 1, "cfg-a", updateAt))
+	row.Description = "stale owner must not pass"
+	require.ErrorIs(t, repo.UpdateCordoned(ctx, row, deleteAt), ErrSandboxConfigCordoned)
+	row.Description = "owned update"
+	require.NoError(t, repo.UpdateCordoned(ctx, row, updateAt))
+
+	stored, err = repo.GetByID(ctx, 1, "cfg-a")
+	require.NoError(t, err)
+	require.Equal(t, "owned update", stored.Description)
+	require.ErrorIs(t, repo.SoftDeleteCordoned(ctx, 1, "cfg-a", deleteAt), ErrSandboxConfigDeleteOwnerLost)
+}

@@ -1004,7 +1004,7 @@ func (s *TenantSandboxConfigService) Update(
 		}
 	}
 
-	updated, err := s.writeConfig(ctx, entity, in, merged)
+	updated, err := s.writeCordonedConfig(ctx, entity, in, merged, cordonedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -1365,6 +1365,27 @@ func (s *TenantSandboxConfigService) writeConfig(
 		entity.SandboxType = merged.SandboxType
 	}
 	if err := s.repo.Update(ctx, entity); err != nil {
+		return nil, err
+	}
+	return entity, nil
+}
+
+func (s *TenantSandboxConfigService) writeCordonedConfig(
+	ctx context.Context,
+	entity *types.TenantSandboxConfigEntity,
+	in UpdateSandboxConfigInput,
+	merged *types.TenantSandboxConfig,
+	cordonedAt time.Time,
+) (*types.TenantSandboxConfigEntity, error) {
+	if name := strings.TrimSpace(in.Name); name != "" {
+		entity.Name = name
+	}
+	entity.Description = in.Description
+	entity.Config = merged
+	if merged != nil {
+		entity.SandboxType = merged.SandboxType
+	}
+	if err := s.repo.UpdateCordoned(ctx, entity, cordonedAt); err != nil {
 		return nil, err
 	}
 	return entity, nil
