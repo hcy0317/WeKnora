@@ -101,4 +101,5 @@ jobs:
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
           working-directory: ${{ matrix.module }}
+          args: --new-from-rev=${{ github.event.pull_request.base.sha }}
           only-new-issues: true
