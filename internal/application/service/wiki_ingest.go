@@ -64,6 +64,36 @@ const (
 	// commit. Owner tokens and compare-delete release make expiry/reacquisition
 	// safe; a long LLM reduce cannot silently lose serialization after 5m.
 	wikiSlugLockTTL = WikiIngestTaskTimeout + wikiPagePersistTimeout + 5*time.Minute
+
+	// wikiIdentityClaimPrefix reserves the slug chosen for one normalized
+	// (page type, display title) identity while concurrent map phases are
+	// still running. The existing per-slug lock cannot help when two models
+	// emit different slugs for the same title, because those reducers lock
+	// different keys. A short-lived identity claim makes both batches use
+	// the same slug before summaries and page updates are materialized.
+	wikiIdentityClaimPrefix = "wiki:identity:"
+	wikiIdentityClaimTTL    = 2 * time.Hour
+	// wikiIdentityClaimScript atomically GET-or-SET (or overwrite when
+	// ARGV[3] is "1"). A valid existing slug wins and has its TTL refreshed.
+	// Missing or corrupt values are replaced so callers cannot diverge on a
+	// dirty key. KEYS[1]=claim key; ARGV = proposed slug, TTL seconds,
+	// authoritative ("0"/"1"), required slug prefix.
+	wikiIdentityClaimScript = `
+local proposed = ARGV[1]
+local ttl = tonumber(ARGV[2])
+local prefix = ARGV[4]
+if ARGV[3] == '1' then
+  redis.call('SET', KEYS[1], proposed, 'EX', ttl)
+  return proposed
+end
+local existing = redis.call('GET', KEYS[1])
+if type(existing) == 'string' and string.sub(existing, 1, #prefix) == prefix then
+  redis.call('EXPIRE', KEYS[1], ttl)
+  return existing
+end
+redis.call('SET', KEYS[1], proposed, 'EX', ttl)
+return proposed
+`
 	// wikiSlugLockWait / Poll bound how long a reduce goroutine blocks
 	// waiting for a contended slug before falling back to a best-effort
 	// skip (matching the pre-existing reduce-failure semantics).
@@ -1757,6 +1787,18 @@ type WikiBatchContext struct {
 	// pre-resolved ids and never races on folder creation. Read-only during
 	// reduce.
 	PlannedFolderID map[string]string
+
+	// identityClaims is the Lite-mode and Redis-error fallback for identity
+	// reservations. Map workers in one batch run concurrently even though Lite
+	// serializes batches, so they still need to converge before Reduce groups
+	// updates by slug. The map is batch-scoped and disappears with the batch.
+	identityClaims sync.Map
+
+	// identityPages memoizes exact title lookups for this batch so concurrent
+	// map workers probing the same (page type, normalized title) share one DB
+	// round-trip. Values are []*types.WikiPageLite, including empty slices
+	// for confirmed misses.
+	identityPages sync.Map
 }
 
 // SlugUpdate represents a single update operation for a specific slug
@@ -2824,10 +2866,6 @@ func xmlEscape(s string) string {
 }
 
 // deduplicateExtractedBatch deduplicates both entities and concepts against
-// existing wiki pages in a single LLM call. Uses pre-loaded allPages to avoid
-// redundant DB queries. This replaces the two separate deduplicateItems calls
-// that each queried ListAllPages + made a separate LLM call.
-// deduplicateExtractedBatch deduplicates both entities and concepts against
 // existing wiki pages in a single LLM call. Pre-filters candidates via the
 // pg_trgm trigram index on lower(title) — every new item issues a
 // FindSimilarPages probe and the union of top-K hits across all items is
@@ -2842,13 +2880,15 @@ func (s *wikiIngestService) deduplicateExtractedBatch(
 	chatModel chat.Chat,
 	kbID string,
 	entities, concepts []extractedItem,
+	batchCtx *WikiBatchContext,
 ) ([]extractedItem, []extractedItem) {
 	entities, concepts = compactExtractedItems(entities, concepts)
 	if len(entities) == 0 && len(concepts) == 0 {
 		return entities, concepts
 	}
 	if s.wikiService == nil {
-		return entities, concepts
+		return s.stabilizeExtractedIdentities(ctx, kbID, types.WikiPageTypeEntity, entities, nil, nil, batchCtx),
+			s.stabilizeExtractedIdentities(ctx, kbID, types.WikiPageTypeConcept, concepts, nil, nil, batchCtx)
 	}
 
 	// Build the candidate set: for each new item, ask the repo for
@@ -2904,34 +2944,54 @@ func (s *wikiIngestService) deduplicateExtractedBatch(
 	for _, c := range concepts {
 		probe(c)
 	}
+	s.attachExactIdentityPages(ctx, kbID, types.WikiPageTypeEntity, entities, candidatePages, itemCandidates, batchCtx)
+	s.attachExactIdentityPages(ctx, kbID, types.WikiPageTypeConcept, concepts, candidatePages, itemCandidates, batchCtx)
+
+	// Resolve exact same-type, same-title candidates deterministically before
+	// asking the model about semantic/alias variants. Besides avoiding an LLM
+	// call for the obvious case, this makes an already-materialized page
+	// authoritative for the identity reservation below.
+	exactTargets := make(map[string]string)
+	mergeTargets := make(map[string]string)
+	collectExactIdentityTargets(entities, types.WikiPageTypeEntity, itemCandidates, candidatePages, exactTargets)
+	collectExactIdentityTargets(concepts, types.WikiPageTypeConcept, itemCandidates, candidatePages, exactTargets)
+	// Preserve the fork's broader deterministic reuse contract for exact
+	// title/alias/compact-slug matches, including an existing page whose type
+	// differs from the model's fresh classification. Upstream same-type exact
+	// identities remain authoritative when both strategies find a target.
+	collectDeterministicTarget := func(item extractedItem, pageType string) {
+		if exactTargets[item.Slug] != "" {
+			return
+		}
+		if target := deterministicExistingMergeTarget(
+			item, pageType, itemCandidates[item.Slug], candidatePages,
+		); target != "" {
+			exactTargets[item.Slug] = target
+		}
+	}
+	for _, item := range entities {
+		collectDeterministicTarget(item, types.WikiPageTypeEntity)
+	}
+	for _, item := range concepts {
+		collectDeterministicTarget(item, types.WikiPageTypeConcept)
+	}
+
+	stabilize := func() ([]extractedItem, []extractedItem) {
+		return s.stabilizeExtractedIdentities(
+				ctx, kbID, types.WikiPageTypeEntity, entities, mergeTargets, exactTargets, batchCtx,
+			), s.stabilizeExtractedIdentities(
+				ctx, kbID, types.WikiPageTypeConcept, concepts, mergeTargets, exactTargets, batchCtx,
+			)
+	}
+
 	if len(candidatePages) == 0 {
-		// No similar existing pages — nothing to merge against. The
-		// items pass through unchanged.
+		// No similar existing pages — identity reservations still make
+		// concurrent batches converge before they materialize new pages.
 		logger.Infof(ctx, "wiki ingest: no similar existing pages found for %d new items", len(entities)+len(concepts))
-		return compactExtractedItems(entities, concepts)
+		return stabilize()
 	}
 	logger.Infof(ctx, "wiki ingest: %d similar existing pages selected for %d new items",
 		len(candidatePages), len(entities)+len(concepts))
-
-	// Exact identities do not need an LLM judgment. Resolve them first and
-	// exclude them from the fuzzy prompt. This both stabilizes canonical slug
-	// selection and ensures exact matches still merge when the dedup LLM is
-	// unavailable or emits malformed JSON.
-	deterministicMerges := make(map[string]string)
-	for _, item := range entities {
-		if target := deterministicExistingMergeTarget(
-			item, types.WikiPageTypeEntity, itemCandidates[item.Slug], candidatePages,
-		); target != "" {
-			deterministicMerges[item.Slug] = target
-		}
-	}
-	for _, item := range concepts {
-		if target := deterministicExistingMergeTarget(
-			item, types.WikiPageTypeConcept, itemCandidates[item.Slug], candidatePages,
-		); target != "" {
-			deterministicMerges[item.Slug] = target
-		}
-	}
 
 	// Group each new item with ONLY the existing pages that surfaced for
 	// its own similarity probe. Presenting the model two flat lists (all
@@ -2946,7 +3006,7 @@ func (s *wikiIngestService) deduplicateExtractedBatch(
 	var candBuf strings.Builder
 	groups := 0
 	renderGroup := func(item extractedItem, itemType string) {
-		if deterministicMerges[item.Slug] != "" {
+		if exactTargets[item.Slug] != "" {
 			return
 		}
 		cset := itemCandidates[item.Slug]
@@ -2981,21 +3041,27 @@ func (s *wikiIngestService) deduplicateExtractedBatch(
 	for _, item := range concepts {
 		renderGroup(item, "concept")
 	}
+	if groups == 0 {
+		// Every item was resolved exactly or has no safe semantic candidate.
+		return stabilize()
+	}
+
+	dedupeJSON, err := s.generateWithTemplate(ctx, chatModel, agent.WikiDeduplicationPrompt, map[string]string{
+		"Candidates": candBuf.String(),
+	})
+	if err != nil {
+		logger.Warnf(ctx, "wiki ingest: deduplication LLM call failed: %v", err)
+		return stabilize()
+	}
+
+	dedupeJSON = cleanLLMJSON(dedupeJSON)
+
 	var dedupeResult struct {
 		Merges map[string]string `json:"merges"`
 	}
-	if groups > 0 {
-		dedupeJSON, err := s.generateWithTemplate(ctx, chatModel, agent.WikiDeduplicationPrompt, map[string]string{
-			"Candidates": candBuf.String(),
-		})
-		if err != nil {
-			logger.Warnf(ctx, "wiki ingest: deduplication LLM call failed: %v", err)
-		} else {
-			dedupeJSON = cleanLLMJSON(dedupeJSON)
-			if err := json.Unmarshal([]byte(dedupeJSON), &dedupeResult); err != nil {
-				logger.Warnf(ctx, "wiki ingest: failed to parse dedup JSON: %v\nRaw: %s", err, dedupeJSON)
-			}
-		}
+	if err := json.Unmarshal([]byte(dedupeJSON), &dedupeResult); err != nil {
+		logger.Warnf(ctx, "wiki ingest: failed to parse dedup JSON: %v\nRaw: %s", err, dedupeJSON)
+		return stabilize()
 	}
 
 	validMerge := func(srcSlug, dstSlug string) bool {
@@ -3006,30 +3072,26 @@ func (s *wikiIngestService) deduplicateExtractedBatch(
 		return true
 	}
 
-	for i, item := range entities {
-		if existingSlug := deterministicMerges[item.Slug]; existingSlug != "" {
-			if existingSlug != item.Slug {
-				logger.Infof(ctx, "wiki ingest: deterministic dedup merge %s → %s", item.Slug, existingSlug)
-				entities[i].Slug = existingSlug
-			}
-		} else if existingSlug, ok := dedupeResult.Merges[item.Slug]; ok && validMerge(item.Slug, existingSlug) {
+	for _, item := range entities {
+		if exactTargets[item.Slug] != "" {
+			continue
+		}
+		if existingSlug, ok := dedupeResult.Merges[item.Slug]; ok && validMerge(item.Slug, existingSlug) {
 			logger.Infof(ctx, "wiki ingest: dedup merge %s → %s", item.Slug, existingSlug)
-			entities[i].Slug = existingSlug
+			mergeTargets[item.Slug] = existingSlug
 		}
 	}
-	for i, item := range concepts {
-		if existingSlug := deterministicMerges[item.Slug]; existingSlug != "" {
-			if existingSlug != item.Slug {
-				logger.Infof(ctx, "wiki ingest: deterministic dedup merge %s → %s", item.Slug, existingSlug)
-				concepts[i].Slug = existingSlug
-			}
-		} else if existingSlug, ok := dedupeResult.Merges[item.Slug]; ok && validMerge(item.Slug, existingSlug) {
+	for _, item := range concepts {
+		if exactTargets[item.Slug] != "" {
+			continue
+		}
+		if existingSlug, ok := dedupeResult.Merges[item.Slug]; ok && validMerge(item.Slug, existingSlug) {
 			logger.Infof(ctx, "wiki ingest: dedup merge %s → %s", item.Slug, existingSlug)
-			concepts[i].Slug = existingSlug
+			mergeTargets[item.Slug] = existingSlug
 		}
 	}
 
-	return compactExtractedItems(entities, concepts)
+	return stabilize()
 }
 
 // generateWithTemplate executes a prompt template and calls the LLM with

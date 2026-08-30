@@ -89,7 +89,7 @@ func setMigrationVersion(t *testing.T, db *sql.DB, version uint, dirty bool) {
 	require.NoError(t, err)
 }
 
-func TestPostgresMigration80To93AndIdempotentSQL(t *testing.T) {
+func TestPostgresMigration80To97AndIdempotentSQL(t *testing.T) {
 	useRepositoryRoot(t)
 	dsn, db := newEphemeralPostgresSchema(t)
 	m, err := migrate.New("file://migrations/versioned", dsn)
@@ -101,7 +101,7 @@ func TestPostgresMigration80To93AndIdempotentSQL(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	assert.Equal(t, uint(93), version)
+	assert.Equal(t, uint(97), version)
 	assert.False(t, dirty)
 	var definition string
 	require.NoError(t, db.QueryRow(`SELECT indexdef FROM pg_indexes
@@ -157,7 +157,7 @@ func TestPostgresMigrationLegacyLocalVersion91ReceivesUpstreamMigrations(t *test
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	require.Equal(t, uint(93), version)
+	require.Equal(t, uint(97), version)
 	require.False(t, dirty)
 
 	var upstreamObjects int
@@ -329,7 +329,7 @@ func TestPostgresMigration85DirtyRecoversIdempotently(t *testing.T) {
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	assert.Equal(t, uint(93), version)
+	assert.Equal(t, uint(97), version)
 	assert.False(t, dirty)
 	var indexes int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM pg_indexes
@@ -400,14 +400,17 @@ func TestPostgresMigrationGateDriftMatrix(t *testing.T) {
 	})
 }
 
-func TestPostgresFreshAndPre55MigrateTo93(t *testing.T) {
+func TestPostgresFreshAndPre55MigrateTo97(t *testing.T) {
 	useRepositoryRoot(t)
 	t.Run("fresh", func(t *testing.T) {
 		dsn, db := newEphemeralPostgresSchema(t)
 		require.NoError(t, RunMigrationsWithOptions(dsn, MigrationOptions{}))
 		var version uint
-		require.NoError(t, db.QueryRow(`SELECT version FROM schema_migrations`).Scan(&version))
-		assert.Equal(t, uint(93), version)
+		var dirty bool
+		require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
+		assert.Equal(t, uint(97), version)
+		assert.False(t, dirty)
+		assertPostgresCompatibilitySchema(t, db)
 	})
 
 	t.Run("pre55", func(t *testing.T) {
@@ -421,9 +424,138 @@ func TestPostgresFreshAndPre55MigrateTo93(t *testing.T) {
 		assert.Nil(t, relation)
 		require.NoError(t, RunMigrationsWithOptions(dsn, MigrationOptions{}))
 		var version uint
-		require.NoError(t, db.QueryRow(`SELECT version FROM schema_migrations`).Scan(&version))
-		assert.Equal(t, uint(93), version)
+		var dirty bool
+		require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
+		assert.Equal(t, uint(97), version)
+		assert.False(t, dirty)
+		assertPostgresCompatibilitySchema(t, db)
 	})
+}
+
+func TestPostgresMigrationForkVersion93AdvancesTo97(t *testing.T) {
+	useRepositoryRoot(t)
+	dsn, db := newEphemeralPostgresSchema(t)
+	m, err := migrate.New("file://migrations/versioned", dsn)
+	require.NoError(t, err)
+	require.NoError(t, m.Migrate(93))
+	_, _ = m.Close()
+
+	require.NoError(t, RunMigrationsWithOptions(dsn, MigrationOptions{}))
+	var version uint
+	var dirty bool
+	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
+	require.Equal(t, uint(97), version)
+	require.False(t, dirty)
+	assertPostgresCompatibilitySchema(t, db)
+}
+
+func TestPostgresMigrationUpstreamVersions85To90AdvanceTo97(t *testing.T) {
+	useRepositoryRoot(t)
+	upstreamMigrations := []string{
+		"migrations/versioned/000092_message_usage.up.sql",
+		"migrations/versioned/000093_tenant_skills.up.sql",
+		"migrations/versioned/000094_skill_install_transcript.up.sql",
+		"migrations/versioned/000095_skill_snapshot_planned_name.up.sql",
+		"migrations/versioned/000096_env_vars.up.sql",
+		"migrations/versioned/000097_skill_catalog.up.sql",
+	}
+	for upstreamVersion := uint(85); upstreamVersion <= 90; upstreamVersion++ {
+		t.Run(fmt.Sprintf("v%d", upstreamVersion), func(t *testing.T) {
+			dsn, db := newEphemeralPostgresSchema(t)
+			m, err := migrate.New("file://migrations/versioned", dsn)
+			require.NoError(t, err)
+			require.NoError(t, m.Migrate(84))
+			_, _ = m.Close()
+
+			// Reproduce Tencent's v85-v90 schema using the equivalent remapped
+			// fork migrations, then retain the upstream version marker.
+			for _, migration := range upstreamMigrations[:upstreamVersion-84] {
+				contents, readErr := os.ReadFile(migration)
+				require.NoError(t, readErr)
+				require.NoError(t, execSQL(db, string(contents)))
+				if strings.Contains(migration, "000093_tenant_skills") {
+					_, insertErr := db.Exec(`INSERT INTO tenant_skills
+						(id, tenant_id, sandbox_config_id, name, status, updated_at)
+						VALUES ('skill-original', 7, 'sandbox-a', 'shared-skill', 'ready', NOW())`)
+					require.NoError(t, insertErr)
+				}
+			}
+			if upstreamVersion == 90 {
+				_, insertErr := db.Exec(`INSERT INTO tenant_skills
+					(id, tenant_id, sandbox_config_id, name, status, updated_at)
+					VALUES ('skill-later', 7, 'sandbox-b', 'shared-skill', 'ready', NOW() + INTERVAL '1 hour')`)
+				require.NoError(t, insertErr)
+			}
+			_, err = db.Exec(`UPDATE schema_migrations SET version = $1, dirty = false`, upstreamVersion)
+			require.NoError(t, err)
+
+			require.NoError(t, RunMigrationsWithOptions(dsn, MigrationOptions{}))
+			var version uint
+			var dirty bool
+			require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
+			require.Equal(t, uint(97), version)
+			require.False(t, dirty)
+			assertPostgresCompatibilitySchema(t, db)
+			if upstreamVersion == 90 {
+				var catalogRows, linkedInstalls int
+				require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM tenant_skill_catalog
+					WHERE tenant_id = 7 AND name = 'shared-skill' AND deleted_at IS NULL`).Scan(&catalogRows))
+				require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM tenant_skills
+					WHERE tenant_id = 7 AND name = 'shared-skill' AND catalog_id IS NOT NULL`).Scan(&linkedInstalls))
+				require.Equal(t, 1, catalogRows)
+				require.Equal(t, 2, linkedInstalls)
+			}
+		})
+	}
+}
+
+func assertPostgresCompatibilitySchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var objects int
+	require.NoError(t, db.QueryRow(`SELECT
+		(EXISTS (SELECT 1 FROM pg_indexes
+			WHERE schemaname = current_schema() AND indexname = 'idx_knowledge_processing_spans_root_attempt_unique'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'task_pending_ops' AND column_name = 'claim_heartbeat_at'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'question_generation_manifests'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'wiki_ingest_work_units'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'wiki_canonical_identities'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'wiki_generation_fragments'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'knowledge_completion_outbox'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'messages' AND column_name = 'usage'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'tenant_skills'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'tenant_skill_snapshots'))::int`).Scan(&objects))
+	require.Equal(t, 10, objects)
+	assertPostgresSkillCatalogSchema(t, db)
+}
+
+func assertPostgresSkillCatalogSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var objects int
+	require.NoError(t, db.QueryRow(`SELECT
+		(EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'tenant_skills' AND column_name = 'install_session_id'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'tenant_skills' AND column_name = 'install_message_id'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'tenant_skill_snapshots' AND column_name = 'planned_name'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'tenant_skills' AND column_name = 'envs'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'tenant_user_env_vars'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = 'tenant_skill_catalog'))::int +
+		(EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'tenant_skills' AND column_name = 'catalog_id'))::int`).Scan(&objects))
+	require.Equal(t, 7, objects)
 }
 
 func TestPostgresMigrationLegacyLocalVersion85ReplaysUpstreamMigrations(t *testing.T) {
@@ -468,7 +600,7 @@ func TestPostgresMigrationLegacyLocalVersion85ReplaysUpstreamMigrations(t *testi
 	var version uint
 	var dirty bool
 	require.NoError(t, db.QueryRow(`SELECT version, dirty FROM schema_migrations`).Scan(&version, &dirty))
-	require.Equal(t, uint(93), version)
+	require.Equal(t, uint(97), version)
 	require.False(t, dirty)
 	require.NoError(t, db.QueryRow(`SELECT
 		(EXISTS (SELECT 1 FROM information_schema.columns
@@ -484,6 +616,7 @@ func TestPostgresMigrationLegacyLocalVersion85ReplaysUpstreamMigrations(t *testi
 		(EXISTS (SELECT 1 FROM information_schema.tables
 			WHERE table_schema = current_schema() AND table_name = 'tenant_skills'))::int`).Scan(&upstreamObjects))
 	require.Equal(t, 6, upstreamObjects)
+	assertPostgresCompatibilitySchema(t, db)
 }
 
 func execSQL(db *sql.DB, statement string) error {

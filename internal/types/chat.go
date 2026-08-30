@@ -221,6 +221,11 @@ const (
 	ResponseTypeAgentQuery ResponseType = "agent_query"
 	// Complete response type (agent complete)
 	ResponseTypeComplete ResponseType = "complete"
+	// ResponseTypeArtifactsPending is sent while skill/sandbox output is being
+	// copied into persistent storage after the answer has already streamed.
+	// The UI shows a toolbar placeholder until ResponseTypeComplete carries
+	// the file list.
+	ResponseTypeArtifactsPending ResponseType = "artifacts_pending"
 	// ToolApprovalRequired: MCP tool marked dangerous — UI must collect user approval before execution continues
 	ResponseTypeToolApprovalRequired ResponseType = "tool_approval_required"
 	// ToolApprovalResolved: user approved/rejected (or timeout); informational for UI replay
@@ -235,6 +240,12 @@ const (
 	// MemoryRecalled: the long-term memories injected into this answer, so
 	// the UI can show and let the user delete what influenced it.
 	ResponseTypeMemoryRecalled ResponseType = "memory_recalled"
+	// ResponseTypeInstallPrompt is the instruction a skill install handed to
+	// the installer agent. Only the skill install transcript emits this, and
+	// it emits it first, so replaying the log alone shows what was asked for
+	// — the console does not have to read the durable prompt row to caption
+	// the run.
+	ResponseTypeInstallPrompt ResponseType = "install_prompt"
 )
 
 // StreamResponse stream response

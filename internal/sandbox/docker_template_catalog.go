@@ -5,12 +5,14 @@
 // answer is images on the daemon: an image is a pre-baked filesystem a sandbox
 // starts from, which is exactly what a Cube or E2B template is.
 //
-// Two differences from the MicroVM backends shape this file:
+// Three differences from the MicroVM backends shape this file:
 //
 //   - A daemon holds every image its host ever pulled, most of which have
 //     nothing to do with sandboxes. Listing all of them would bury the one the
 //     admin needs, so the catalog only reports images that are recognisably
 //     sandbox templates.
+//   - Skill snapshots live in the same image store (weknora-skill/…), so they
+//     are subtracted the way Cube hides snap- IDs from GET /templates.
 //   - Making the standard template exist means pulling, which can take minutes
 //     on a cold host. The pull therefore runs in the background and the
 //     template reports "building" until it lands, mirroring how the other
@@ -56,12 +58,19 @@ func (c *DockerRemoteClient) ListTemplates(ctx context.Context) ([]RemoteTemplat
 	configured := strings.TrimSpace(c.settings.Image)
 	configuredPresent := false
 	for _, image := range listed.Items {
+		snapshot := dockerImageIsSkillSnapshot(image)
 		for _, tag := range image.RepoTags {
 			if tag == "" || tag == "<none>:<none>" {
 				continue
 			}
+			// Skill snapshots are images, so they would otherwise appear in
+			// the "pick a base template" list the way Cube's snap- IDs used
+			// to. Hide them unless this config's stored image is that tag.
+			if snapshot && tag != configured {
+				continue
+			}
 			standard := isStandardTemplateImage(tag)
-			if !standard && image.Labels[dockerTemplateLabel] != "true" && tag != configured {
+			if !standard && !snapshot && image.Labels[dockerTemplateLabel] != "true" && tag != configured {
 				continue
 			}
 			if tag == configured {
@@ -148,6 +157,19 @@ func (c *DockerRemoteClient) EnsureStandardTemplate(ctx context.Context) (*Remot
 
 	pending := c.pendingTemplate(image)
 	return &pending, nil
+}
+
+// ReplaceStandardTemplate is a pull of the configured image. Docker has no
+// cluster-side template object to delete; a missing image is fetched, a
+// present one is left as-is.
+func (c *DockerRemoteClient) ReplaceStandardTemplate(ctx context.Context) (*RemoteTemplate, error) {
+	return c.EnsureStandardTemplate(ctx)
+}
+
+// DeleteSupersededStandardTemplates is a no-op: Docker has no cluster-side
+// template object, and skill snapshots live in a separate image namespace.
+func (c *DockerRemoteClient) DeleteSupersededStandardTemplates(context.Context, string) error {
+	return nil
 }
 
 func (c *DockerRemoteClient) pullInBackground(ctx context.Context, key, image string) {

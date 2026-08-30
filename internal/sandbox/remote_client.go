@@ -2,7 +2,7 @@
 //
 // This file introduces the RemoteSandboxClient interface and the neutral
 // data-transfer types that SessionBoundManager depends on. Concrete backends
-// (Cube, E2B) each provide an implementation
+// (Cube, E2B, Docker) each provide an implementation
 // in a separate adapter file.
 //
 // The interface is deliberately minimal: it covers only the operations
@@ -338,7 +338,7 @@ type RemoteSandboxCapabilities struct {
 
 	// SupportsSnapshots reports whether the provider can snapshot a running
 	// sandbox into a reusable image. Snapshot IDs double as template IDs on
-	// both Cube and E2B, which is what makes skill images work.
+	// Cube, E2B, and Docker, which is what makes skill images work.
 	SupportsSnapshots bool
 
 	// SupportsVolumes is true when the provider can mount a named volume into
@@ -401,6 +401,10 @@ type RemoteSandboxClient interface {
 	WriteFile(ctx context.Context, handle RemoteSandboxHandle, path string, content []byte) error
 	ReadFile(ctx context.Context, handle RemoteSandboxHandle, path string) ([]byte, error)
 	ListDir(ctx context.Context, handle RemoteSandboxHandle, path string) ([]RemoteDirEntry, error)
+	// MakeDir creates path, including parents. A directory that already
+	// exists is success: envd's MakeDir is not mkdir -p, and adapters must
+	// hide that so writing a second file into the same folder (or seeding
+	// SKILL.md after resetSkillDir) does not fail.
 	MakeDir(ctx context.Context, handle RemoteSandboxHandle, path string) error
 	Remove(ctx context.Context, handle RemoteSandboxHandle, path string) error
 	Stat(ctx context.Context, handle RemoteSandboxHandle, path string) (*RemoteStatEntry, error)
@@ -420,8 +424,8 @@ func cloneMetadata(source map[string]string) map[string]string {
 }
 
 // RemoteSnapshotRef identifies one provider-side snapshot. ID can be passed
-// straight back as RemoteCreateRequest.TemplateID: both Cube and E2B store
-// snapshots as templates.
+// straight back as RemoteCreateRequest.TemplateID: Cube and E2B store
+// snapshots as templates, and Docker stores them as local image tags.
 type RemoteSnapshotRef struct {
 	ID    string
 	Names []string
@@ -444,8 +448,8 @@ type RemoteSnapshotManager interface {
 }
 
 // SnapshotManagerFrom narrows a client to its snapshot capability. It returns
-// false for providers that cannot snapshot (docker/local), so callers can fall
-// back to the base template instead of failing.
+// false for providers that cannot snapshot, so callers can fall back to the
+// base template instead of failing.
 //
 // Both signals must agree: the type assertion finds the methods, and
 // SupportsSnapshots is the advertised capability. A wrapper that happens to

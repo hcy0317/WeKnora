@@ -254,22 +254,56 @@ func formatSkillsMetadata(skillsMetadata []*skills.SkillMetadata, shellExecEnabl
 	}
 
 	builder.WriteString("#### Tool Reference\n\n")
-	builder.WriteString("- `read_skill(skill_name)`: Load full skill instructions (MUST call before using a skill)\n")
-	builder.WriteString("- `execute_skill_script(skill_name, script_path, args, input)`: Run utility scripts bundled with a skill\n")
+	builder.WriteString("- `read_skill(skill_name)`: Load SKILL.md **and** list the skill's files. This is how you discover scripts — do not `list_sandbox_files` or `ls` `/opt/weknora/tenant/skills/...`\n")
+	builder.WriteString("- `read_skill(skill_name, file_path)`: Read one file inside the skill (`file_path` is relative, e.g. `scripts/generate_ppt.py`)\n")
+	builder.WriteString("- `execute_skill_script(skill_name, script_path, args, input)`: Run a skill script with that skill's interpreter and packages\n")
+	builder.WriteString("  - `script_path`: relative inside the skill (`scripts/foo.py`), or an absolute `/workspace/...` file from `write_sandbox_file` / `edit_sandbox_file` (not `/workspace/input`)\n")
 	builder.WriteString("  - `input`: Pass data directly via stdin (use this when you have data in memory, e.g. JSON string)\n")
 	builder.WriteString("  - `args`: Command-line arguments; pass absolute `/workspace/input/...` paths from `<sandbox_attachments>` for user-uploaded files\n")
 	builder.WriteString("  - Treat `/workspace/input` as read-only and write generated files only to `$WEKNORA_SKILL_OUTPUT_DIR`\n")
+	builder.WriteString(sandboxArtifactReferenceGuidance())
+	builder.WriteString("  - Each skill keeps its dependencies to itself (virtualenv or node_modules); ")
+	builder.WriteString("this tool already runs scripts the right way. A bare `python3 -c` / `node -e` ")
+	builder.WriteString("sees none of them, so never conclude from that that a skill cannot run. ")
+	builder.WriteString("The skill tree is frozen after install — do not run install_deps.py, ")
+	builder.WriteString("chown, ensurepip, or pip into `/opt/weknora/tenant/skills`. ")
+	builder.WriteString("On-demand extras: `python3 -m pip install --target /workspace/.skill-packages/<skill> <package>`, ")
+	builder.WriteString("then execute_skill_script; or ask the user to reinstall the skill so extras are baked in\n")
 	if shellExecEnabled {
 		builder.WriteString("- `shell_exec(command, work_dir, timeout_sec, max_output_bytes, max_stderr_bytes, env)`: Freely execute shell commands and explore the current session's isolated Cube sandbox\n")
 		builder.WriteString("  - User-uploaded files are restored under `/workspace/input` and listed in `<sandbox_attachments>`\n")
-		builder.WriteString("  - Use `find` and `file` to discover files and types; use `cat`, `head`, `tail`, and `sed` to inspect text; use `grep` and `awk` to search and process content\n")
+		builder.WriteString("  - Use `find` and `ls` to discover files; use `cat`, `head`, `tail`, and `sed` to inspect text; use `grep` and `awk` to search and process content; use `file` for an unknown type\n")
+		builder.WriteString("  - Do not `ls` / `find` / `cat` / `file` a skill under `/opt/weknora/tenant/skills` to discover scripts. `read_skill(skill_name)` already lists them; that tree also contains `.venv` / `node_modules`\n")
 		builder.WriteString("  - Use shell pipelines, redirects, scripts, package managers, compilers, and other installed commands whenever they are the most direct way to complete the task\n")
+		builder.WriteString("  - Do not inspect skill-generated office files with `python3 -c` (system Python has no python-docx/pptx). Write a short script with `write_sandbox_file` and run it with `execute_skill_script`; do not paste the same code into `.venv/bin/python -c`\n")
+		builder.WriteString("  - To change a few lines of a file you already wrote, call `edit_sandbox_file` instead of rewriting the whole file\n")
+		builder.WriteString("  - Python strings: never nest ASCII `\"` inside `\"...\"` (or `'` inside `'...'`). Use the other quote, and 「」 for Chinese quotation\n")
 		builder.WriteString("  - Increase `max_output_bytes` up to 65536 per stream for large text output, or use `sed`/`head`/`tail` for targeted sections\n")
 		builder.WriteString("  - Binary output is suppressed; write binary results under `/workspace/output` so ArtifactCollector attaches them for download\n")
 		builder.WriteString("  - Session state persists across later `shell_exec` and `execute_skill_script` calls\n")
 		builder.WriteString("  - Non-zero exit codes are normal results, not tool errors — inspect stderr and decide what to do next\n")
 	}
 
+	return builder.String()
+}
+
+// sandboxArtifactReferenceGuidance tells the model how to point at a file it
+// generated in the sandbox from its final answer.
+//
+// Without this, models improvise a Markdown image with the bare file name
+// (`![评分](市场画像评分.html)`), which the browser cannot resolve — the answer
+// renders a broken image icon. The `sandbox:` prefix makes the intent explicit
+// so the server can bind the name to the artifact index it hands the client.
+func sandboxArtifactReferenceGuidance() string {
+	var builder strings.Builder
+	builder.WriteString("  - To show a generated file inside your answer, reference it as ")
+	builder.WriteString("`![description](sandbox:<file name>)` using the exact file name and no directory path\n")
+	builder.WriteString("    - Images render inline; charts, tables, and documents ")
+	builder.WriteString("render as a card the user clicks to preview\n")
+	builder.WriteString("    - Never reference a sandbox path (`/workspace/output/...`) ")
+	builder.WriteString("or a bare file name directly — neither resolves in the browser\n")
+	builder.WriteString("    - Prefer output file names without spaces or parentheses; ")
+	builder.WriteString("they keep the reference unambiguous\n")
 	return builder.String()
 }
 

@@ -213,7 +213,7 @@ func (s *wikiIngestService) extractCandidateSlugs(
 	logger.Infof(ctx, "wiki ingest: candidate extraction completed in %d bounded batch(es)", batchCount)
 
 	result.Entities, result.Concepts = s.deduplicateExtractedBatch(
-		ctx, chatModel, kbID, result.Entities, result.Concepts,
+		ctx, chatModel, kbID, result.Entities, result.Concepts, batchCtx,
 	)
 
 	slugItems := make(map[string]extractedItem, len(result.Entities)+len(result.Concepts))

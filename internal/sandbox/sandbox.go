@@ -1,5 +1,5 @@
 // Package sandbox provides isolated execution environments for running untrusted scripts.
-// It supports multiple backends including Docker containers and local process isolation.
+// It supports Docker containers and remote MicroVM backends (CubeSandbox, E2B).
 package sandbox
 
 import (
@@ -17,8 +17,6 @@ const (
 	// backends it keeps session state between executions; unlike them it
 	// shares the host kernel and lives on a single daemon.
 	SandboxTypeDocker SandboxType = "docker"
-	// SandboxTypeLocal uses local process with restrictions
-	SandboxTypeLocal SandboxType = "local"
 	// SandboxTypeCube uses Tencent CubeSandbox (E2B-compatible) MicroVM for isolation.
 	// Like Docker and E2B it keeps session-scoped persistent sandboxes: multiple
 	// executions bound to the same SessionID share one instance and preserve
@@ -31,11 +29,11 @@ const (
 )
 
 // IsNamedSandboxBackendType reports whether raw can be stored as a user-facing
-// named sandbox backend. Cube, E2B and Docker are session-persistent; local
-// is stateless. All four share the same workspace configuration surface.
+// named sandbox backend. Cube, E2B and Docker are all session-persistent and
+// share the same workspace configuration surface.
 func IsNamedSandboxBackendType(raw string) bool {
 	switch SandboxType(raw) {
-	case SandboxTypeCube, SandboxTypeE2B, SandboxTypeDocker, SandboxTypeLocal:
+	case SandboxTypeCube, SandboxTypeE2B, SandboxTypeDocker:
 		return true
 	default:
 		return false
@@ -47,7 +45,12 @@ const (
 	DefaultTimeout     = 60 * time.Second
 	DefaultMemoryLimit = 256 * 1024 * 1024 // 256MB
 	DefaultCPULimit    = 1.0               // 1 CPU core
-	DefaultDockerImage = "wechatopenai/weknora-sandbox:latest"
+	// DefaultDockerImage tracks main rather than latest. The latest tag only
+	// moves when a version is released, so it still carries the image from
+	// before /workspace and its input/output directories were handed to the
+	// sandbox account — a sandbox built from it cannot write its own artifact
+	// directory. Point this back at latest once a release ships that fix.
+	DefaultDockerImage = "wechatopenai/weknora-sandbox:main"
 
 	// DefaultCubeTemplateImage is the same environment with Cube's envd daemon
 	// baked in (target "cube" of docker/Dockerfile.sandbox).
@@ -175,18 +178,24 @@ type ExecuteConfig struct {
 	ScriptContent string
 
 	// SessionID scopes the execution to a per-session persistent sandbox.
-	// Honoured by every session-scoped backend (Cube, E2B, Docker); the Local
-	// backend ignores it. When empty, those backends fall back to an ephemeral
-	// (one-shot) sandbox created and torn down inside the single Execute call.
+	// Honoured by Cube, E2B and Docker. When empty, those backends fall back
+	// to an ephemeral (one-shot) sandbox created and torn down inside the
+	// single Execute call.
 	SessionID string
 
 	// RemoteScriptPath is an absolute path to a script that already exists
-	// inside the sandbox image (installed skills). When set, the executor
-	// skips the upload step and runs it in place. Only paths under a valid
-	// skill directory in SkillsImageRoot are accepted; script-content
-	// validation is skipped because the file is already on the image, so
-	// callers must have vetted the bundle at install time.
+	// inside the sandbox. When set, the executor skips the upload step and
+	// runs it in place. Accepted locations:
+	//   - an installed skill file under SkillsImageRoot (bundle vetted at install)
+	//   - a session-writable file under /workspace, not under /workspace/input,
+	//     which also requires SkillDir so the skill's interpreter is used
 	RemoteScriptPath string
+
+	// SkillDir is the installed skill directory whose venv/node_modules
+	// should run RemoteScriptPath. Required when RemoteScriptPath sits under
+	// /workspace. Image-skill paths derive the directory from the script and
+	// ignore this field.
+	SkillDir string
 }
 
 // ExecuteResult contains the result of script execution
@@ -219,9 +228,6 @@ func (r *ExecuteResult) IsSuccess() bool {
 type Config struct {
 	// Type is the preferred sandbox type
 	Type SandboxType
-
-	// FallbackEnabled allows falling back to local sandbox if Docker is unavailable
-	FallbackEnabled bool
 
 	// DefaultTimeout is the default execution timeout
 	DefaultTimeout time.Duration
@@ -268,12 +274,6 @@ type Config struct {
 	// DockerHTTPTimeout bounds each Engine API call. Zero uses the default.
 	DockerHTTPTimeout time.Duration
 
-	// AllowedCommands is the default list of allowed commands
-	AllowedCommands []string
-
-	// AllowedPaths is the list of paths that can be accessed
-	AllowedPaths []string
-
 	// MaxMemory is the maximum memory limit in bytes
 	MaxMemory int64
 
@@ -312,6 +312,11 @@ type Config struct {
 	// CubeHTTPTimeout bounds each HTTP call to CubeAPI. Zero uses the default.
 	CubeHTTPTimeout time.Duration
 
+	// CubeDNSServers are nameserver IPs included when WeKnora builds the
+	// standard Cube template. Empty omits the field so Cubelet uses its
+	// cluster default.
+	CubeDNSServers []string
+
 	// E2BAPIKey is the E2B API key sent via X-API-Key. Only used when
 	// Type == SandboxTypeE2B.
 	E2BAPIKey string
@@ -346,41 +351,13 @@ type Config struct {
 // incomplete workspace config could silently dial localhost.
 func DefaultConfig() *Config {
 	return &Config{
-		Type:            SandboxTypeLocal,
-		FallbackEnabled: true,
+		Type:            SandboxTypeDisabled,
 		DefaultTimeout:  DefaultTimeout,
 		DockerImage:     DefaultDockerImage,
-		AllowedCommands: defaultAllowedCommands(),
 		MaxMemory:       DefaultMemoryLimit,
 		MaxCPU:          DefaultCPULimit,
 		CubeSandboxTTL:  DefaultCubeSandboxTTL,
 		CubeHTTPTimeout: DefaultCubeHTTPTimeout,
-	}
-}
-
-// defaultAllowedCommands returns the default list of safe commands
-func defaultAllowedCommands() []string {
-	return []string{
-		"python",
-		"python3",
-		"node",
-		"bash",
-		"sh",
-		"cat",
-		"echo",
-		"head",
-		"tail",
-		"grep",
-		"sed",
-		"awk",
-		"sort",
-		"uniq",
-		"wc",
-		"cut",
-		"tr",
-		"ls",
-		"pwd",
-		"date",
 	}
 }
 
@@ -391,7 +368,7 @@ func ValidateConfig(config *Config) error {
 	}
 
 	switch config.Type {
-	case SandboxTypeDocker, SandboxTypeLocal, SandboxTypeCube, SandboxTypeE2B, SandboxTypeDisabled:
+	case SandboxTypeDocker, SandboxTypeCube, SandboxTypeE2B, SandboxTypeDisabled:
 		// Valid types
 	default:
 		return errors.New("invalid sandbox type")

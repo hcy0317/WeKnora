@@ -248,6 +248,28 @@ type populatedKBKnowledgeRepo struct {
 	items []*types.Knowledge
 }
 
+type atomicKBKnowledgeRepo struct {
+	populatedKBKnowledgeRepo
+	finalizeCalls int
+}
+
+func (r *atomicKBKnowledgeRepo) DeleteKnowledgeListAndAdjustStorage(
+	context.Context, uint64, []string,
+) error {
+	r.finalizeCalls++
+	return nil
+}
+
+type recordingKBDeleteTenantRepo struct {
+	interfaces.TenantRepository
+	adjustments []int64
+}
+
+func (r *recordingKBDeleteTenantRepo) AdjustStorageUsed(_ context.Context, _ uint64, delta int64) error {
+	r.adjustments = append(r.adjustments, delta)
+	return nil
+}
+
 func (r populatedKBKnowledgeRepo) ListKnowledgeByKnowledgeBaseID(
 	context.Context,
 	uint64,
@@ -428,6 +450,27 @@ func TestProcessKBDeleteCollectsKnowledgeIDsForEveryScrub(t *testing.T) {
 	for _, call := range inspector.calls {
 		assert.Equal(t, []string{"knowledge-1", "knowledge-2"}, call.knowledgeIDs)
 	}
+}
+
+func TestProcessKBDeleteAtomicFinalizerOwnsStorageAdjustment(t *testing.T) {
+	knowledgeRepo := &atomicKBKnowledgeRepo{populatedKBKnowledgeRepo: populatedKBKnowledgeRepo{
+		items: []*types.Knowledge{{
+			ID: "knowledge-1", KnowledgeBaseID: "kb-1", EmbeddingModelID: "model-1", StorageSize: 25,
+		}},
+	}}
+	tenantRepo := &recordingKBDeleteTenantRepo{}
+	finalizer := &kbDeleteFinalizerRepo{}
+	acker := &kbDeleteOutboxAcker{}
+	svc := &knowledgeBaseService{
+		repo: finalizer, kgRepo: knowledgeRepo, chunkRepo: kbCleanupChunkRepo{},
+		modelService: kbCleanupModelService{}, tenantRepo: tenantRepo, taskPendingRepo: acker,
+	}
+	payload, err := json.Marshal(types.KBDeletePayload{TenantID: 1, KnowledgeBaseID: "kb-1"})
+	require.NoError(t, err)
+
+	require.NoError(t, svc.ProcessKBDelete(context.Background(), asynq.NewTask(types.TypeKBDelete, payload)))
+	require.Equal(t, 1, knowledgeRepo.finalizeCalls)
+	require.Empty(t, tenantRepo.adjustments, "atomic knowledge finalizer must be the only storage accounting path")
 }
 
 func TestProcessKBDeleteModelFailureDoesNotDeleteRowsOrFinalize(t *testing.T) {

@@ -652,6 +652,14 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	}
 	_ = eg.Wait()
 
+	// Re-read upstream identity claims before applying the fork's durable
+	// canonical aliases and publication checkpoints.
+	var identityAliases map[string]string
+	slugUpdates, identityAliases = s.remapSlugUpdatesByIdentity(
+		ctx, payload.KnowledgeBaseID, slugUpdates, batchCtx,
+	)
+	rewriteDocResultSlugs(docResults, identityAliases)
+
 	// Documents are mapped concurrently, so two documents in this batch may
 	// independently emit spelling variants for the same real subject before
 	// either page exists. Resolve those exact identities as one canonical slug
@@ -1777,12 +1785,16 @@ func (s *wikiIngestService) mapOneDocument(
 	preCitationEntities := append([]extractedItem(nil), extractedEntities...)
 	preCitationConcepts := append([]extractedItem(nil), extractedConcepts...)
 	extractedEntities, extractedConcepts, uncited = mergeCitationsIntoItems(extractedEntities, extractedConcepts, citations, newSlugs)
+	extractedEntities, extractedConcepts = s.reclaimExtractedIdentities(
+		ctx, payload.KnowledgeBaseID, extractedEntities, extractedConcepts, batchCtx,
+	)
 	if len(newSlugs) > 0 {
 		// Citation-discovered items did not participate in Pass 0's DB probe.
 		// Run the same exact/fuzzy guard now so they cannot bypass cross-file
 		// canonicalization merely because they surfaced one stage later.
 		extractedEntities, extractedConcepts = s.deduplicateExtractedBatch(
 			ctx, chatModel, payload.KnowledgeBaseID, extractedEntities, extractedConcepts,
+			batchCtx,
 		)
 	}
 	summaryContent = rewriteWikiSlugAliases(summaryContent, extractedItemSlugAliases(
@@ -2069,7 +2081,7 @@ func (s *wikiIngestService) extractEntitiesAndConceptsNoUpsert(
 	// safe default — the LLM merge call simply doesn't get a candidate
 	// list and the items pass through unchanged.
 	result.Entities, result.Concepts = s.deduplicateExtractedBatch(
-		ctx, chatModel, kbID, result.Entities, result.Concepts,
+		ctx, chatModel, kbID, result.Entities, result.Concepts, batchCtx,
 	)
 
 	slugItems := make(map[string]extractedItem)

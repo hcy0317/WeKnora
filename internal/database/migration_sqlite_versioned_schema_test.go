@@ -2,6 +2,7 @@ package database
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -89,6 +90,61 @@ func TestSQLiteLegacyLocalVersion16ReceivesMessageUsage(t *testing.T) {
 	require.Equal(t, expectedSQLiteMigrationVersion, version)
 	require.False(t, dirty)
 	require.True(t, sqliteColumnExists(t, db, "messages", "usage"))
+}
+
+func TestSQLiteCompatibilityVersion16WithUsageSkipsDuplicateDDL(t *testing.T) {
+	repoRoot := sqliteRepoRoot(t)
+	chdirAndRestore(t, repoRoot)
+
+	dbPath := filepath.Join(t.TempDir(), "compat-v16-with-usage.db")
+	require.NoError(t, RunMigrationsWithOptions("sqlite3://unused", MigrationOptions{SQLiteDBPath: dbPath}))
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = db.Exec("UPDATE schema_migrations SET version = 16, dirty = 0")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	require.NoError(t, RunMigrationsWithOptions("sqlite3://unused", MigrationOptions{SQLiteDBPath: dbPath}))
+	db = openSQLiteDB(t, dbPath)
+	version, dirty := sqliteMigrationState(t, db)
+	require.Equal(t, expectedSQLiteMigrationVersion, version)
+	require.False(t, dirty)
+	require.True(t, sqliteColumnExists(t, db, "messages", "usage"))
+}
+
+func TestSQLiteTencentVersion12ReplaysForkMigrations(t *testing.T) {
+	repoRoot := sqliteRepoRoot(t)
+	upstreamRoot := copySQLiteMigrationsThrough(t, repoRoot, 11)
+	chdirAndRestore(t, upstreamRoot)
+
+	dbPath := filepath.Join(t.TempDir(), "upstream-v12.db")
+	require.NoError(t, RunMigrationsWithOptions("sqlite3://unused", MigrationOptions{SQLiteDBPath: dbPath}))
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	usageSQL, err := os.ReadFile(filepath.Join(repoRoot, "migrations", "sqlite", "000017_message_usage.up.sql"))
+	require.NoError(t, err)
+	_, err = db.Exec(string(usageSQL))
+	require.NoError(t, err)
+	_, err = db.Exec("UPDATE schema_migrations SET version = 12, dirty = 0")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	chdirAndRestore(t, repoRoot)
+	require.NoError(t, RunMigrationsWithOptions("sqlite3://unused", MigrationOptions{SQLiteDBPath: dbPath}))
+	db = openSQLiteDB(t, dbPath)
+	version, dirty := sqliteMigrationState(t, db)
+	require.Equal(t, expectedSQLiteMigrationVersion, version)
+	require.False(t, dirty)
+	require.True(t, sqliteColumnExists(t, db, "messages", "usage"))
+	for _, table := range []string{
+		"question_generation_manifests",
+		"wiki_ingest_work_units",
+		"wiki_canonical_identities",
+		"wiki_generation_fragments",
+		"knowledge_completion_outbox",
+	} {
+		require.Truef(t, sqliteTestTableExists(t, db, table), "compatibility replay must create %s", table)
+	}
 }
 
 func TestSQLiteMigrationsUpgradeV4PreservesData(t *testing.T) {
@@ -281,6 +337,23 @@ func copySQLiteMigrationsV4(t *testing.T, repoRoot string) string {
 		data, err := os.ReadFile(filepath.Join(srcDir, name))
 		require.NoError(t, err)
 		require.NoError(t, os.WriteFile(filepath.Join(destDir, name), data, 0o600))
+	}
+	return dest
+}
+
+func copySQLiteMigrationsThrough(t *testing.T, repoRoot string, maxVersion int) string {
+	t.Helper()
+	dest := t.TempDir()
+	srcDir := filepath.Join(repoRoot, "migrations", "sqlite")
+	destDir := filepath.Join(dest, "migrations", "sqlite")
+	require.NoError(t, os.MkdirAll(destDir, 0o755))
+	for version := 0; version <= maxVersion; version++ {
+		matches, err := filepath.Glob(filepath.Join(srcDir, fmt.Sprintf("%06d_*.up.sql", version)))
+		require.NoError(t, err)
+		require.Lenf(t, matches, 1, "expected exactly one SQLite migration for version %d", version)
+		data, err := os.ReadFile(matches[0])
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(destDir, filepath.Base(matches[0])), data, 0o600))
 	}
 	return dest
 }
