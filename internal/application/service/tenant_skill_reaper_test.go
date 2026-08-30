@@ -1047,6 +1047,7 @@ func (r *reaperSkillStore) MarkSnapshotState(
 func (r *reaperSkillStore) DeleteSnapshotRowsByConfig(context.Context, uint64, string) error {
 	panic("DeleteSnapshotRowsByConfig is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) ListSkillsByTenant(_ context.Context, tenantID uint64) ([]*types.TenantSkillEntity, error) {
 	var out []*types.TenantSkillEntity
 	for _, e := range r.rows {
@@ -1057,24 +1058,29 @@ func (r *reaperSkillStore) ListSkillsByTenant(_ context.Context, tenantID uint64
 	}
 	return out, nil
 }
+
 func (r *reaperSkillStore) ListUserEnvVars(
 	context.Context, uint64, types.Principal, string, string,
 ) ([]*types.TenantUserEnvVar, error) {
 	panic("ListUserEnvVars is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) ListUserEnvVarsByConfig(
 	context.Context, uint64, types.Principal, string,
 ) ([]*types.TenantUserEnvVar, error) {
 	panic("ListUserEnvVarsByConfig is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) UpsertUserEnvVar(context.Context, *types.TenantUserEnvVar) error {
 	panic("UpsertUserEnvVar is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) DeleteUserEnvVar(
 	context.Context, uint64, types.Principal, string, string, string,
 ) error {
 	panic("DeleteUserEnvVar is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) DeleteUserEnvVarsByConfig(context.Context, uint64, string) error {
 	panic("DeleteUserEnvVarsByConfig is outside the reaper surface")
 }
@@ -1082,6 +1088,7 @@ func (r *reaperSkillStore) DeleteUserEnvVarsByConfig(context.Context, uint64, st
 func (r *reaperSkillStore) CreateCatalog(context.Context, *types.TenantSkillCatalogEntity) error {
 	panic("CreateCatalog is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) CreateCatalogWithBundleClaim(
 	ctx context.Context, row *types.TenantSkillCatalogEntity, token string,
 ) error {
@@ -1110,6 +1117,7 @@ func (r *reaperSkillStore) ListCatalogsByTenant(context.Context, uint64) ([]*typ
 func (r *reaperSkillStore) UpdateCatalog(context.Context, *types.TenantSkillCatalogEntity) error {
 	panic("UpdateCatalog is outside the reaper surface")
 }
+
 func (r *reaperSkillStore) UpdateCatalogWithBundleClaim(
 	_ context.Context, row *types.TenantSkillCatalogEntity, token string,
 ) error {
@@ -1135,6 +1143,7 @@ func (r *reaperSkillStore) SetCatalogBundleIfEmpty(
 	row.BundleSHA256 = bundleSHA256
 	return true, nil
 }
+
 func (r *reaperSkillStore) SetCatalogBundleIfEmptyWithClaim(
 	_ context.Context, tenantID uint64, catalogID, bundleRef, bundleSHA256, token string,
 ) (bool, error) {
