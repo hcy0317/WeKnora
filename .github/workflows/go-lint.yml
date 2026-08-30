@@ -1,8 +1,8 @@
 name: Go Lint
 
 # The repository carries a large backlog of pre-existing golangci-lint findings,
-# so pull requests are only judged on the code they introduce (`only-new-issues`).
-# That filter needs a pull request diff, which is why this workflow has no other
+# so pull requests are only judged on the code they introduce (`--new-from-rev`).
+# That filter needs a pull request base, which is why this workflow has no other
 # trigger; the companion go-lint-cache.yml keeps the caches this job restores
 # from warm on main.
 
@@ -102,4 +102,3 @@ jobs:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
           working-directory: ${{ matrix.module }}
           args: --new-from-rev=${{ github.event.pull_request.base.sha }}
-          only-new-issues: true
