@@ -54,11 +54,14 @@ func TestResolveCatalogFindsLegacySkillID(t *testing.T) {
 	))
 	repo := repository.NewTenantSkillRepository(db)
 	ctx := context.WithValue(context.Background(), types.TenantRoleContextKey, types.TenantRoleAdmin)
-	require.NoError(t, repo.CreateSkill(ctx, &types.TenantSkillEntity{
+	// This fixture represents a pre-claim legacy row. Insert it below the
+	// repository boundary because current callers must never write BundleRef
+	// without first owning the durable bundle claim.
+	require.NoError(t, db.Create(&types.TenantSkillEntity{
 		ID: "sk-old", TenantID: 7, SandboxConfigID: "cfg-a",
 		Name: "pdf", BundleRef: "local://7/tenant-skills/sk-old.zip",
 		Status: types.SkillStatusReady, Enabled: true,
-	}))
+	}).Error)
 
 	svc := NewTenantSkillService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	cat, err := svc.resolveCatalog(ctx, 7, "sk-old")

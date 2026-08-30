@@ -650,6 +650,129 @@ func TestInstallSkillUpgradeFailureDeletesOnlyNewUnreferencedArchive(t *testing.
 	require.Equal(t, oldRef, stored.BundleRef)
 }
 
+func TestInstallSkillOldBundleDeletionFencesConcurrentReassignment(t *testing.T) {
+	fx := newInstallFixture(t)
+	fx.returnNamedBundleRefs = true
+	ctx := context.Background()
+	oldArchive := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
+	oldSHA := skillArchiveSHA256(oldArchive)
+	oldRef := "file://tenant-skills/sk-1/" + oldSHA + ".zip"
+	fx.storedBundles = map[string][]byte{oldRef: oldArchive}
+	skill, err := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	skill.BundleRef = oldRef
+	skill.BundleSHA256 = oldSHA
+	require.NoError(t, fx.skillRepo.UpdateSkill(ctx, skill))
+
+	deleteClaimed := make(chan struct{})
+	releaseDelete := make(chan struct{})
+	oldWriteClaimed := make(chan struct{}, 1)
+	var deleteOnce sync.Once
+	fx.skillRepo.onBundleDeleteClaim = func(ref string) {
+		if ref == oldRef {
+			deleteOnce.Do(func() { close(deleteClaimed) })
+			<-releaseDelete
+		}
+	}
+	fx.skillRepo.onBundleWriteClaim = func(ref string) {
+		if ref == oldRef {
+			oldWriteClaimed <- struct{}{}
+		}
+	}
+	upgrade := zipBundle(t, map[string]string{
+		"SKILL.md": validSkillMD, "scripts/v2.py": "print('v2')\n",
+	})
+	type installResult struct {
+		id  string
+		err error
+	}
+	aDone := make(chan installResult, 1)
+	go func() {
+		id, installErr := fx.svc.InstallSkill(ctx, 7, "cfg-1", upgrade)
+		aDone <- installResult{id: id, err: installErr}
+	}()
+	<-deleteClaimed
+	bDone := make(chan installResult, 1)
+	go func() {
+		id, installErr := fx.svc.InstallSkill(ctx, 7, "cfg-1", oldArchive)
+		bDone <- installResult{id: id, err: installErr}
+	}()
+	select {
+	case <-oldWriteClaimed:
+		t.Fatal("old ref was reassigned while its deletion claim was active")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseDelete)
+	require.NoError(t, (<-aDone).err)
+	require.NoError(t, (<-bDone).err)
+	select {
+	case <-oldWriteClaimed:
+	case <-time.After(time.Second):
+		t.Fatal("reassignment did not resume after deletion completed")
+	}
+	require.Equal(t, oldArchive, fx.storedBundles[oldRef],
+		"the reassignment must re-save bytes after the prior deletion")
+	stored, err := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	require.Equal(t, oldRef, stored.BundleRef)
+}
+
+func TestInstallSkillFailedNewBundleCleanupFencesConcurrentClaim(t *testing.T) {
+	fx := newInstallFixture(t)
+	fx.returnNamedBundleRefs = true
+	ctx := context.Background()
+	archive := zipBundle(t, map[string]string{
+		"SKILL.md": validSkillMD, "scripts/v2.py": "print('v2')\n",
+	})
+	sha := skillArchiveSHA256(archive)
+	ref := "file://tenant-skills/sk-1/" + sha + ".zip"
+	var failed atomic.Bool
+	fx.skillRepo.updateFailsWhen = func(row *types.TenantSkillEntity) bool {
+		return row.BundleSHA256 == sha && failed.CompareAndSwap(false, true)
+	}
+	deleteClaimed := make(chan struct{})
+	releaseDelete := make(chan struct{})
+	writeClaimed := make(chan struct{}, 1)
+	var deleteOnce sync.Once
+	fx.skillRepo.onBundleDeleteClaim = func(got string) {
+		if got == ref {
+			deleteOnce.Do(func() { close(deleteClaimed) })
+			<-releaseDelete
+		}
+	}
+	fx.skillRepo.onBundleWriteClaim = func(got string) {
+		if got == ref && failed.Load() {
+			writeClaimed <- struct{}{}
+		}
+	}
+	aDone := make(chan error, 1)
+	go func() {
+		_, installErr := fx.svc.InstallSkill(ctx, 7, "cfg-1", archive)
+		aDone <- installErr
+	}()
+	<-deleteClaimed
+	bDone := make(chan error, 1)
+	go func() {
+		_, installErr := fx.svc.InstallSkill(ctx, 7, "cfg-1", archive)
+		bDone <- installErr
+	}()
+	select {
+	case <-writeClaimed:
+		t.Fatal("new ref was claimed while failed-write cleanup was deleting it")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseDelete)
+	require.ErrorIs(t, <-aDone, errUpdateBoom)
+	require.NoError(t, <-bDone)
+	select {
+	case <-writeClaimed:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent claimant did not resume after cleanup completed")
+	}
+	require.Equal(t, archive, fx.storedBundles[ref],
+		"the winner must re-save the archive after failed-run cleanup")
+}
+
 func TestSaveBundlePathIsQualifiedByOwningSHA(t *testing.T) {
 	fx := newInstallFixture(t)
 	first := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
@@ -1998,10 +2121,13 @@ func (r *installConfigRepo) ClearCordonIfMatch(context.Context, uint64, string, 
 }
 
 type installSkillRepo struct {
-	mu        sync.Mutex
-	skills    map[string]*types.TenantSkillEntity
-	snapshots map[string]*types.TenantSkillSnapshotEntity
-	catalogs  map[string]*types.TenantSkillCatalogEntity
+	mu                  sync.Mutex
+	skills              map[string]*types.TenantSkillEntity
+	snapshots           map[string]*types.TenantSkillSnapshotEntity
+	catalogs            map[string]*types.TenantSkillCatalogEntity
+	bundleClaims        map[string]installBundleClaim
+	onBundleDeleteClaim func(string)
+	onBundleWriteClaim  func(string)
 	// updateFailsWhen models a transient write failure for one kind of row
 	// state, so a test can fail the terminal bookkeeping write without
 	// disabling every other write the run makes.
@@ -2030,11 +2156,17 @@ type installSkillRepo struct {
 	userEnvs []*types.TenantUserEnvVar
 }
 
+type installBundleClaim struct {
+	state string
+	token string
+}
+
 func newInstallSkillRepo() *installSkillRepo {
 	return &installSkillRepo{
-		skills:    map[string]*types.TenantSkillEntity{},
-		snapshots: map[string]*types.TenantSkillSnapshotEntity{},
-		catalogs:  map[string]*types.TenantSkillCatalogEntity{},
+		skills:       map[string]*types.TenantSkillEntity{},
+		snapshots:    map[string]*types.TenantSkillSnapshotEntity{},
+		catalogs:     map[string]*types.TenantSkillCatalogEntity{},
+		bundleClaims: map[string]installBundleClaim{},
 	}
 }
 
@@ -2135,6 +2267,168 @@ func (r *installSkillRepo) UpdateSkill(ctx context.Context, e *types.TenantSkill
 		cp.Envs = nil
 	}
 	r.skills[key] = &cp
+	return nil
+}
+
+func installBundleClaimKey(tenantID uint64, ref string) string {
+	return fmt.Sprintf("%d|%s", tenantID, ref)
+}
+
+func (r *installSkillRepo) ClaimSkillBundleWrite(
+	ctx context.Context, tenantID uint64, ref, token string,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	key := installBundleClaimKey(tenantID, ref)
+	claim := r.bundleClaims[key]
+	if claim.state == "writing" && claim.token == token {
+		r.mu.Unlock()
+		return nil
+	}
+	if claim.state == "writing" || claim.state == "deleting" {
+		r.mu.Unlock()
+		return repository.ErrSkillBundleRefBusy
+	}
+	r.bundleClaims[key] = installBundleClaim{state: "writing", token: token}
+	hook := r.onBundleWriteClaim
+	r.mu.Unlock()
+	if hook != nil {
+		hook(ref)
+	}
+	return nil
+}
+
+func (r *installSkillRepo) CreateSkillWithBundleClaim(
+	_ context.Context, e *types.TenantSkillEntity, token string,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := installBundleClaimKey(e.TenantID, e.BundleRef)
+	claim := r.bundleClaims[key]
+	if claim.state != "writing" || claim.token != token {
+		return repository.ErrSkillBundleRefBusy
+	}
+	if r.createErr != nil {
+		return r.createErr
+	}
+	cp := *e
+	r.skills[skillKey(e.TenantID, e.SandboxConfigID, e.ID)] = &cp
+	r.bundleClaims[key] = installBundleClaim{state: "live"}
+	return nil
+}
+
+func (r *installSkillRepo) UpdateSkillWithBundleClaim(
+	ctx context.Context, e *types.TenantSkillEntity, token string,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := installBundleClaimKey(e.TenantID, e.BundleRef)
+	claim := r.bundleClaims[key]
+	if claim.state != "writing" || claim.token != token {
+		return repository.ErrSkillBundleRefBusy
+	}
+	if r.updateFailsWhen != nil && r.updateFailsWhen(e) {
+		return errUpdateBoom
+	}
+	cp := *e
+	if stored := r.skills[skillKey(e.TenantID, e.SandboxConfigID, e.ID)]; stored != nil {
+		cp.Envs = stored.Envs
+	}
+	r.skills[skillKey(e.TenantID, e.SandboxConfigID, e.ID)] = &cp
+	r.bundleClaims[key] = installBundleClaim{state: "live"}
+	return nil
+}
+
+func (r *installSkillRepo) ReleaseSkillBundleWrite(
+	_ context.Context, tenantID uint64, ref, token string,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := installBundleClaimKey(tenantID, ref)
+	claim := r.bundleClaims[key]
+	if claim.state != "writing" || claim.token != token {
+		return repository.ErrSkillBundleRefBusy
+	}
+	r.bundleClaims[key] = installBundleClaim{state: "live"}
+	return nil
+}
+
+func (r *installSkillRepo) ClaimUnreferencedSkillBundleDelete(
+	_ context.Context, tenantID uint64, ref, token string, fromWrite bool,
+) (bool, error) {
+	r.mu.Lock()
+	key := installBundleClaimKey(tenantID, ref)
+	claim := r.bundleClaims[key]
+	if fromWrite {
+		if claim.state != "writing" || claim.token != token {
+			r.mu.Unlock()
+			return false, repository.ErrSkillBundleRefBusy
+		}
+	} else if claim.state == "writing" || claim.state == "deleting" {
+		r.mu.Unlock()
+		return false, repository.ErrSkillBundleRefBusy
+	}
+	for _, row := range r.skills {
+		if row != nil && row.TenantID == tenantID && strings.TrimSpace(row.BundleRef) == ref {
+			if fromWrite {
+				r.bundleClaims[key] = installBundleClaim{state: "live"}
+			}
+			r.mu.Unlock()
+			return false, nil
+		}
+	}
+	for _, row := range r.catalogs {
+		if row != nil && row.TenantID == tenantID && strings.TrimSpace(row.BundleRef) == ref {
+			if fromWrite {
+				r.bundleClaims[key] = installBundleClaim{state: "live"}
+			}
+			r.mu.Unlock()
+			return false, nil
+		}
+	}
+	if claim.state == "deleted" && !fromWrite {
+		r.mu.Unlock()
+		return false, nil
+	}
+	r.bundleClaims[key] = installBundleClaim{state: "deleting", token: token}
+	hook := r.onBundleDeleteClaim
+	r.mu.Unlock()
+	if hook != nil {
+		hook(ref)
+	}
+	return true, nil
+}
+
+func (r *installSkillRepo) CompleteSkillBundleDelete(
+	_ context.Context, tenantID uint64, ref, token string,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := installBundleClaimKey(tenantID, ref)
+	claim := r.bundleClaims[key]
+	if claim.state != "deleting" || claim.token != token {
+		return repository.ErrSkillBundleRefBusy
+	}
+	r.bundleClaims[key] = installBundleClaim{state: "deleted"}
+	return nil
+}
+
+func (r *installSkillRepo) ReleaseSkillBundleDelete(
+	_ context.Context, tenantID uint64, ref, token string,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := installBundleClaimKey(tenantID, ref)
+	claim := r.bundleClaims[key]
+	if claim.state != "deleting" || claim.token != token {
+		return repository.ErrSkillBundleRefBusy
+	}
+	r.bundleClaims[key] = installBundleClaim{state: "live"}
 	return nil
 }
 
@@ -3113,6 +3407,7 @@ func (installFileService) GetFileURL(context.Context, string) (string, error) { 
 func (s installFileService) DeleteFile(_ context.Context, ref string) error {
 	if s.fx != nil {
 		s.fx.deletedBundles = append(s.fx.deletedBundles, ref)
+		delete(s.fx.storedBundles, ref)
 	}
 	return nil
 }

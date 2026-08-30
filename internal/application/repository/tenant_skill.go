@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -28,6 +29,15 @@ type TenantSkillRepository interface {
 	// UpdateSkill writes the mutable projection fields after install/remove
 	// state changes. It never touches envs; see the implementation.
 	UpdateSkill(ctx context.Context, e *types.TenantSkillEntity) error
+	ClaimSkillBundleWrite(ctx context.Context, tenantID uint64, bundleRef, token string) error
+	CreateSkillWithBundleClaim(ctx context.Context, e *types.TenantSkillEntity, token string) error
+	UpdateSkillWithBundleClaim(ctx context.Context, e *types.TenantSkillEntity, token string) error
+	ReleaseSkillBundleWrite(ctx context.Context, tenantID uint64, bundleRef, token string) error
+	ClaimUnreferencedSkillBundleDelete(
+		ctx context.Context, tenantID uint64, bundleRef, token string, fromWrite bool,
+	) (bool, error)
+	CompleteSkillBundleDelete(ctx context.Context, tenantID uint64, bundleRef, token string) error
+	ReleaseSkillBundleDelete(ctx context.Context, tenantID uint64, bundleRef, token string) error
 	// UpdateSkillEnvs writes the declared environment variables alone.
 	UpdateSkillEnvs(
 		ctx context.Context, tenantID uint64, configID, skillID string, envs types.SkillEnvVars,
@@ -103,12 +113,28 @@ type TenantSkillRepository interface {
 
 type tenantSkillRepository struct{ db *gorm.DB }
 
+var ErrSkillBundleRefBusy = errors.New("skill bundle reference is owned by another operation")
+var ErrSkillBundleClaimRequired = errors.New("skill bundle reference changes require a bundle claim")
+
+type skillBundleRefClaim struct {
+	TenantID   uint64 `gorm:"primaryKey"`
+	BundleRef  string `gorm:"primaryKey"`
+	State      string
+	ClaimToken *string
+	UpdatedAt  time.Time
+}
+
+func (skillBundleRefClaim) TableName() string { return "tenant_skill_bundle_ref_claims" }
+
 // NewTenantSkillRepository returns a GORM-backed implementation.
 func NewTenantSkillRepository(db *gorm.DB) TenantSkillRepository {
 	return &tenantSkillRepository{db: db}
 }
 
 func (r *tenantSkillRepository) CreateSkill(ctx context.Context, e *types.TenantSkillEntity) error {
+	if strings.TrimSpace(e.BundleRef) != "" {
+		return ErrSkillBundleClaimRequired
+	}
 	return r.db.WithContext(ctx).Create(e).Error
 }
 
@@ -182,26 +208,233 @@ func (r *tenantSkillRepository) ListSkillsByTenant(
 // the stale list — or a NULL — back. UpdateSkillEnvs and UpdateSkillAdminState
 // are the only writers of that column.
 func (r *tenantSkillRepository) UpdateSkill(ctx context.Context, e *types.TenantSkillEntity) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current types.TenantSkillEntity
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("bundle_ref", "bundle_sha256").
+			Where("tenant_id = ? AND sandbox_config_id = ? AND id = ?",
+				e.TenantID, e.SandboxConfigID, e.ID).
+			First(&current).Error; err != nil {
+			return err
+		}
+		if strings.TrimSpace(current.BundleRef) != strings.TrimSpace(e.BundleRef) ||
+			strings.TrimSpace(current.BundleSHA256) != strings.TrimSpace(e.BundleSHA256) {
+			return ErrSkillBundleClaimRequired
+		}
+		return (&tenantSkillRepository{db: tx}).updateSkill(ctx, e, false)
+	})
+}
+
+func (r *tenantSkillRepository) updateSkill(
+	ctx context.Context, e *types.TenantSkillEntity, includeBundle bool,
+) error {
+	updates := map[string]any{
+		"name":                  e.Name,
+		"version":               e.Version,
+		"description":           e.Description,
+		"instructions":          e.Instructions,
+		"enabled":               e.Enabled,
+		"installed_snapshot_id": e.InstalledSnapshotID,
+		"install_session_id":    e.InstallSessionID,
+		"install_message_id":    e.InstallMessageID,
+		"catalog_id":            e.CatalogID,
+		"status":                e.Status,
+		"error":                 e.Error,
+		"installing_since":      e.InstallingSince,
+		"updated_at":            time.Now(),
+	}
+	if includeBundle {
+		updates["bundle_ref"] = e.BundleRef
+		updates["bundle_sha256"] = e.BundleSHA256
+	}
 	return r.db.WithContext(ctx).
 		Model(&types.TenantSkillEntity{}).
 		Where("tenant_id = ? AND sandbox_config_id = ? AND id = ?", e.TenantID, e.SandboxConfigID, e.ID).
-		Updates(map[string]any{
-			"name":                  e.Name,
-			"version":               e.Version,
-			"description":           e.Description,
-			"instructions":          e.Instructions,
-			"bundle_ref":            e.BundleRef,
-			"bundle_sha256":         e.BundleSHA256,
-			"enabled":               e.Enabled,
-			"installed_snapshot_id": e.InstalledSnapshotID,
-			"install_session_id":    e.InstallSessionID,
-			"install_message_id":    e.InstallMessageID,
-			"catalog_id":            e.CatalogID,
-			"status":                e.Status,
-			"error":                 e.Error,
-			"installing_since":      e.InstallingSince,
-			"updated_at":            time.Now(),
-		}).Error
+		Updates(updates).Error
+}
+
+func ensureSkillBundleClaimRow(tx *gorm.DB, tenantID uint64, bundleRef string) error {
+	return tx.Exec(`INSERT INTO tenant_skill_bundle_ref_claims
+		(tenant_id, bundle_ref, state, updated_at) VALUES (?, ?, 'live', CURRENT_TIMESTAMP)
+		ON CONFLICT (tenant_id, bundle_ref) DO NOTHING`, tenantID, bundleRef).Error
+}
+
+func lockSkillBundleClaim(
+	tx *gorm.DB, tenantID uint64, bundleRef string,
+) (*skillBundleRefClaim, error) {
+	if err := ensureSkillBundleClaimRow(tx, tenantID, bundleRef); err != nil {
+		return nil, err
+	}
+	var claim skillBundleRefClaim
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("tenant_id = ? AND bundle_ref = ?", tenantID, bundleRef).
+		First(&claim).Error
+	return &claim, err
+}
+
+func (r *tenantSkillRepository) ClaimSkillBundleWrite(
+	ctx context.Context, tenantID uint64, bundleRef, token string,
+) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		claim, err := lockSkillBundleClaim(tx, tenantID, bundleRef)
+		if err != nil {
+			return err
+		}
+		if claim.State == "writing" && claim.ClaimToken != nil && *claim.ClaimToken == token {
+			return nil
+		}
+		if claim.State == "writing" || claim.State == "deleting" {
+			return ErrSkillBundleRefBusy
+		}
+		return tx.Model(&skillBundleRefClaim{}).
+			Where("tenant_id = ? AND bundle_ref = ?", tenantID, bundleRef).
+			Updates(map[string]any{
+				"state": "writing", "claim_token": token, "updated_at": time.Now(),
+			}).Error
+	})
+}
+
+func (r *tenantSkillRepository) CreateSkillWithBundleClaim(
+	ctx context.Context, e *types.TenantSkillEntity, token string,
+) error {
+	return r.withSkillBundleWriteClaim(ctx, e, token, func(tx *gorm.DB) error {
+		return tx.Create(e).Error
+	})
+}
+
+func (r *tenantSkillRepository) UpdateSkillWithBundleClaim(
+	ctx context.Context, e *types.TenantSkillEntity, token string,
+) error {
+	return r.withSkillBundleWriteClaim(ctx, e, token, func(tx *gorm.DB) error {
+		return (&tenantSkillRepository{db: tx}).updateSkill(ctx, e, true)
+	})
+}
+
+func (r *tenantSkillRepository) withSkillBundleWriteClaim(
+	ctx context.Context,
+	e *types.TenantSkillEntity,
+	token string,
+	write func(*gorm.DB) error,
+) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		claim, err := lockSkillBundleClaim(tx, e.TenantID, e.BundleRef)
+		if err != nil {
+			return err
+		}
+		if claim.State != "writing" || claim.ClaimToken == nil || *claim.ClaimToken != token {
+			return ErrSkillBundleRefBusy
+		}
+		if err := write(tx); err != nil {
+			return err
+		}
+		return tx.Model(&skillBundleRefClaim{}).
+			Where("tenant_id = ? AND bundle_ref = ? AND state = 'writing' AND claim_token = ?",
+				e.TenantID, e.BundleRef, token).
+			Updates(map[string]any{
+				"state": "live", "claim_token": nil, "updated_at": time.Now(),
+			}).Error
+	})
+}
+
+func (r *tenantSkillRepository) ReleaseSkillBundleWrite(
+	ctx context.Context, tenantID uint64, bundleRef, token string,
+) error {
+	result := r.db.WithContext(ctx).Model(&skillBundleRefClaim{}).
+		Where("tenant_id = ? AND bundle_ref = ? AND state = 'writing' AND claim_token = ?",
+			tenantID, bundleRef, token).
+		Updates(map[string]any{"state": "live", "claim_token": nil, "updated_at": time.Now()})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrSkillBundleRefBusy
+	}
+	return nil
+}
+
+func (r *tenantSkillRepository) ClaimUnreferencedSkillBundleDelete(
+	ctx context.Context, tenantID uint64, bundleRef, token string, fromWrite bool,
+) (bool, error) {
+	claimed := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		claim, err := lockSkillBundleClaim(tx, tenantID, bundleRef)
+		if err != nil {
+			return err
+		}
+		if fromWrite {
+			if claim.State != "writing" || claim.ClaimToken == nil || *claim.ClaimToken != token {
+				return ErrSkillBundleRefBusy
+			}
+		} else if claim.State == "writing" || claim.State == "deleting" {
+			return ErrSkillBundleRefBusy
+		}
+		var skillRefs, catalogRefs int64
+		if err := tx.Model(&types.TenantSkillEntity{}).
+			Where("tenant_id = ? AND bundle_ref = ?", tenantID, bundleRef).
+			Count(&skillRefs).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&types.TenantSkillCatalogEntity{}).
+			Where("tenant_id = ? AND bundle_ref = ?", tenantID, bundleRef).
+			Count(&catalogRefs).Error; err != nil {
+			return err
+		}
+		if skillRefs+catalogRefs > 0 {
+			if fromWrite {
+				return tx.Model(&skillBundleRefClaim{}).
+					Where("tenant_id = ? AND bundle_ref = ? AND claim_token = ?", tenantID, bundleRef, token).
+					Updates(map[string]any{
+						"state": "live", "claim_token": nil, "updated_at": time.Now(),
+					}).Error
+			}
+			return nil
+		}
+		if claim.State == "deleted" && !fromWrite {
+			return nil
+		}
+		if err := tx.Model(&skillBundleRefClaim{}).
+			Where("tenant_id = ? AND bundle_ref = ?", tenantID, bundleRef).
+			Updates(map[string]any{
+				"state": "deleting", "claim_token": token, "updated_at": time.Now(),
+			}).Error; err != nil {
+			return err
+		}
+		claimed = true
+		return nil
+	})
+	return claimed, err
+}
+
+func (r *tenantSkillRepository) CompleteSkillBundleDelete(
+	ctx context.Context, tenantID uint64, bundleRef, token string,
+) error {
+	result := r.db.WithContext(ctx).Model(&skillBundleRefClaim{}).
+		Where("tenant_id = ? AND bundle_ref = ? AND state = 'deleting' AND claim_token = ?",
+			tenantID, bundleRef, token).
+		Updates(map[string]any{"state": "deleted", "claim_token": nil, "updated_at": time.Now()})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrSkillBundleRefBusy
+	}
+	return nil
+}
+
+func (r *tenantSkillRepository) ReleaseSkillBundleDelete(
+	ctx context.Context, tenantID uint64, bundleRef, token string,
+) error {
+	result := r.db.WithContext(ctx).Model(&skillBundleRefClaim{}).
+		Where("tenant_id = ? AND bundle_ref = ? AND state = 'deleting' AND claim_token = ?",
+			tenantID, bundleRef, token).
+		Updates(map[string]any{"state": "live", "claim_token": nil, "updated_at": time.Now()})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrSkillBundleRefBusy
+	}
+	return nil
 }
 
 // UpdateSkillEnvs writes the declaration column alone, so recording what a

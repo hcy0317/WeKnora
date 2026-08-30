@@ -26,7 +26,7 @@ func newSkillTestRepoWithDB(t *testing.T) (TenantSkillRepository, *gorm.DB) {
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
 		&types.TenantSkillEntity{}, &types.TenantSkillSnapshotEntity{},
-		&types.TenantUserEnvVar{}, &types.TenantSkillCatalogEntity{},
+		&types.TenantUserEnvVar{}, &types.TenantSkillCatalogEntity{}, &skillBundleRefClaim{},
 	))
 	// AutoMigrate cannot express the partial unique index, so add it here to
 	// match the production migration.
@@ -37,6 +37,56 @@ func newSkillTestRepoWithDB(t *testing.T) (TenantSkillRepository, *gorm.DB) {
 		`CREATE UNIQUE INDEX IF NOT EXISTS uq_tenant_skill_catalog_name
 		 ON tenant_skill_catalog (tenant_id, name) WHERE deleted_at IS NULL`).Error)
 	return NewTenantSkillRepository(db), db
+}
+
+func TestSkillBundleDeleteClaimSerializesRefReassignment(t *testing.T) {
+	repo := newSkillTestRepo(t)
+	ctx := context.Background()
+	oldRef := "file://old.zip"
+	newRef := "file://new.zip"
+	row := skillRow("sk-a", "cfg-1", "pdf")
+	require.NoError(t, repo.CreateSkill(ctx, row))
+	require.NoError(t, repo.ClaimSkillBundleWrite(ctx, 7, oldRef, "write-old"))
+	row.BundleRef = oldRef
+	require.NoError(t, repo.UpdateSkillWithBundleClaim(ctx, row, "write-old"))
+
+	require.NoError(t, repo.ClaimSkillBundleWrite(ctx, 7, newRef, "write-new"))
+	row.BundleRef = newRef
+	require.NoError(t, repo.UpdateSkillWithBundleClaim(ctx, row, "write-new"))
+	claimed, err := repo.ClaimUnreferencedSkillBundleDelete(ctx, 7, oldRef, "delete-old", false)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.ErrorIs(t,
+		repo.ClaimSkillBundleWrite(ctx, 7, oldRef, "reassign-old"), ErrSkillBundleRefBusy)
+	require.NoError(t, repo.CompleteSkillBundleDelete(ctx, 7, oldRef, "delete-old"))
+	require.NoError(t, repo.ClaimSkillBundleWrite(ctx, 7, oldRef, "reassign-old"))
+	row.BundleRef = oldRef
+	require.NoError(t, repo.UpdateSkillWithBundleClaim(ctx, row, "reassign-old"))
+}
+
+func TestSkillRepoRejectsUnclaimedBundleRefWrites(t *testing.T) {
+	repo := newSkillTestRepo(t)
+	ctx := context.Background()
+	row := skillRow("sk-a", "cfg-1", "pdf")
+	row.BundleRef = "file://unclaimed.zip"
+	require.ErrorIs(t, repo.CreateSkill(ctx, row), ErrSkillBundleClaimRequired)
+	row.BundleRef = ""
+	require.NoError(t, repo.CreateSkill(ctx, row))
+	row.BundleRef = "file://unclaimed.zip"
+	require.ErrorIs(t, repo.UpdateSkill(ctx, row), ErrSkillBundleClaimRequired)
+}
+
+func TestSkillBundleFailedWriteCanAtomicallyBecomeDeleteClaim(t *testing.T) {
+	repo := newSkillTestRepo(t)
+	ctx := context.Background()
+	ref := "file://new.zip"
+	require.NoError(t, repo.ClaimSkillBundleWrite(ctx, 7, ref, "write"))
+	claimed, err := repo.ClaimUnreferencedSkillBundleDelete(ctx, 7, ref, "write", true)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.ErrorIs(t, repo.ClaimSkillBundleWrite(ctx, 7, ref, "other"), ErrSkillBundleRefBusy)
+	require.NoError(t, repo.CompleteSkillBundleDelete(ctx, 7, ref, "write"))
+	require.NoError(t, repo.ClaimSkillBundleWrite(ctx, 7, ref, "other"))
 }
 
 func skillRow(id, configID, name string) *types.TenantSkillEntity {
