@@ -2,9 +2,10 @@ name: Go Lint
 
 # The repository carries a large backlog of pre-existing golangci-lint findings,
 # so pull requests are only judged on the code they introduce (`--new-from-rev`).
-# Ordinary PRs use their base SHA. A chore(upstream) compatibility PR may use
-# the absorbed second parent when its merge commit's first parent is exactly the
-# PR base, so upstream lint debt is not reclassified as a fork regression.
+# Ordinary PRs use their base SHA. A chore(upstream) compatibility PR treats
+# its reviewed import merge as the baseline when that merge's first parent is
+# exactly the PR base; each parent carries independent historical lint debt,
+# while every compatibility follow-up after the merge remains fully linted.
 
 on:
   pull_request:
@@ -57,7 +58,7 @@ jobs:
             while read -r merge_commit; do
               read -ra parents <<< "$(git rev-list --parents -n 1 "${merge_commit}")"
               if [[ ${#parents[@]} -ge 3 && "${parents[1]}" == "${PR_BASE}" ]]; then
-                lint_base="${parents[2]}"
+                lint_base="${merge_commit}"
                 break
               fi
             done < <(git rev-list --merges "${PR_BASE}..${PR_HEAD}")
