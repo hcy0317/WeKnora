@@ -312,14 +312,12 @@ export class ArtifactBlobURLCache {
 type ArtifactBlobState = {
   blobByKey: Map<string, string>;
   inflight: Map<string, Promise<string | null>>;
-  invalidatedInflight: Set<string>;
 };
 
 const artifactBlobState: ArtifactBlobState = (() => {
   const fresh = (): ArtifactBlobState => ({
     blobByKey: new Map(),
     inflight: new Map(),
-    invalidatedInflight: new Set(),
   });
   if (typeof window === 'undefined') return fresh();
   const scope = window as typeof window & {
@@ -328,36 +326,79 @@ const artifactBlobState: ArtifactBlobState = (() => {
   scope.__weknoraArtifactBlobCacheV1__ ||= fresh();
   scope.__weknoraArtifactBlobCacheV1__.blobByKey ||= new Map();
   scope.__weknoraArtifactBlobCacheV1__.inflight ||= new Map();
-  scope.__weknoraArtifactBlobCacheV1__.invalidatedInflight ||= new Set();
   return scope.__weknoraArtifactBlobCacheV1__ as ArtifactBlobState;
 })();
+
+/**
+ * Owns one in-flight request generation per cache key.
+ *
+ * Disposal detaches the current generation instead of marking the key itself
+ * invalid. A component that immediately remounts can therefore start a fresh
+ * request. When the detached request eventually finishes it can only discard
+ * its own value; its finally block cannot delete the replacement generation.
+ */
+export class ArtifactBlobRequestCoordinator<T> {
+  constructor(private readonly inflight: Map<string, Promise<T | null>> = new Map()) {}
+
+  load(
+    key: string,
+    fetchValue: () => Promise<T>,
+    acceptValue: (value: T) => void,
+    discardValue: (value: T) => void,
+    onError?: (error: unknown) => void,
+  ): Promise<T | null> {
+    const existing = this.inflight.get(key);
+    if (existing) return existing;
+
+    let created!: Promise<T | null>;
+    created = (async () => {
+      try {
+        const value = await fetchValue();
+        if (this.inflight.get(key) !== created) {
+          discardValue(value);
+          return null;
+        }
+        acceptValue(value);
+        return value;
+      } catch (error) {
+        onError?.(error);
+        return null;
+      } finally {
+        if (this.inflight.get(key) === created) this.inflight.delete(key);
+      }
+    })();
+    this.inflight.set(key, created);
+    return created;
+  }
+
+  detachMatching(matches: (key: string) => boolean): void {
+    for (const key of this.inflight.keys()) {
+      if (matches(key)) this.inflight.delete(key);
+    }
+  }
+}
 
 const artifactBlobCache = new ArtifactBlobURLCache(
   ARTIFACT_BLOB_CACHE_MAX_ENTRIES,
   revokeBlobURL,
   artifactBlobState.blobByKey,
 );
-
-function invalidateInflight(matches: (key: string) => boolean): void {
-  for (const key of artifactBlobState.inflight.keys()) {
-    if (matches(key)) artifactBlobState.invalidatedInflight.add(key);
-  }
-}
+const artifactBlobRequests = new ArtifactBlobRequestCoordinator(artifactBlobState.inflight);
 
 export function disposeArtifactBlobURLsForMessage(ctx: ArtifactRefContext): number {
   const prefix = messageCachePrefix(ctx);
-  invalidateInflight((key) => key.startsWith(prefix));
+  artifactBlobRequests.detachMatching((key) => key.startsWith(prefix));
   return artifactBlobCache.disposeMessage(ctx);
 }
 
 export function disposeArtifactBlobURLsForSession(sessionId: string): number {
   const prefix = sessionCachePrefix(sessionId);
-  invalidateInflight((key) => key.startsWith(prefix));
+  artifactBlobRequests.detachMatching((key) => key.startsWith(prefix));
   return artifactBlobCache.disposeSession(sessionId);
 }
 
 export function disposeAllArtifactBlobURLs(): number {
-  invalidateInflight(() => true);
+  artifactBlobRequests.detachMatching(() => true);
   return artifactBlobCache.disposeAll();
 }
 
@@ -455,32 +496,19 @@ async function loadArtifactBlobURL(ctx: ArtifactRefContext, index: number): Prom
   const cached = artifactBlobCache.get(ctx, index);
   if (cached) return cached;
 
-  let task = artifactBlobState.inflight.get(key);
-  if (!task) {
-    task = (async () => {
-      try {
-        // Imported lazily so parsing/rendering stays free of the axios
-        // transport — those parts run in plain Node during unit tests.
-        const { downloadArtifact } = await import('@/api/chat');
-        const blob = await downloadArtifact(ctx.sessionId, ctx.messageId, index);
-        const blobURL = URL.createObjectURL(blob);
-        if (artifactBlobState.invalidatedInflight.delete(key)) {
-          revokeBlobURL(blobURL);
-          return null;
-        }
-        artifactBlobCache.set(ctx, index, blobURL);
-        return blobURL;
-      } catch (error) {
-        console.warn('[sandboxArtifactRefs] artifact image load failed:', error);
-        return null;
-      } finally {
-        artifactBlobState.invalidatedInflight.delete(key);
-        artifactBlobState.inflight.delete(key);
-      }
-    })();
-    artifactBlobState.inflight.set(key, task);
-  }
-  return task;
+  return artifactBlobRequests.load(
+    key,
+    async () => {
+      // Imported lazily so parsing/rendering stays free of the axios
+      // transport — those parts run in plain Node during unit tests.
+      const { downloadArtifact } = await import('@/api/chat');
+      const blob = await downloadArtifact(ctx.sessionId, ctx.messageId, index);
+      return URL.createObjectURL(blob);
+    },
+    (blobURL) => artifactBlobCache.set(ctx, index, blobURL),
+    revokeBlobURL,
+    (error) => console.warn('[sandboxArtifactRefs] artifact image load failed:', error),
+  );
 }
 
 /**

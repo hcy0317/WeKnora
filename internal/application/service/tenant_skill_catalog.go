@@ -16,7 +16,7 @@ import (
 
 // SkillCatalogInstallView is one installation of a catalog skill onto a sandbox.
 type SkillCatalogInstallView struct {
-	SkillID           string    `json:"skill_id"`
+	SkillID           string    `json:"skill_id,omitempty"`
 	SandboxConfigID   string    `json:"sandbox_config_id"`
 	SandboxConfigName string    `json:"sandbox_config_name,omitempty"`
 	SandboxType       string    `json:"sandbox_type,omitempty"`
@@ -44,7 +44,7 @@ type SkillCatalogView struct {
 func (s *TenantSkillService) ListCatalog(
 	ctx context.Context, tenantID uint64,
 ) ([]SkillCatalogView, error) {
-	includeOperationalState := types.TenantRoleFromContext(ctx).HasPermission(types.TenantRoleAdmin)
+	role := types.TenantRoleFromContext(ctx)
 	catalogs, err := s.skills.ListCatalogsByTenant(ctx, tenantID)
 	if err != nil {
 		return nil, err
@@ -121,7 +121,24 @@ func (s *TenantSkillService) ListCatalog(
 		}
 		out = append(out, catalogView(synthetic, []*types.TenantSkillEntity{row}, configByID))
 	}
-	if !includeOperationalState {
+	switch {
+	case role.HasPermission(types.TenantRoleAdmin):
+		// Administrators need the complete operational record to diagnose and
+		// repair installs.
+	case role.HasPermission(types.TenantRoleContributor):
+		// Contributors can author agents. AgentEditor needs per-sandbox status
+		// and enabled state to decide which catalog skills are selectable, but
+		// neither the bundle digest nor provider failures belong in that read
+		// surface.
+		for i := range out {
+			out[i].BundleSHA256 = ""
+			for j := range out[i].Installations {
+				out[i].Installations[j].SkillID = ""
+				out[i].Installations[j].Error = ""
+				out[i].Installations[j].BundleSHA256 = ""
+			}
+		}
+	default:
 		for i := range out {
 			out[i].BundleSHA256 = ""
 			out[i].Installations = nil
@@ -288,7 +305,7 @@ func (s *TenantSkillService) upsertCatalogFromBundle(
 	now := s.now()
 	if existing != nil {
 		oldRef := strings.TrimSpace(existing.BundleRef)
-		stored, err := s.storeCatalogBundle(ctx, tenantID, existing, archive, requireStore)
+		stored, claimToken, err := s.storeCatalogBundle(ctx, tenantID, existing, archive, requireStore)
 		if err != nil {
 			return nil, err
 		}
@@ -300,10 +317,9 @@ func (s *TenantSkillService) upsertCatalogFromBundle(
 		existing.Instructions = bundle.Instructions
 		existing.BundleSHA256 = bundle.SHA256
 		existing.UpdatedAt = now
-		if err := s.skills.UpdateCatalog(ctx, existing); err != nil {
-			if oldRef != strings.TrimSpace(existing.BundleRef) {
-				s.deleteStoredBundleBestEffort(ctx, tenantID, existing.BundleRef)
-			}
+		if err := s.skills.UpdateCatalogWithBundleClaim(ctx, existing, claimToken); err != nil {
+			s.deleteUnreferencedSkillBundleBestEffort(
+				ctx, tenantID, existing.BundleRef, claimToken, true)
 			return nil, err
 		}
 		if oldRef != "" && oldRef != strings.TrimSpace(existing.BundleRef) {
@@ -318,19 +334,29 @@ func (s *TenantSkillService) upsertCatalogFromBundle(
 		Instructions: bundle.Instructions,
 		CreatedAt:    now, UpdatedAt: now,
 	}
-	stored, err := s.storeCatalogBundle(ctx, tenantID, row, archive, requireStore)
+	stored, claimToken, err := s.storeCatalogBundle(ctx, tenantID, row, archive, requireStore)
 	if err != nil {
 		return nil, err
 	}
 	if stored {
 		row.BundleSHA256 = bundle.SHA256
 	}
-	if err := s.skills.CreateCatalog(ctx, row); err != nil {
+	create := s.skills.CreateCatalog
+	if stored {
+		create = func(ctx context.Context, row *types.TenantSkillCatalogEntity) error {
+			return s.skills.CreateCatalogWithBundleClaim(ctx, row, claimToken)
+		}
+	}
+	if err := create(ctx, row); err != nil {
 		if !isSkillNameConflict(err) {
-			s.deleteStoredBundleBestEffort(ctx, tenantID, row.BundleRef)
+			if stored {
+				s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, row.BundleRef, claimToken, true)
+			}
 			return nil, err
 		}
-		s.deleteStoredBundleBestEffort(ctx, tenantID, row.BundleRef)
+		if stored {
+			s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, row.BundleRef, claimToken, true)
+		}
 		winner, lookupErr := s.skills.GetCatalogByName(ctx, tenantID, bundle.Name)
 		if lookupErr != nil {
 			return nil, lookupErr
@@ -345,46 +371,45 @@ func (s *TenantSkillService) upsertCatalogFromBundle(
 
 func (s *TenantSkillService) storeCatalogBundle(
 	ctx context.Context, tenantID uint64, catalog *types.TenantSkillCatalogEntity, archive []byte, requireStore bool,
-) (bool, error) {
+) (bool, string, error) {
 	if catalog == nil || len(archive) == 0 {
-		return false, nil
+		return false, "", nil
 	}
 	fs, err := s.fileServiceForTenant(ctx, tenantID)
 	if err != nil {
 		if requireStore {
-			return false, err
+			return false, "", err
 		}
 		logger.Warnf(ctx, "[skill] catalog bundle storage unavailable: %v", err)
-		return false, nil
+		return false, "", nil
 	}
+	token := uuid.NewString()
 	ref, err := fs.SaveBytes(ctx, archive, tenantID,
-		fmt.Sprintf("tenant-skills/catalog/%s/%s.zip", catalog.ID, skillArchiveSHA256(archive)), false)
+		fmt.Sprintf("tenant-skills/catalog/%s/%s/%s.zip",
+			catalog.ID, skillArchiveSHA256(archive), token), false)
 	if err != nil {
 		if requireStore {
-			return false, fmt.Errorf("store catalog bundle: %w", err)
+			return false, "", fmt.Errorf("store catalog bundle: %w", err)
 		}
 		logger.Warnf(ctx, "[skill] catalog bundle store failed: %v", err)
-		return false, nil
+		return false, "", nil
+	}
+	if err := s.claimSkillBundleWrite(ctx, tenantID, ref, token); err != nil {
+		s.cleanupUnpublishedBundleAfterClaimFailure(ctx, tenantID, ref, token, err)
+		if requireStore {
+			return false, "", fmt.Errorf("claim catalog bundle: %w", err)
+		}
+		logger.Warnf(ctx, "[skill] catalog bundle claim failed: %v", err)
+		return false, "", nil
 	}
 	catalog.BundleRef = ref
-	return true, nil
+	return true, token, nil
 }
 
 func (s *TenantSkillService) deleteStoredBundleBestEffort(
 	ctx context.Context, tenantID uint64, ref string,
 ) {
-	ref = strings.TrimSpace(ref)
-	if ref == "" {
-		return
-	}
-	fs, err := s.fileServiceForTenant(ctx, tenantID)
-	if err != nil {
-		logger.Warnf(ctx, "[skill] resolve storage to delete bundle %s failed: %v", ref, err)
-		return
-	}
-	if err := fs.DeleteFile(ctx, ref); err != nil {
-		logger.Warnf(ctx, "[skill] delete superseded bundle %s failed: %v", ref, err)
-	}
+	s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, ref, uuid.NewString(), false)
 }
 
 func skillUserErrorMessage(err error) string {
@@ -498,6 +523,7 @@ func (s *TenantSkillService) catalogBundleArchive(
 		return nil, apperrors.NewNotFoundError("skill not found")
 	}
 	wantSHA := strings.TrimSpace(catalog.BundleSHA256)
+	var lastCandidateErr error
 	finishFallback := func(archive []byte) ([]byte, error) {
 		if err := s.ensureCatalogOwnedBundle(ctx, tenantID, catalog.ID, wantSHA, archive); err != nil {
 			return nil, err
@@ -508,8 +534,15 @@ func (s *TenantSkillService) catalogBundleArchive(
 		if row == nil || strings.TrimSpace(row.BundleRef) == "" {
 			return nil, false
 		}
+		if wantSHA != "" && !strings.EqualFold(strings.TrimSpace(row.BundleSHA256), wantSHA) {
+			return nil, false
+		}
 		archive, err := s.downloadSkillBundle(ctx, tenantID, row)
-		if err != nil || len(archive) == 0 {
+		if err != nil {
+			lastCandidateErr = err
+			return nil, false
+		}
+		if len(archive) == 0 {
 			return nil, false
 		}
 		if wantSHA != "" && !archiveMatchesSHA(archive, wantSHA) {
@@ -549,6 +582,9 @@ func (s *TenantSkillService) catalogBundleArchive(
 			return finishFallback(archive)
 		}
 	}
+	if lastCandidateErr != nil {
+		return nil, fmt.Errorf("read catalog bundle candidate: %w", lastCandidateErr)
+	}
 	return nil, apperrors.NewBadRequestError(
 		"the archive of this skill is no longer stored; add it again from the original bundle")
 }
@@ -571,7 +607,7 @@ func (s *TenantSkillService) ensureCatalogOwnedBundle(
 		return fmt.Errorf("catalog fallback bundle does not match its declared sha256")
 	}
 	copyRow := *persisted
-	stored, err := s.storeCatalogBundle(ctx, tenantID, &copyRow, archive, true)
+	stored, claimToken, err := s.storeCatalogBundle(ctx, tenantID, &copyRow, archive, true)
 	if err != nil {
 		return err
 	}
@@ -582,11 +618,11 @@ func (s *TenantSkillService) ensureCatalogOwnedBundle(
 	if sha == "" {
 		sha = skillArchiveSHA256(archive)
 	}
-	won, err := s.skills.SetCatalogBundleIfEmpty(
-		ctx, tenantID, catalogID, copyRow.BundleRef, sha,
+	won, err := s.skills.SetCatalogBundleIfEmptyWithClaim(
+		ctx, tenantID, catalogID, copyRow.BundleRef, sha, claimToken,
 	)
 	if err != nil {
-		s.deleteStoredBundleBestEffort(ctx, tenantID, copyRow.BundleRef)
+		s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, copyRow.BundleRef, claimToken, true)
 		return err
 	}
 	if won {
@@ -595,12 +631,10 @@ func (s *TenantSkillService) ensureCatalogOwnedBundle(
 	winner, loadErr := s.skills.GetCatalog(ctx, tenantID, catalogID)
 	if loadErr == nil && winner != nil && strings.TrimSpace(winner.BundleRef) != "" &&
 		(strings.TrimSpace(winner.BundleSHA256) == "" || strings.EqualFold(winner.BundleSHA256, sha)) {
-		if winner.BundleRef != copyRow.BundleRef {
-			s.deleteStoredBundleBestEffort(ctx, tenantID, copyRow.BundleRef)
-		}
+		s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, copyRow.BundleRef, claimToken, true)
 		return nil
 	}
-	s.deleteStoredBundleBestEffort(ctx, tenantID, copyRow.BundleRef)
+	s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, copyRow.BundleRef, claimToken, true)
 	if loadErr != nil {
 		return loadErr
 	}

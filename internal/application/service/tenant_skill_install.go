@@ -18,6 +18,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/agent/skills"
 	"github.com/Tencent/WeKnora/internal/agent/tools"
+	"github.com/Tencent/WeKnora/internal/application/repository"
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -37,8 +38,9 @@ const (
 	// The terminal "ready" write happens after the pointer has moved, so it is
 	// retried: the skill is already installed and serving, and the only thing
 	// still missing is the row that says so.
-	readySkillWriteAttempts = 3
-	readySkillWriteDelay    = 100 * time.Millisecond
+	readySkillWriteAttempts    = 3
+	readySkillWriteDelay       = 100 * time.Millisecond
+	bundleClaimFinalizeTimeout = 5 * time.Second
 
 	// skillSeedArchivePath is the single remote write used to land a skill's
 	// files. Writing each file with MakeDir+WriteFile is two round trips per
@@ -106,45 +108,61 @@ func (s *TenantSkillService) InstallSkill(
 	// Store under an immutable digest-qualified object before claiming the DB
 	// row. The claim then writes BundleSHA256 and BundleRef together, so two
 	// uploads cannot leave one digest pointing at the other upload's bytes.
-	ref, err := s.saveBundle(ctx, tenantID, skillID, archive)
+	bundleClaim := uuid.NewString()
+	ref, err := s.saveBundle(ctx, tenantID, skillID, bundleClaim, archive)
 	if err != nil {
 		return "", fmt.Errorf("store bundle for skill %s: %w", skillID, err)
 	}
+	if err := s.claimSkillBundleWrite(ctx, tenantID, ref, bundleClaim); err != nil {
+		s.cleanupUnpublishedBundleAfterClaimFailure(ctx, tenantID, ref, bundleClaim, err)
+		return "", fmt.Errorf("claim bundle for skill %s: %w", skillID, err)
+	}
 	now := s.now()
 	if existing != nil {
+		oldRef := strings.TrimSpace(existing.BundleRef)
 		takeSkillRowForInstall(existing, bundle, now, ref)
 		existing.CatalogID = catalogID
-		if err := s.skills.UpdateSkill(ctx, existing); err != nil {
+		if err := s.skills.UpdateSkillWithBundleClaim(ctx, existing, bundleClaim); err != nil {
+			s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, ref, bundleClaim, true)
 			return "", err
 		}
+		if oldRef != "" && oldRef != strings.TrimSpace(ref) {
+			s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, oldRef, uuid.NewString(), false)
+		}
 	} else {
-		if err := s.skills.CreateSkill(ctx, &types.TenantSkillEntity{
+		if err := s.skills.CreateSkillWithBundleClaim(ctx, &types.TenantSkillEntity{
 			ID: skillID, TenantID: tenantID, SandboxConfigID: configID,
 			CatalogID: catalogID,
 			Name:      bundle.Name, Version: bundle.Version,
 			Description: bundle.Description, Instructions: bundle.Instructions,
 			BundleRef: ref, BundleSHA256: bundle.SHA256, Enabled: true,
 			Status: types.SkillStatusInstalling, InstallingSince: &now,
-		}); err != nil {
+		}, bundleClaim); err != nil {
 			if !isSkillNameConflict(err) {
-				s.deleteStoredBundleBestEffort(ctx, tenantID, ref)
+				s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, ref, bundleClaim, true)
 				return "", err
 			}
 			// Two first-time uploads of the same name raced the unique index.
 			// Take the row that won rather than surfacing a 500.
 			winner, lookupErr := s.skills.GetSkillByName(ctx, tenantID, configID, bundle.Name)
 			if lookupErr != nil {
+				s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, ref, bundleClaim, true)
 				return "", lookupErr
 			}
 			if winner == nil {
+				s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, ref, bundleClaim, true)
 				return "", err
 			}
 			skillID = winner.ID
+			oldRef := strings.TrimSpace(winner.BundleRef)
 			takeSkillRowForInstall(winner, bundle, now, ref)
 			winner.CatalogID = catalogID
-			if err := s.skills.UpdateSkill(ctx, winner); err != nil {
-				s.deleteStoredBundleBestEffort(ctx, tenantID, ref)
+			if err := s.skills.UpdateSkillWithBundleClaim(ctx, winner, bundleClaim); err != nil {
+				s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, ref, bundleClaim, true)
 				return "", err
+			}
+			if oldRef != "" && oldRef != strings.TrimSpace(ref) {
+				s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, oldRef, uuid.NewString(), false)
 			}
 		}
 	}
@@ -166,6 +184,115 @@ func (s *TenantSkillService) InstallSkill(
 	}()
 
 	return skillID, nil
+}
+
+// deleteUnreferencedSkillBundleBestEffort removes an immutable installation
+// archive only after the database no longer points at it. Old deployments may
+// still contain refs shared by multiple installs or owned by the catalog, so
+// failure to prove exclusivity deliberately leaks bytes instead of breaking a
+// live install or reinstall source.
+func (s *TenantSkillService) deleteUnreferencedSkillBundleBestEffort(
+	ctx context.Context, tenantID uint64, ref, token string, fromWrite bool,
+) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), installCleanupTimeout)
+	defer cancel()
+	claimed, err := s.skills.ClaimUnreferencedSkillBundleDelete(
+		cleanupCtx, tenantID, ref, token, fromWrite)
+	if err != nil {
+		logger.Warnf(cleanupCtx, "[skill] retain bundle %s: cannot claim deletion: %v", ref, err)
+		return
+	}
+	if !claimed {
+		return
+	}
+	fs, err := s.fileServiceForTenant(cleanupCtx, tenantID)
+	if err != nil || fs == nil {
+		finalCtx, finalCancel := bundleClaimFinalizationContext(ctx)
+		_ = s.skills.ReleaseSkillBundleDelete(finalCtx, tenantID, ref, token)
+		finalCancel()
+		logger.Warnf(cleanupCtx, "[skill] resolve storage to delete bundle %s failed: %v", ref, err)
+		return
+	}
+	if err := fs.DeleteFile(cleanupCtx, ref); err != nil {
+		finalCtx, finalCancel := bundleClaimFinalizationContext(ctx)
+		_ = s.skills.ReleaseSkillBundleDelete(finalCtx, tenantID, ref, token)
+		finalCancel()
+		logger.Warnf(cleanupCtx, "[skill] delete superseded bundle %s failed: %v", ref, err)
+		return
+	}
+	finalCtx, finalCancel := bundleClaimFinalizationContext(ctx)
+	defer finalCancel()
+	if err := s.skills.CompleteSkillBundleDelete(finalCtx, tenantID, ref, token); err != nil {
+		logger.Warnf(cleanupCtx, "[skill] complete deletion claim for bundle %s failed: %v", ref, err)
+	}
+}
+
+func bundleClaimFinalizationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), bundleClaimFinalizeTimeout)
+}
+
+// cleanupUnpublishedBundleAfterClaimFailure compensates the only interval in
+// which unique bytes exist but no DB row points at them. Retrying the same
+// token first handles a committed claim whose response was lost. Another
+// owner's busy claim is never touched. A persistent DB error can safely fall
+// back to direct object deletion because the token-qualified ref has never
+// been published to either the skill or catalog table.
+func (s *TenantSkillService) cleanupUnpublishedBundleAfterClaimFailure(
+	ctx context.Context, tenantID uint64, ref, token string, claimErr error,
+) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), installCleanupTimeout)
+	defer cancel()
+	retryErr := s.skills.ClaimSkillBundleWrite(cleanupCtx, tenantID, ref, token)
+	switch {
+	case retryErr == nil:
+		s.deleteUnreferencedSkillBundleBestEffort(cleanupCtx, tenantID, ref, token, true)
+		return
+	case errors.Is(retryErr, repository.ErrSkillBundleRefBusy):
+		logger.Warnf(cleanupCtx,
+			"[skill] retain unpublished bundle %s: another claim owner won after %v", ref, claimErr)
+		return
+	}
+	fs, err := s.fileServiceForTenant(cleanupCtx, tenantID)
+	if err != nil || fs == nil {
+		logger.Warnf(cleanupCtx,
+			"[skill] orphan bundle %s after claim failure %v; cleanup unavailable: %v",
+			ref, claimErr, err)
+		return
+	}
+	if err := fs.DeleteFile(cleanupCtx, ref); err != nil {
+		logger.Warnf(cleanupCtx,
+			"[skill] delete unpublished bundle %s after claim failure %v failed: %v",
+			ref, claimErr, err)
+		return
+	}
+	logger.Warnf(cleanupCtx,
+		"[skill] deleted unpublished bundle %s after persistent claim failure: first=%v retry=%v",
+		ref, claimErr, retryErr)
+}
+
+func (s *TenantSkillService) claimSkillBundleWrite(
+	ctx context.Context, tenantID uint64, ref, token string,
+) error {
+	deadlineCtx, cancel := context.WithTimeout(ctx, installCleanupTimeout)
+	defer cancel()
+	for {
+		err := s.skills.ClaimSkillBundleWrite(deadlineCtx, tenantID, ref, token)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, repository.ErrSkillBundleRefBusy) {
+			return err
+		}
+		select {
+		case <-deadlineCtx.Done():
+			return deadlineCtx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
 }
 
 // takeSkillRowForInstall hands an existing row to the run about to start.
@@ -896,14 +1023,14 @@ func (s *TenantSkillService) fileServiceForTenant(
 }
 
 func (s *TenantSkillService) saveBundle(
-	ctx context.Context, tenantID uint64, skillID string, archive []byte,
+	ctx context.Context, tenantID uint64, skillID, token string, archive []byte,
 ) (string, error) {
 	fs, err := s.fileServiceForTenant(ctx, tenantID)
 	if err != nil {
 		return "", err
 	}
 	return fs.SaveBytes(ctx, archive, tenantID, fmt.Sprintf(
-		"tenant-skills/%s/%s.zip", skillID, skillArchiveSHA256(archive),
+		"tenant-skills/%s/%s/%s.zip", skillID, skillArchiveSHA256(archive), token,
 	), false)
 }
 
@@ -1159,17 +1286,39 @@ func (s *TenantSkillService) refreshSkippedBundle(
 	if existing == nil {
 		return nil
 	}
-	ref, err := s.saveBundle(ctx, existing.TenantID, existing.ID, archive)
+	token := uuid.NewString()
+	ref, err := s.saveBundle(ctx, existing.TenantID, existing.ID, token, archive)
 	if err != nil {
 		return err
 	}
+	if err := s.claimSkillBundleWrite(ctx, existing.TenantID, ref, token); err != nil {
+		s.cleanupUnpublishedBundleAfterClaimFailure(
+			ctx, existing.TenantID, ref, token, err)
+		return err
+	}
 	wantSHA := skillArchiveSHA256(archive)
-	return s.updateSkillFields(ctx, existing.TenantID, existing.SandboxConfigID, existing.ID,
-		func(e *types.TenantSkillEntity) {
-			if e.BundleSHA256 == wantSHA {
-				e.BundleRef = ref
-			}
-		})
+	current, err := s.skills.GetSkill(ctx, existing.TenantID, existing.SandboxConfigID, existing.ID)
+	if err != nil || current == nil || current.BundleSHA256 != wantSHA {
+		s.deleteUnreferencedSkillBundleBestEffort(ctx, existing.TenantID, ref, token, true)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return fmt.Errorf("skill %s not found", existing.ID)
+		}
+		return nil
+	}
+	oldRef := strings.TrimSpace(current.BundleRef)
+	current.BundleRef = ref
+	if err := s.skills.UpdateSkillWithBundleClaim(ctx, current, token); err != nil {
+		s.deleteUnreferencedSkillBundleBestEffort(ctx, existing.TenantID, ref, token, true)
+		return err
+	}
+	if oldRef != "" && oldRef != strings.TrimSpace(ref) {
+		s.deleteUnreferencedSkillBundleBestEffort(
+			ctx, existing.TenantID, oldRef, uuid.NewString(), false)
+	}
+	return nil
 }
 
 // startMaintenanceSession opens the session one image operation runs in. The

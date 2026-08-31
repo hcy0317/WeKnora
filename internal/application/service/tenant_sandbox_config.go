@@ -221,6 +221,11 @@ type sandboxConfigSkillStore interface {
 	MarkSnapshotState(ctx context.Context, tenantID uint64, id, state, snapshotID string) error
 	ListSkillsByConfig(ctx context.Context, tenantID uint64, configID string) ([]*types.TenantSkillEntity, error)
 	DeleteSkill(ctx context.Context, tenantID uint64, configID, skillID string) error
+	ClaimUnreferencedSkillBundleDelete(
+		ctx context.Context, tenantID uint64, bundleRef, token string, fromWrite bool,
+	) (bool, error)
+	CompleteSkillBundleDelete(ctx context.Context, tenantID uint64, bundleRef, token string) error
+	ReleaseSkillBundleDelete(ctx context.Context, tenantID uint64, bundleRef, token string) error
 	DeleteSnapshotRowsByConfig(ctx context.Context, tenantID uint64, configID string) error
 	DeleteUserEnvVarsByConfig(ctx context.Context, tenantID uint64, configID string) error
 }
@@ -1004,7 +1009,7 @@ func (s *TenantSandboxConfigService) Update(
 		}
 	}
 
-	updated, err := s.writeConfig(ctx, entity, in, merged)
+	updated, err := s.writeCordonedConfig(ctx, entity, in, merged, cordonedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -1055,6 +1060,9 @@ func (s *TenantSandboxConfigService) Delete(
 	if err := s.repo.SetCordon(ctx, tenantID, id, cordonedAt); err != nil {
 		return err
 	}
+	lease := &sandboxDeleteCordon{
+		service: s, tenantID: tenantID, configID: id, token: cordonedAt,
+	}
 	summaries, listErr := s.listSandboxes(ctx, entity.Config, tenantID, id)
 	if listErr != nil {
 		if !force {
@@ -1068,10 +1076,44 @@ func (s *TenantSandboxConfigService) Delete(
 		inv := s.inventoryFromSummaries(ctx, tenantID, id, summaries)
 		return &SandboxesStillLiveError{Inventory: inv}
 	}
-	if err := s.releaseSkillSnapshots(ctx, entity, tenantID, id, force); err != nil {
+	if err := s.releaseSkillSnapshots(ctx, entity, tenantID, id, force, lease); err != nil {
 		return err
 	}
-	return s.repo.SoftDeleteCordoned(ctx, tenantID, id, cordonedAt)
+	if err := lease.renew(ctx); err != nil {
+		return err
+	}
+	opCtx, cancel := sandboxDestructiveContext(ctx)
+	defer cancel()
+	return s.repo.SoftDeleteCordoned(opCtx, tenantID, id, lease.token)
+}
+
+type sandboxDeleteCordon struct {
+	service  *TenantSandboxConfigService
+	tenantID uint64
+	configID string
+	token    time.Time
+}
+
+func (l *sandboxDeleteCordon) renew(ctx context.Context) error {
+	if l == nil || l.service == nil {
+		return repository.ErrSandboxConfigDeleteOwnerLost
+	}
+	renewed := l.service.now().UTC().Truncate(time.Microsecond)
+	if !renewed.After(l.token) {
+		renewed = l.token.Add(time.Microsecond)
+	}
+	renewCtx, cancel := sandboxDestructiveContext(ctx)
+	defer cancel()
+	if err := l.service.repo.RenewCordonIfMatch(
+		renewCtx, l.tenantID, l.configID, l.token, renewed); err != nil {
+		return err
+	}
+	l.token = renewed
+	return nil
+}
+
+func sandboxDestructiveContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, sandboxConfigCleanupTimeout)
 }
 
 func snapshotReleaserFrom(client sandbox.ConfigSandboxClient) (sandboxSnapshotReleaser, bool) {
@@ -1169,6 +1211,7 @@ func (s *TenantSandboxConfigService) releaseSkillSnapshots(
 	tenantID uint64,
 	configID string,
 	force bool,
+	lease *sandboxDeleteCordon,
 ) error {
 	if s.skills == nil {
 		return nil
@@ -1185,7 +1228,10 @@ func (s *TenantSandboxConfigService) releaseSkillSnapshots(
 	}
 
 	pending := pendingSkillSnapshots(rows)
-	remaining := s.destroyPendingSnapshots(ctx, entity, pending)
+	remaining, destroyErr := s.destroyPendingSnapshots(ctx, entity, pending, lease)
+	if destroyErr != nil {
+		return destroyErr
+	}
 	if len(remaining) > 0 && !force {
 		return &SkillSnapshotReleaseFailedError{Remaining: remaining}
 	}
@@ -1195,17 +1241,17 @@ func (s *TenantSandboxConfigService) releaseSkillSnapshots(
 			configID, strings.Join(remaining, ", "))
 	}
 
-	s.cleanupSkillMetadata(ctx, tenantID, configID)
-	return nil
+	return s.cleanupSkillMetadata(ctx, tenantID, configID, lease)
 }
 
 func (s *TenantSandboxConfigService) destroyPendingSnapshots(
 	ctx context.Context,
 	entity *types.TenantSandboxConfigEntity,
 	pending []*types.TenantSkillSnapshotEntity,
-) []string {
+	lease *sandboxDeleteCordon,
+) ([]string, error) {
 	if len(pending) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	releaser := sandboxSnapshotReleaser(nil)
@@ -1221,18 +1267,29 @@ func (s *TenantSandboxConfigService) destroyPendingSnapshots(
 	}
 	var remaining []string
 	for _, row := range pending {
-		if err := deleteProviderSnapshot(ctx, releaser, row); err != nil {
+		if err := lease.renew(ctx); err != nil {
+			return remaining, err
+		}
+		opCtx, cancel := sandboxDestructiveContext(ctx)
+		err := deleteProviderSnapshot(opCtx, releaser, row)
+		cancel()
+		if err != nil {
 			remaining = append(remaining, skillSnapshotName(row))
 			continue
 		}
+		if err := lease.renew(ctx); err != nil {
+			return remaining, err
+		}
+		opCtx, cancel = sandboxDestructiveContext(ctx)
 		if err := s.skills.MarkSnapshotState(
-			ctx, row.TenantID, row.ID, types.SkillSnapshotStateDeleted, row.SnapshotID,
+			opCtx, row.TenantID, row.ID, types.SkillSnapshotStateDeleted, row.SnapshotID,
 		); err != nil {
 			logger.Warnf(ctx, "[sandbox] mark snapshot %s deleted failed: %v", row.ID, err)
 			remaining = append(remaining, skillSnapshotName(row))
 		}
+		cancel()
 	}
-	return remaining
+	return remaining, nil
 }
 
 // snapshotClientFor builds the provider client config deletion needs to
@@ -1283,8 +1340,8 @@ func deleteProviderSnapshot(
 }
 
 func (s *TenantSandboxConfigService) cleanupSkillMetadata(
-	ctx context.Context, tenantID uint64, configID string,
-) {
+	ctx context.Context, tenantID uint64, configID string, lease *sandboxDeleteCordon,
+) error {
 	skills, err := s.skills.ListSkillsByConfig(ctx, tenantID, configID)
 	if err != nil {
 		logger.Warnf(ctx, "[sandbox] list skills for config %s cleanup failed: %v", configID, err)
@@ -1293,39 +1350,97 @@ func (s *TenantSandboxConfigService) cleanupSkillMetadata(
 		if skill == nil {
 			continue
 		}
-		s.deleteSkillBundleBestEffort(ctx, tenantID, skill.BundleRef)
-		if err := s.skills.DeleteSkill(ctx, tenantID, configID, skill.ID); err != nil {
+		if err := lease.renew(ctx); err != nil {
+			return err
+		}
+		opCtx, cancel := sandboxDestructiveContext(ctx)
+		if err := s.skills.DeleteSkill(opCtx, tenantID, configID, skill.ID); err != nil {
+			cancel()
 			logger.Warnf(ctx, "[sandbox] delete skill %s on config %s failed: %v",
 				skill.ID, configID, err)
+			continue
+		}
+		cancel()
+		if err := s.deleteSkillBundleBestEffort(ctx, tenantID, skill.BundleRef, lease); err != nil {
+			return err
 		}
 	}
-	if err := s.skills.DeleteSnapshotRowsByConfig(ctx, tenantID, configID); err != nil {
+	if err := lease.renew(ctx); err != nil {
+		return err
+	}
+	opCtx, cancel := sandboxDestructiveContext(ctx)
+	if err := s.skills.DeleteSnapshotRowsByConfig(opCtx, tenantID, configID); err != nil {
 		logger.Warnf(ctx, "[sandbox] delete snapshot ledger for config %s failed: %v",
 			configID, err)
 	}
+	cancel()
 	// DeleteSkill only takes the values filed under a skill; the config-wide
 	// ones have no skill to hang off and would outlive the config.
-	if err := s.skills.DeleteUserEnvVarsByConfig(ctx, tenantID, configID); err != nil {
+	if err := lease.renew(ctx); err != nil {
+		return err
+	}
+	opCtx, cancel = sandboxDestructiveContext(ctx)
+	if err := s.skills.DeleteUserEnvVarsByConfig(opCtx, tenantID, configID); err != nil {
 		logger.Warnf(ctx, "[sandbox] delete member env vars for config %s failed: %v",
 			configID, err)
 	}
+	cancel()
+	return nil
 }
 
 func (s *TenantSandboxConfigService) deleteSkillBundleBestEffort(
-	ctx context.Context, tenantID uint64, bundleRef string,
-) {
+	ctx context.Context, tenantID uint64, bundleRef string, lease *sandboxDeleteCordon,
+) error {
 	if s.files == nil || strings.TrimSpace(bundleRef) == "" {
-		return
+		return nil
 	}
-	fs, _, err := s.files.ResolveFileService(ctx, &types.Tenant{ID: tenantID}, "", "", "")
+	if err := lease.renew(ctx); err != nil {
+		return err
+	}
+	token := uuid.NewString()
+	opCtx, opCancel := sandboxDestructiveContext(ctx)
+	claimed, err := s.skills.ClaimUnreferencedSkillBundleDelete(
+		opCtx, tenantID, bundleRef, token, false)
+	opCancel()
+	if err != nil {
+		logger.Warnf(ctx, "[sandbox] claim bundle %s deletion failed: %v", bundleRef, err)
+		return nil
+	}
+	if !claimed {
+		return nil
+	}
+	if err := lease.renew(ctx); err != nil {
+		finalCtx, finalCancel := bundleClaimFinalizationContext(ctx)
+		_ = s.skills.ReleaseSkillBundleDelete(finalCtx, tenantID, bundleRef, token)
+		finalCancel()
+		return err
+	}
+	opCtx, opCancel = sandboxDestructiveContext(ctx)
+	fs, _, err := s.files.ResolveFileService(opCtx, &types.Tenant{ID: tenantID}, "", "", "")
 	if err != nil || fs == nil {
+		opCancel()
+		finalCtx, finalCancel := bundleClaimFinalizationContext(ctx)
+		_ = s.skills.ReleaseSkillBundleDelete(finalCtx, tenantID, bundleRef, token)
+		finalCancel()
 		logger.Warnf(ctx, "[sandbox] resolve file service to delete bundle %s failed: %v",
 			bundleRef, err)
-		return
+		return nil
 	}
-	if err := fs.DeleteFile(ctx, bundleRef); err != nil {
+	if err := fs.DeleteFile(opCtx, bundleRef); err != nil {
+		opCancel()
+		finalCtx, finalCancel := bundleClaimFinalizationContext(ctx)
+		_ = s.skills.ReleaseSkillBundleDelete(finalCtx, tenantID, bundleRef, token)
+		finalCancel()
 		logger.Warnf(ctx, "[sandbox] delete bundle %s failed: %v", bundleRef, err)
+		return nil
 	}
+	opCancel()
+	finalCtx, finalCancel := bundleClaimFinalizationContext(ctx)
+	defer finalCancel()
+	if err := s.skills.CompleteSkillBundleDelete(finalCtx, tenantID, bundleRef, token); err != nil {
+		logger.Warnf(ctx, "[sandbox] complete bundle %s deletion claim failed: %v", bundleRef, err)
+	}
+	return nil
 }
 
 func (s *TenantSandboxConfigService) clientFor(
@@ -1365,6 +1480,27 @@ func (s *TenantSandboxConfigService) writeConfig(
 		entity.SandboxType = merged.SandboxType
 	}
 	if err := s.repo.Update(ctx, entity); err != nil {
+		return nil, err
+	}
+	return entity, nil
+}
+
+func (s *TenantSandboxConfigService) writeCordonedConfig(
+	ctx context.Context,
+	entity *types.TenantSandboxConfigEntity,
+	in UpdateSandboxConfigInput,
+	merged *types.TenantSandboxConfig,
+	cordonedAt time.Time,
+) (*types.TenantSandboxConfigEntity, error) {
+	if name := strings.TrimSpace(in.Name); name != "" {
+		entity.Name = name
+	}
+	entity.Description = in.Description
+	entity.Config = merged
+	if merged != nil {
+		entity.SandboxType = merged.SandboxType
+	}
+	if err := s.repo.UpdateCordoned(ctx, entity, cordonedAt); err != nil {
 		return nil, err
 	}
 	return entity, nil

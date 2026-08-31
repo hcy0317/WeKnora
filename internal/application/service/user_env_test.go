@@ -65,6 +65,12 @@ func (r *userEnvConfigRepo) Update(context.Context, *types.TenantSandboxConfigEn
 	panic("Update is outside the user env surface")
 }
 
+func (r *userEnvConfigRepo) UpdateCordoned(
+	context.Context, *types.TenantSandboxConfigEntity, time.Time,
+) error {
+	panic("UpdateCordoned is outside the user env surface")
+}
+
 func (r *userEnvConfigRepo) SoftDelete(context.Context, uint64, string) error {
 	panic("SoftDelete is outside the user env surface")
 }
@@ -75,6 +81,12 @@ func (r *userEnvConfigRepo) SoftDeleteCordoned(context.Context, uint64, string, 
 
 func (r *userEnvConfigRepo) SetCordon(context.Context, uint64, string, time.Time) error {
 	panic("SetCordon is outside the user env surface")
+}
+
+func (r *userEnvConfigRepo) RenewCordonIfMatch(
+	context.Context, uint64, string, time.Time, time.Time,
+) error {
+	panic("RenewCordonIfMatch is outside the user env surface")
 }
 
 func (r *userEnvConfigRepo) ClearCordon(context.Context, uint64, string) error {

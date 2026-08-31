@@ -68,13 +68,12 @@ func (s *TenantSkillService) ensureCatalogBundleBeforeRemoval(
 	if err != nil || catalog == nil || strings.TrimSpace(catalog.BundleRef) != "" {
 		return err
 	}
-	archive, err := s.downloadSkillBundle(ctx, tenantID, skill)
-	if err != nil {
-		return err
-	}
-	return s.ensureCatalogOwnedBundle(
-		ctx, tenantID, catalog.ID, strings.TrimSpace(skill.BundleSHA256), archive,
-	)
+	// The catalog may already describe a newer upload of the same skill name.
+	// catalogBundleArchive selects an installation whose archive matches the
+	// catalog digest; using the row being removed unconditionally can either
+	// preserve the wrong version or permanently block removal of the old one.
+	_, err = s.catalogBundleArchive(ctx, tenantID, catalog)
+	return err
 }
 
 func (s *TenantSkillService) runRemove(
@@ -495,13 +494,5 @@ func (s *TenantSkillService) removeStillOwnsTheRow(
 func (s *TenantSkillService) deleteBundleBestEffort(
 	ctx context.Context, tenantID uint64, bundleRef string,
 ) {
-	fs, err := s.fileServiceForTenant(ctx, tenantID)
-	if err != nil || fs == nil {
-		logger.Warnf(ctx, "[skill] resolve file service to delete bundle %s failed: %v",
-			bundleRef, err)
-		return
-	}
-	if err := fs.DeleteFile(ctx, bundleRef); err != nil {
-		logger.Warnf(ctx, "[skill] delete bundle %s failed: %v", bundleRef, err)
-	}
+	s.deleteUnreferencedSkillBundleBestEffort(ctx, tenantID, bundleRef, uuid.NewString(), false)
 }

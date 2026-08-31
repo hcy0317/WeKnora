@@ -16,6 +16,44 @@ import (
 // commands are: it runs as root with the skills root writable.
 const removeSkillDirCommand = "rm -rf " + installSkillDir
 
+func TestEnsureCatalogBundleBeforeRemovalUsesMatchingVersion(t *testing.T) {
+	fx := newInstallFixture(t)
+	fx.returnNamedBundleRefs = true
+	ctx := context.Background()
+	oldArchive := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
+	newArchive := zipBundle(t, map[string]string{
+		"SKILL.md": validSkillMD, "scripts/v2.py": "print('v2')\n",
+	})
+	oldSHA := skillArchiveSHA256(oldArchive)
+	newSHA := skillArchiveSHA256(newArchive)
+	oldRef := "file://tenant-skills/sk-old/" + oldSHA + ".zip"
+	newRef := "file://tenant-skills/sk-new/" + newSHA + ".zip"
+	fx.storedBundles = map[string][]byte{oldRef: oldArchive, newRef: newArchive}
+	require.NoError(t, fx.skillRepo.CreateCatalog(ctx, &types.TenantSkillCatalogEntity{
+		ID: "cat-1", TenantID: 7, Name: "pdf-tools", Version: "2.0.0", BundleSHA256: newSHA,
+	}))
+	oldSkill, err := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	oldSkill.CatalogID = "cat-1"
+	oldSkill.Version = "1.0.0"
+	oldSkill.BundleRef = oldRef
+	oldSkill.BundleSHA256 = oldSHA
+	require.NoError(t, fx.skillRepo.UpdateSkill(ctx, oldSkill))
+	require.NoError(t, fx.skillRepo.CreateSkill(ctx, &types.TenantSkillEntity{
+		ID: "sk-new", TenantID: 7, SandboxConfigID: "cfg-2", CatalogID: "cat-1",
+		Name: "pdf-tools", Version: "2.0.0", BundleRef: newRef, BundleSHA256: newSHA,
+		Status: types.SkillStatusReady, Enabled: true,
+	}))
+
+	require.NoError(t, fx.svc.ensureCatalogBundleBeforeRemoval(ctx, 7, oldSkill))
+	catalog, err := fx.skillRepo.GetCatalog(ctx, 7, "cat-1")
+	require.NoError(t, err)
+	require.NotEmpty(t, catalog.BundleRef)
+	require.Equal(t, newSHA, catalog.BundleSHA256)
+	require.Equal(t, newArchive, fx.storedBundles[catalog.BundleRef])
+	require.NotEqual(t, oldRef, catalog.BundleRef)
+}
+
 func TestRunRemoveProducesANewSnapshotWithoutTheSkillDir(t *testing.T) {
 	fx := newInstallFixture(t)
 	fx.seedInstalledSkill("sk-1", "snap-old", 2)

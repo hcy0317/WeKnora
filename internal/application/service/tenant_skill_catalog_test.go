@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -53,11 +54,14 @@ func TestResolveCatalogFindsLegacySkillID(t *testing.T) {
 	))
 	repo := repository.NewTenantSkillRepository(db)
 	ctx := context.WithValue(context.Background(), types.TenantRoleContextKey, types.TenantRoleAdmin)
-	require.NoError(t, repo.CreateSkill(ctx, &types.TenantSkillEntity{
+	// This fixture represents a pre-claim legacy row. Insert it below the
+	// repository boundary because current callers must never write BundleRef
+	// without first owning the durable bundle claim.
+	require.NoError(t, db.Create(&types.TenantSkillEntity{
 		ID: "sk-old", TenantID: 7, SandboxConfigID: "cfg-a",
 		Name: "pdf", BundleRef: "local://7/tenant-skills/sk-old.zip",
 		Status: types.SkillStatusReady, Enabled: true,
-	}))
+	}).Error)
 
 	svc := NewTenantSkillService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	cat, err := svc.resolveCatalog(ctx, 7, "sk-old")
@@ -118,6 +122,38 @@ func TestListCatalogViewerDoesNotExposeOperationalState(t *testing.T) {
 	require.Len(t, list, 1)
 	require.Empty(t, list[0].BundleSHA256)
 	require.Nil(t, list[0].Installations)
+}
+
+func TestListCatalogContributorCanSelectInstalledSkillWithoutOperationalSecrets(t *testing.T) {
+	repo := catalogTestRepo(t, "file:catalog-contributor?mode=memory&cache=shared")
+	ctx := context.WithValue(context.Background(), types.TenantRoleContextKey, types.TenantRoleContributor)
+	require.NoError(t, repo.CreateCatalog(ctx, &types.TenantSkillCatalogEntity{
+		ID: "cat-pdf", TenantID: 7, Name: "pdf", BundleSHA256: strings.Repeat("a", 64),
+	}))
+	require.NoError(t, repo.CreateSkill(ctx, &types.TenantSkillEntity{
+		ID: "sk-1", TenantID: 7, SandboxConfigID: "cfg-a", CatalogID: "cat-pdf",
+		Name: "pdf", Status: types.SkillStatusReady, Error: "private provider detail",
+		BundleSHA256: strings.Repeat("b", 64), Enabled: true,
+	}))
+
+	svc := NewTenantSkillService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	list, err := svc.ListCatalog(ctx, 7)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.Empty(t, list[0].BundleSHA256)
+	require.Len(t, list[0].Installations, 1)
+	install := list[0].Installations[0]
+	require.Equal(t, "cfg-a", install.SandboxConfigID)
+	require.Equal(t, types.SkillStatusReady, install.Status)
+	require.True(t, install.Enabled)
+	require.Empty(t, install.SkillID)
+	require.Empty(t, install.Error)
+	require.Empty(t, install.BundleSHA256)
+	encoded, err := json.Marshal(list[0])
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "bundle_sha256")
+	require.NotContains(t, string(encoded), "skill_id")
+	require.NotContains(t, string(encoded), "private provider detail")
 }
 
 func TestDeleteCatalogRefusesWhileARemovalIsInFlight(t *testing.T) {
@@ -227,6 +263,23 @@ func TestMigratedCatalogBackfillsBeforeLastRemovalAndCanReinstall(t *testing.T) 
 	result, err := fx.svc.InstallCatalogToConfigs(ctx, 7, "cat-migrated", []string{"cfg-1"})
 	require.NoError(t, err)
 	require.NotEmpty(t, result.Installs["cfg-1"])
+}
+
+func TestCatalogBundleArchiveReturnsTemporaryStorageError(t *testing.T) {
+	fx := newInstallFixture(t)
+	ctx := context.Background()
+	archive := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
+	sha := skillArchiveSHA256(archive)
+	catalog := &types.TenantSkillCatalogEntity{
+		ID: "cat-temporary", TenantID: 7, Name: "pdf-tools",
+		BundleRef: "file://temporarily-unavailable.zip", BundleSHA256: sha,
+	}
+
+	_, err := fx.svc.catalogBundleArchive(ctx, 7, catalog)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "bundle not found")
+	require.NotContains(t, err.Error(), "no longer stored",
+		"a temporary object-store read failure must not be rewritten as permanent absence")
 }
 
 func TestInstallCatalogToConfigsReportsPartialFailure(t *testing.T) {

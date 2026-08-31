@@ -215,10 +215,12 @@ type fakeConfigRepo struct {
 	updated *types.TenantSandboxConfigEntity
 	deleted bool
 
-	onSetCordon  func()
-	setCordonErr error
-	onUpdate     func()
-	updateErr    error
+	onSetCordon    func()
+	setCordonErr   error
+	onRenewCordon  func()
+	renewCordonErr error
+	onUpdate       func()
+	updateErr      error
 
 	clearCordonCtxErr error
 	cordonAt          time.Time
@@ -272,6 +274,15 @@ func (f *fakeConfigRepo) Update(
 	return nil
 }
 
+func (f *fakeConfigRepo) UpdateCordoned(
+	ctx context.Context, e *types.TenantSandboxConfigEntity, cordonedAt time.Time,
+) error {
+	if !cordonedAt.Equal(f.cordonAt) {
+		return repository.ErrSandboxConfigCordoned
+	}
+	return f.Update(ctx, e)
+}
+
 func (f *fakeConfigRepo) SoftDelete(_ context.Context, _ uint64, id string) error {
 	f.events = append(f.events, "delete")
 	if f.policy != nil && f.policy.ID == id {
@@ -288,6 +299,22 @@ func (f *fakeConfigRepo) SetCordon(_ context.Context, _ uint64, _ string, at tim
 		f.onSetCordon()
 	}
 	return f.setCordonErr
+}
+
+func (f *fakeConfigRepo) RenewCordonIfMatch(
+	_ context.Context, _ uint64, _ string, expected, renewed time.Time,
+) error {
+	if f.onRenewCordon != nil {
+		f.onRenewCordon()
+	}
+	if f.renewCordonErr != nil {
+		return f.renewCordonErr
+	}
+	if !expected.Equal(f.cordonAt) {
+		return repository.ErrSandboxConfigDeleteOwnerLost
+	}
+	f.cordonAt = renewed
+	return nil
 }
 
 func (f *fakeConfigRepo) SoftDeleteCordoned(
@@ -1572,9 +1599,92 @@ func TestDeleteReleasesSkillSnapshotsBeforeSoftDelete(t *testing.T) {
 	require.Empty(t, fx.skills.skills, "tenant_skills rows must be dropped before SoftDelete")
 	require.True(t, fx.skills.ledgerCleared)
 	require.Equal(t, []string{"bundle://skill-a.zip"}, fx.files.deleted)
+	require.Len(t, fx.skills.completedClaims, 1)
+	require.Contains(t, fx.skills.completedClaims[0], "bundle://skill-a.zip:",
+		"physical deletion must complete the exact durable claim token")
 	// DeleteSkill only takes values filed under a skill; the config-wide ones
 	// would outlive the config without this.
 	require.Equal(t, []string{"7:cfg-a"}, fx.skills.envVarsClearedFor)
+}
+
+func TestDeleteOwnerLossStopsAllLaterDestructiveStages(t *testing.T) {
+	fx := newSnapshotReleaseFixture(t, nil)
+	renewals := 0
+	fx.repo.onRenewCordon = func() {
+		renewals++
+		if renewals == 2 {
+			fx.repo.renewCordonErr = repository.ErrSandboxConfigDeleteOwnerLost
+		}
+	}
+
+	err := fx.svc.Delete(context.Background(), 7, "cfg-a", false)
+	require.ErrorIs(t, err, repository.ErrSandboxConfigDeleteOwnerLost)
+	require.Equal(t, []string{"snap-1"}, fx.events,
+		"owner loss before the snapshot ledger write must stop every later provider deletion")
+	require.NotContains(t, fx.skills.marks, "row-1:"+types.SkillSnapshotStateDeleted)
+	require.Len(t, fx.skills.skills, 1, "skill metadata must remain after owner loss")
+	require.Empty(t, fx.files.deleted, "bundle deletion must not start after owner loss")
+	require.False(t, fx.skills.ledgerCleared)
+	require.Empty(t, fx.skills.envVarsClearedFor)
+}
+
+func TestDeleteSkillMetadataFailureDoesNotDeleteBundle(t *testing.T) {
+	fx := newSnapshotReleaseFixture(t, nil)
+	fx.skills.deleteSkillErr = stderrors.New("database unavailable")
+
+	require.NoError(t, fx.svc.Delete(context.Background(), 7, "cfg-a", false))
+	require.Empty(t, fx.files.deleted)
+	require.Len(t, fx.skills.skills, 1,
+		"a surviving DB row must keep ownership of its physical archive")
+	require.Empty(t, fx.skills.completedClaims)
+}
+
+func TestDeleteSkillMetadataRetainsCatalogOwnedBundle(t *testing.T) {
+	fx := newSnapshotReleaseFixture(t, nil)
+	fx.skills.catalogBundleRefs = map[string]bool{"bundle://skill-a.zip": true}
+
+	require.NoError(t, fx.svc.Delete(context.Background(), 7, "cfg-a", false))
+	require.Empty(t, fx.files.deleted)
+	require.Empty(t, fx.skills.skills)
+	require.Empty(t, fx.skills.completedClaims,
+		"the catalog's live reference must prevent a deletion claim")
+}
+
+func TestDeleteSkillBundleFinalizesOnFreshContext(t *testing.T) {
+	fx := newSnapshotReleaseFixture(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	fx.files.afterDelete = cancel
+	fx.skills.skills = nil // the DB row was already deleted before physical cleanup
+	cordonAt := fx.svc.now().UTC().Truncate(time.Microsecond)
+	require.NoError(t, fx.repo.SetCordon(context.Background(), 7, "cfg-a", cordonAt))
+	lease := &sandboxDeleteCordon{
+		service: fx.svc, tenantID: 7, configID: "cfg-a", token: cordonAt,
+	}
+
+	require.NoError(t, fx.svc.deleteSkillBundleBestEffort(
+		ctx, 7, "bundle://skill-a.zip", lease))
+	require.Error(t, ctx.Err(), "the file operation must expire the request context")
+	require.NoError(t, fx.skills.completeCtxErr,
+		"claim completion must use an independent finalization context")
+}
+
+func TestDeleteSkillBundleReleaseUsesFreshContextAfterResolveFailure(t *testing.T) {
+	fx := newSnapshotReleaseFixture(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cordonAt := fx.svc.now().UTC().Truncate(time.Microsecond)
+	require.NoError(t, fx.repo.SetCordon(context.Background(), 7, "cfg-a", cordonAt))
+	lease := &sandboxDeleteCordon{
+		service: fx.svc, tenantID: 7, configID: "cfg-a", token: cordonAt,
+	}
+	fx.skills.skills = nil
+	fx.files.onResolve = cancel
+	fx.files.resolveErr = stderrors.New("storage unavailable")
+
+	require.NoError(t, fx.svc.deleteSkillBundleBestEffort(
+		ctx, 7, "bundle://skill-a.zip", lease))
+	require.NoError(t, fx.skills.releaseCtxErr,
+		"claim release must not reuse the cancelled storage context")
+	require.Empty(t, fx.skills.bundleClaims)
 }
 
 func TestDeleteRefusesWhenSnapshotReleaseFailsWithoutForce(t *testing.T) {
@@ -1824,6 +1934,12 @@ type deleteSkillStore struct {
 	marks             []string
 	ledgerCleared     bool
 	envVarsClearedFor []string
+	deleteSkillErr    error
+	catalogBundleRefs map[string]bool
+	bundleClaims      map[string]string
+	completedClaims   []string
+	completeCtxErr    error
+	releaseCtxErr     error
 }
 
 func (s *deleteSkillStore) snapshot(id string) *types.TenantSkillSnapshotEntity {
@@ -1892,6 +2008,9 @@ func (s *deleteSkillStore) DeleteSkill(ctx context.Context, tenantID uint64, con
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if s.deleteSkillErr != nil {
+		return s.deleteSkillErr
+	}
 	kept := s.skills[:0]
 	for _, row := range s.skills {
 		if row.TenantID == tenantID && row.SandboxConfigID == configID && row.ID == skillID {
@@ -1900,6 +2019,47 @@ func (s *deleteSkillStore) DeleteSkill(ctx context.Context, tenantID uint64, con
 		kept = append(kept, row)
 	}
 	s.skills = kept
+	return nil
+}
+
+func (s *deleteSkillStore) ClaimUnreferencedSkillBundleDelete(
+	_ context.Context, tenantID uint64, ref, token string, _ bool,
+) (bool, error) {
+	for _, row := range s.skills {
+		if row != nil && row.TenantID == tenantID && row.BundleRef == ref {
+			return false, nil
+		}
+	}
+	if s.catalogBundleRefs[ref] {
+		return false, nil
+	}
+	if s.bundleClaims == nil {
+		s.bundleClaims = map[string]string{}
+	}
+	s.bundleClaims[ref] = token
+	return true, nil
+}
+
+func (s *deleteSkillStore) CompleteSkillBundleDelete(
+	ctx context.Context, _ uint64, ref, token string,
+) error {
+	s.completeCtxErr = ctx.Err()
+	if s.bundleClaims[ref] != token {
+		return stderrors.New("claim token mismatch")
+	}
+	delete(s.bundleClaims, ref)
+	s.completedClaims = append(s.completedClaims, ref+":"+token)
+	return nil
+}
+
+func (s *deleteSkillStore) ReleaseSkillBundleDelete(
+	ctx context.Context, _ uint64, ref, token string,
+) error {
+	s.releaseCtxErr = ctx.Err()
+	if s.bundleClaims[ref] != token {
+		return stderrors.New("claim token mismatch")
+	}
+	delete(s.bundleClaims, ref)
 	return nil
 }
 
@@ -1930,7 +2090,10 @@ func (s *deleteSkillStore) DeleteUserEnvVarsByConfig(
 }
 
 type deleteBundleResolver struct {
-	deleted []string
+	deleted     []string
+	afterDelete func()
+	onResolve   func()
+	resolveErr  error
 }
 
 func (r *deleteBundleResolver) ResolveFileService(
@@ -1938,6 +2101,12 @@ func (r *deleteBundleResolver) ResolveFileService(
 ) (interfaces.FileService, string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
+	}
+	if r.onResolve != nil {
+		r.onResolve()
+	}
+	if r.resolveErr != nil {
+		return nil, "", r.resolveErr
 	}
 	return deleteFileService{r: r}, "", nil
 }
@@ -1959,6 +2128,9 @@ func (s deleteFileService) DeleteFile(ctx context.Context, ref string) error {
 		return err
 	}
 	s.r.deleted = append(s.r.deleted, ref)
+	if s.r.afterDelete != nil {
+		s.r.afterDelete()
+	}
 	return nil
 }
 
