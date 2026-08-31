@@ -597,6 +597,93 @@ func TestInstallSkillAcceptsStorageReturningUniqueRefPerSave(t *testing.T) {
 	require.Contains(t, catalog.BundleRef, "opaque-save-1")
 }
 
+func TestInstallSkillClaimFailureCleansUniqueRefAfterRequestCancellation(t *testing.T) {
+	fx := newInstallFixture(t)
+	fx.returnNamedBundleRefs = true
+	ctx, cancel := context.WithCancel(context.Background())
+	fx.afterSave = func(call int) {
+		if call == 2 { // catalog is first; installation archive is second
+			cancel()
+		}
+	}
+	archive := zipBundle(t, map[string]string{
+		"SKILL.md": validSkillMD, "scripts/cancel.py": "print('cancel')\n",
+	})
+
+	_, err := fx.svc.InstallSkill(ctx, 7, "cfg-1", archive)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Len(t, fx.deletedBundles, 1)
+	require.Contains(t, fx.deletedBundles[0], "tenant-skills/sk-1/")
+	require.NotContains(t, fx.storedBundles, fx.deletedBundles[0],
+		"DeleteFile must remove the storage resource row/object for the unpublished ref")
+}
+
+func TestRefreshSkippedBundleClaimFailureCleansUniqueRefAfterRequestCancellation(t *testing.T) {
+	fx := newInstallFixture(t)
+	fx.returnNamedBundleRefs = true
+	ctx, cancel := context.WithCancel(context.Background())
+	fx.afterSave = func(int) { cancel() }
+	archive := zipBundle(t, map[string]string{
+		"SKILL.md": validSkillMD, "scripts/cancel.py": "print('cancel')\n",
+	})
+	bundle, err := ParseSkillBundle(archive)
+	require.NoError(t, err)
+	skill, err := fx.skillRepo.GetSkill(ctx, 7, "cfg-1", "sk-1")
+	require.NoError(t, err)
+	skill.BundleSHA256 = bundle.SHA256
+
+	err = fx.svc.refreshSkippedBundle(ctx, skill, archive)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Len(t, fx.deletedBundles, 1)
+	require.NotContains(t, fx.storedBundles, fx.deletedBundles[0])
+}
+
+func TestStoreCatalogBundleClaimFailureCleansUniqueRefAfterRequestCancellation(t *testing.T) {
+	fx := newInstallFixture(t)
+	fx.returnNamedBundleRefs = true
+	ctx, cancel := context.WithCancel(context.Background())
+	fx.afterSave = func(int) { cancel() }
+	archive := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
+	catalog := &types.TenantSkillCatalogEntity{ID: "cat-cancel", TenantID: 7, Name: "pdf-tools"}
+
+	stored, _, err := fx.svc.storeCatalogBundle(ctx, 7, catalog, archive, true)
+	require.False(t, stored)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Len(t, fx.deletedBundles, 1)
+	require.NotContains(t, fx.storedBundles, fx.deletedBundles[0])
+}
+
+func TestUnpublishedBundlePersistentClaimErrorDeletesStorageResource(t *testing.T) {
+	fx := newInstallFixture(t)
+	fx.returnNamedBundleRefs = true
+	dbErr := errors.New("claim database unavailable")
+	fx.skillRepo.claimWriteErrors = []error{dbErr, dbErr}
+	archive := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
+	catalog := &types.TenantSkillCatalogEntity{ID: "cat-db-error", TenantID: 7, Name: "pdf-tools"}
+
+	stored, _, err := fx.svc.storeCatalogBundle(context.Background(), 7, catalog, archive, true)
+	require.False(t, stored)
+	require.ErrorIs(t, err, dbErr)
+	require.Len(t, fx.deletedBundles, 1)
+	require.NotContains(t, fx.storedBundles, fx.deletedBundles[0],
+		"direct cleanup must remove both the unique object and its storage resource record")
+}
+
+func TestUnpublishedBundleBusyRetryRetainsOtherOwnersObject(t *testing.T) {
+	fx := newInstallFixture(t)
+	fx.returnNamedBundleRefs = true
+	dbErr := errors.New("claim response lost")
+	fx.skillRepo.claimWriteErrors = []error{dbErr, repository.ErrSkillBundleRefBusy}
+	archive := zipBundle(t, map[string]string{"SKILL.md": validSkillMD})
+	catalog := &types.TenantSkillCatalogEntity{ID: "cat-busy", TenantID: 7, Name: "pdf-tools"}
+
+	stored, _, err := fx.svc.storeCatalogBundle(context.Background(), 7, catalog, archive, true)
+	require.False(t, stored)
+	require.ErrorIs(t, err, dbErr)
+	require.Empty(t, fx.deletedBundles)
+	require.Len(t, fx.storedBundles, 1)
+}
+
 func TestInstallSkillUpgradeDeletesSupersededUnreferencedArchive(t *testing.T) {
 	fx := newInstallFixture(t)
 	fx.returnNamedBundleRefs = true
@@ -1778,6 +1865,7 @@ type installFixture struct {
 	// beforeSeed runs on the first image file write, so a test can prove the
 	// transcript locators landed before the minutes-long copy begins.
 	beforeSeed func()
+	afterSave  func(int)
 	// staleMarks records every InvalidateConfigSandboxes call, so a test can
 	// state which config was marked rather than only that something was.
 	staleMarks []staleMark
@@ -2088,6 +2176,7 @@ type installSkillRepo struct {
 	bundleClaims        map[string]installBundleClaim
 	onBundleDeleteClaim func(string)
 	onBundleWriteClaim  func(string)
+	claimWriteErrors    []error
 	// updateFailsWhen models a transient write failure for one kind of row
 	// state, so a test can fail the terminal bookkeeping write without
 	// disabling every other write the run makes.
@@ -2241,6 +2330,12 @@ func (r *installSkillRepo) ClaimSkillBundleWrite(
 		return err
 	}
 	r.mu.Lock()
+	if len(r.claimWriteErrors) > 0 {
+		err := r.claimWriteErrors[0]
+		r.claimWriteErrors = r.claimWriteErrors[1:]
+		r.mu.Unlock()
+		return err
+	}
 	key := installBundleClaimKey(tenantID, ref)
 	claim := r.bundleClaims[key]
 	if claim.state == "writing" && claim.token == token {
@@ -3405,6 +3500,9 @@ func (s installFileService) SaveBytes(_ context.Context, data []byte, _ uint64, 
 			ref = fmt.Sprintf("file://opaque-save-%d", s.fx.savedBundles)
 		}
 		s.fx.storedBundles[ref] = copied
+		if s.fx.afterSave != nil {
+			s.fx.afterSave(s.fx.savedBundles)
+		}
 	}
 	return ref, nil
 }

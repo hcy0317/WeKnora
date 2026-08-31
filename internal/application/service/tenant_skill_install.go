@@ -114,6 +114,7 @@ func (s *TenantSkillService) InstallSkill(
 		return "", fmt.Errorf("store bundle for skill %s: %w", skillID, err)
 	}
 	if err := s.claimSkillBundleWrite(ctx, tenantID, ref, bundleClaim); err != nil {
+		s.cleanupUnpublishedBundleAfterClaimFailure(ctx, tenantID, ref, bundleClaim, err)
 		return "", fmt.Errorf("claim bundle for skill %s: %w", skillID, err)
 	}
 	now := s.now()
@@ -232,6 +233,45 @@ func (s *TenantSkillService) deleteUnreferencedSkillBundleBestEffort(
 
 func bundleClaimFinalizationContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), bundleClaimFinalizeTimeout)
+}
+
+// cleanupUnpublishedBundleAfterClaimFailure compensates the only interval in
+// which unique bytes exist but no DB row points at them. Retrying the same
+// token first handles a committed claim whose response was lost. Another
+// owner's busy claim is never touched. A persistent DB error can safely fall
+// back to direct object deletion because the token-qualified ref has never
+// been published to either the skill or catalog table.
+func (s *TenantSkillService) cleanupUnpublishedBundleAfterClaimFailure(
+	ctx context.Context, tenantID uint64, ref, token string, claimErr error,
+) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), installCleanupTimeout)
+	defer cancel()
+	retryErr := s.skills.ClaimSkillBundleWrite(cleanupCtx, tenantID, ref, token)
+	switch {
+	case retryErr == nil:
+		s.deleteUnreferencedSkillBundleBestEffort(cleanupCtx, tenantID, ref, token, true)
+		return
+	case errors.Is(retryErr, repository.ErrSkillBundleRefBusy):
+		logger.Warnf(cleanupCtx,
+			"[skill] retain unpublished bundle %s: another claim owner won after %v", ref, claimErr)
+		return
+	}
+	fs, err := s.fileServiceForTenant(cleanupCtx, tenantID)
+	if err != nil || fs == nil {
+		logger.Warnf(cleanupCtx,
+			"[skill] orphan bundle %s after claim failure %v; cleanup unavailable: %v",
+			ref, claimErr, err)
+		return
+	}
+	if err := fs.DeleteFile(cleanupCtx, ref); err != nil {
+		logger.Warnf(cleanupCtx,
+			"[skill] delete unpublished bundle %s after claim failure %v failed: %v",
+			ref, claimErr, err)
+		return
+	}
+	logger.Warnf(cleanupCtx,
+		"[skill] deleted unpublished bundle %s after persistent claim failure: first=%v retry=%v",
+		ref, claimErr, retryErr)
 }
 
 func (s *TenantSkillService) claimSkillBundleWrite(
@@ -1252,6 +1292,8 @@ func (s *TenantSkillService) refreshSkippedBundle(
 		return err
 	}
 	if err := s.claimSkillBundleWrite(ctx, existing.TenantID, ref, token); err != nil {
+		s.cleanupUnpublishedBundleAfterClaimFailure(
+			ctx, existing.TenantID, ref, token, err)
 		return err
 	}
 	wantSHA := skillArchiveSHA256(archive)

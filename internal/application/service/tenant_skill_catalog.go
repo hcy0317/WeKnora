@@ -395,6 +395,7 @@ func (s *TenantSkillService) storeCatalogBundle(
 		return false, "", nil
 	}
 	if err := s.claimSkillBundleWrite(ctx, tenantID, ref, token); err != nil {
+		s.cleanupUnpublishedBundleAfterClaimFailure(ctx, tenantID, ref, token, err)
 		if requireStore {
 			return false, "", fmt.Errorf("claim catalog bundle: %w", err)
 		}
