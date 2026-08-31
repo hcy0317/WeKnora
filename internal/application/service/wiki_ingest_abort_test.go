@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -14,8 +15,11 @@ import (
 type wikiAbortPendingRepo struct {
 	interfaces.TaskPendingOpsRepository
 	interfaces.TaskPendingOpsClaimLease
-	failCount int
-	order     []string
+	failCount    int
+	order        []string
+	releasedIDs  []int64
+	releaseOwner types.TaskClaimOwner
+	releaseErr   error
 }
 
 func (r *wikiAbortPendingRepo) IncrClaimFailCount(
@@ -26,10 +30,57 @@ func (r *wikiAbortPendingRepo) IncrClaimFailCount(
 }
 
 func (r *wikiAbortPendingRepo) ReleaseClaims(
-	_ context.Context, _ []int64, _ types.TaskClaimOwner,
+	_ context.Context, ids []int64, owner types.TaskClaimOwner,
 ) error {
 	r.order = append(r.order, "release")
-	return nil
+	r.releasedIDs = append(r.releasedIDs, ids...)
+	r.releaseOwner = owner
+	return r.releaseErr
+}
+
+func TestRequeueDeferredOpsUsesOwnerSafeReleaseWithoutChargingFailureBudget(t *testing.T) {
+	owner := &types.TaskClaimOwner{Token: "claim-token", TaskID: "task-id"}
+	repo := &wikiAbortPendingRepo{failCount: wikiMaxFailRetries + 1}
+	svc := &wikiIngestService{pendingRepo: repo}
+
+	err := svc.requeueDeferredOps(context.Background(), []WikiPendingOp{{
+		KnowledgeID: "kid", WorkID: "work-a", dbID: 31, dbIDs: []int64{31, 32}, claimOwner: owner,
+	}})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"release"}, repo.order)
+	require.Equal(t, []int64{31, 32}, repo.releasedIDs)
+	require.Equal(t, *owner, repo.releaseOwner)
+}
+
+func TestRequeueDeferredOpsReleaseFailureRequestsReleaseOnlyAbort(t *testing.T) {
+	wantErr := errors.New("release failed")
+	owner := &types.TaskClaimOwner{Token: "claim-token", TaskID: "task-id"}
+	repo := &wikiAbortPendingRepo{failCount: wikiMaxFailRetries + 1, releaseErr: wantErr}
+	svc := &wikiIngestService{pendingRepo: repo}
+
+	err := svc.requeueDeferredOps(context.Background(), []WikiPendingOp{{
+		KnowledgeID: "kid", WorkID: "work-a", dbID: 31, claimOwner: owner,
+	}})
+
+	require.ErrorIs(t, err, errWikiDeferredRelease)
+	require.ErrorIs(t, err, wantErr)
+	require.NotContains(t, repo.order, "increment")
+}
+
+func TestRequeueFailedOpsReleasesEveryExactDuplicateWithOneBudgetCharge(t *testing.T) {
+	owner := &types.TaskClaimOwner{Token: "claim-token", TaskID: "task-id"}
+	repo := &wikiAbortPendingRepo{failCount: 1}
+	svc := &wikiIngestService{pendingRepo: repo}
+
+	err := svc.requeueFailedOps(context.Background(), WikiIngestPayload{}, []WikiPendingOp{{
+		KnowledgeID: "kid", WorkID: "work-a", dbID: 31, dbIDs: []int64{31, 32}, claimOwner: owner,
+	}})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"increment", "release"}, repo.order)
+	require.Equal(t, []int64{31, 32}, repo.releasedIDs)
+	require.Equal(t, *owner, repo.releaseOwner)
 }
 
 type wikiAbortSpanTracker struct {

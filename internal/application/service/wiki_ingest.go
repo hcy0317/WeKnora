@@ -99,6 +99,9 @@ return proposed
 	// skip (matching the pre-existing reduce-failure semantics).
 	wikiSlugLockWait = 2 * time.Minute
 	wikiSlugLockPoll = 50 * time.Millisecond
+	// A contended slug is not a failed document. Give the active writer a
+	// longer window to finish before the durable waiter is claimed again.
+	wikiSlugContentionBackoff = 30 * time.Second
 
 	// --- Phase 4: per-KB in-flight cap (standard/Redis mode) --------------
 	//
@@ -394,6 +397,148 @@ func (op WikiPendingOp) pendingRowIDs() []int64 {
 		return []int64{op.dbID}
 	}
 	return nil
+}
+
+type wikiWorkKey struct {
+	KnowledgeID string
+	WorkID      string
+	LegacyRowID int64
+}
+
+func wikiPendingOpWorkKey(op WikiPendingOp) wikiWorkKey {
+	key := wikiWorkKey{KnowledgeID: op.KnowledgeID, WorkID: op.WorkID}
+	if key.WorkID == "" {
+		key.LegacyRowID = op.dbID
+	}
+	return key
+}
+
+func wikiSlugUpdateWorkKey(update SlugUpdate) wikiWorkKey {
+	return wikiWorkKey{KnowledgeID: update.KnowledgeID, WorkID: update.WorkID}
+}
+
+func wikiDocResultWorkKey(result *docIngestResult) wikiWorkKey {
+	if result == nil {
+		return wikiWorkKey{}
+	}
+	if result.WorkID != "" {
+		return wikiWorkKey{KnowledgeID: result.KnowledgeID, WorkID: result.WorkID}
+	}
+	return wikiPendingOpWorkKey(result.SourceOp)
+}
+
+func wikiWorkSetContains(set map[wikiWorkKey]struct{}, op WikiPendingOp) bool {
+	if _, ok := set[wikiPendingOpWorkKey(op)]; ok {
+		return true
+	}
+	// Legacy updates cannot carry a durable row id. A wildcard match retains
+	// every legacy row for the knowledge rather than risking revision loss.
+	if op.WorkID == "" {
+		_, ok := set[wikiWorkKey{KnowledgeID: op.KnowledgeID}]
+		return ok
+	}
+	return false
+}
+
+func wikiDocResultWorkSetContains(set map[wikiWorkKey]struct{}, result *docIngestResult) bool {
+	key := wikiDocResultWorkKey(result)
+	if _, ok := set[key]; ok {
+		return true
+	}
+	if key.WorkID == "" {
+		_, ok := set[wikiWorkKey{KnowledgeID: key.KnowledgeID}]
+		return ok
+	}
+	return false
+}
+
+func wikiDocResultWorkSlugs(values map[wikiWorkKey]map[string]struct{}, result *docIngestResult) map[string]struct{} {
+	key := wikiDocResultWorkKey(result)
+	if slugs := values[key]; slugs != nil {
+		return slugs
+	}
+	if key.WorkID == "" {
+		return values[wikiWorkKey{KnowledgeID: key.KnowledgeID}]
+	}
+	return nil
+}
+
+func partitionWikiUnappliedOps(
+	pendingOps []WikiPendingOp,
+	failedOps []WikiPendingOp,
+	unappliedWorkKeys map[wikiWorkKey]struct{},
+	penalizedUnappliedWorkKeys map[wikiWorkKey]struct{},
+) ([]WikiPendingOp, []WikiPendingOp) {
+	failedWorkKeys := make(map[wikiWorkKey]struct{}, len(failedOps))
+	deferredWorkKeys := make(map[wikiWorkKey]struct{})
+	for _, op := range failedOps {
+		failedWorkKeys[wikiPendingOpWorkKey(op)] = struct{}{}
+	}
+	var deferredOps []WikiPendingOp
+	for _, op := range pendingOps {
+		if !wikiWorkSetContains(unappliedWorkKeys, op) {
+			continue
+		}
+		workKey := wikiPendingOpWorkKey(op)
+		if _, already := failedWorkKeys[workKey]; already {
+			continue
+		}
+		if wikiWorkSetContains(penalizedUnappliedWorkKeys, op) {
+			failedOps = append(failedOps, op)
+			failedWorkKeys[workKey] = struct{}{}
+			continue
+		}
+		if _, already := deferredWorkKeys[workKey]; already {
+			continue
+		}
+		deferredOps = append(deferredOps, op)
+		deferredWorkKeys[workKey] = struct{}{}
+	}
+	return failedOps, deferredOps
+}
+
+func wikiPendingTrimIDs(peekedIDs []int64, retainedGroups ...[]WikiPendingOp) []int64 {
+	retainedIDs := make(map[int64]struct{})
+	for _, ops := range retainedGroups {
+		for _, op := range ops {
+			for _, id := range op.pendingRowIDs() {
+				retainedIDs[id] = struct{}{}
+			}
+		}
+	}
+	trimIDs := make([]int64, 0, len(peekedIDs))
+	for _, id := range peekedIDs {
+		if _, retained := retainedIDs[id]; retained {
+			continue
+		}
+		trimIDs = append(trimIDs, id)
+	}
+	return trimIDs
+}
+
+func bindMappedWikiPendingOps(pendingOps []WikiPendingOp, results []*docIngestResult) []WikiPendingOp {
+	boundByRowID := make(map[int64]WikiPendingOp)
+	for _, result := range results {
+		if result == nil {
+			continue
+		}
+		bound := result.SourceOp
+		if bound.WorkID == "" {
+			bound.WorkID = result.WorkID
+		}
+		if bound.WorkID == "" {
+			continue
+		}
+		for _, id := range bound.pendingRowIDs() {
+			boundByRowID[id] = bound
+		}
+	}
+	for i := range pendingOps {
+		if bound, ok := boundByRowID[pendingOps[i].dbID]; ok {
+			pendingOps[i] = bound
+		}
+	}
+	return pendingOps
 }
 
 // wikiIngestService handles the LLM-powered wiki generation pipeline.
@@ -1064,6 +1209,8 @@ end
 return 0
 `
 
+var errWikiDeferredRelease = errors.New("release contended wiki operation")
+
 // wikiInflightReserveScript atomically enforces the per-KB in-flight cap.
 // It purges expired slots (crash recovery), counts live slots, and adds the
 // caller's slot iff under the cap. Returning 1 = reserved, 0 = at cap.
@@ -1223,13 +1370,7 @@ func (s *wikiIngestService) decodePendingRows(ctx context.Context, rows []*types
 	}
 
 	all := make([]WikiPendingOp, 0, len(rows))
-	rowIDsByWork := make(map[string][]int64, len(rows))
-	workKey := func(op WikiPendingOp) string {
-		if op.WorkID != "" {
-			return op.KnowledgeID + "\x00work\x00" + op.WorkID
-		}
-		return fmt.Sprintf("%s\x00legacy-row\x00%d", op.KnowledgeID, op.dbID)
-	}
+	rowIDsByWork := make(map[wikiWorkKey][]int64, len(rows))
 	peekedIDs = make([]int64, 0, len(rows))
 	for _, r := range rows {
 		peekedIDs = append(peekedIDs, r.ID)
@@ -1255,7 +1396,7 @@ func (s *wikiIngestService) decodePendingRows(ctx context.Context, rows []*types
 			op.claimOwner = &owner
 		}
 		if op.KnowledgeID != "" {
-			key := workKey(op)
+			key := wikiPendingOpWorkKey(op)
 			rowIDsByWork[key] = append(rowIDsByWork[key], r.ID)
 		} else {
 			op.dbIDs = []int64{r.ID}
@@ -1266,7 +1407,7 @@ func (s *wikiIngestService) decodePendingRows(ctx context.Context, rows []*types
 	// Collapse only exact durable work identities. Legacy rows have no revision
 	// key, so treating them as last-write-wins could drop an older or newer
 	// revision before either one reaches its checkpoint.
-	seen := make(map[string]bool)
+	seen := make(map[wikiWorkKey]bool)
 	reversedUnique := make([]WikiPendingOp, 0, len(all))
 	for i := len(all) - 1; i >= 0; i-- {
 		op := all[i]
@@ -1276,7 +1417,7 @@ func (s *wikiIngestService) decodePendingRows(ctx context.Context, rows []*types
 			reversedUnique = append(reversedUnique, op)
 			continue
 		}
-		key := workKey(op)
+		key := wikiPendingOpWorkKey(op)
 		if seen[key] {
 			continue
 		}
@@ -1288,7 +1429,7 @@ func (s *wikiIngestService) decodePendingRows(ctx context.Context, rows []*types
 	for i := len(reversedUnique) - 1; i >= 0; i-- {
 		op := reversedUnique[i]
 		if op.KnowledgeID != "" {
-			op.dbIDs = append([]int64(nil), rowIDsByWork[workKey(op)]...)
+			op.dbIDs = append([]int64(nil), rowIDsByWork[wikiPendingOpWorkKey(op)]...)
 		}
 		ops = append(ops, op)
 	}
@@ -1397,6 +1538,7 @@ func (s *wikiIngestService) settleWikiIngestRows(
 	payload WikiIngestPayload,
 	trimIDs []int64,
 	failedOps []WikiPendingOp,
+	deferredOps []WikiPendingOp,
 	terminalOps []WikiPendingOp,
 	claimOwner *types.TaskClaimOwner,
 ) error {
@@ -1446,9 +1588,49 @@ func (s *wikiIngestService) settleWikiIngestRows(
 	}
 	trimCancel()
 
+	deferCtx, deferCancel := wikiPagePersistContext(ctx)
+	deferErr := s.requeueDeferredOps(deferCtx, deferredOps)
+	deferCancel()
+
 	requeueCtx, requeueCancel := wikiPagePersistContext(ctx)
 	defer requeueCancel()
-	return s.requeueFailedOps(requeueCtx, payload, failedOps)
+	return errors.Join(deferErr, s.requeueFailedOps(requeueCtx, payload, failedOps))
+}
+
+// requeueDeferredOps releases rows blocked only by an active per-slug writer
+// without consuming fail_count. The lock owner is healthy and durable;
+// treating its waiter as a failed document can exhaust the finite retry budget
+// before a long shared-page merge releases the lock.
+func (s *wikiIngestService) requeueDeferredOps(ctx context.Context, ops []WikiPendingOp) error {
+	if s.pendingRepo == nil || len(ops) == 0 {
+		return nil
+	}
+	var errs []error
+	for _, op := range ops {
+		ids := op.pendingRowIDs()
+		if len(ids) == 0 {
+			continue
+		}
+		var err error
+		if op.claimOwner == nil {
+			err = s.pendingRepo.ReleaseByIDs(ctx, ids)
+		} else if claimRepo, ok := s.pendingRepo.(interfaces.TaskPendingOpsClaimLease); ok {
+			err = claimRepo.ReleaseClaims(ctx, ids, *op.claimOwner)
+		} else {
+			err = fmt.Errorf("owner-safe pending deferral release is unavailable")
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("release contended wiki op ids=%v: %w", ids, err))
+			continue
+		}
+		logger.Infof(ctx,
+			"wiki ingest: deferred contended op %s (%s) without consuming failure budget",
+			op.KnowledgeID, op.DocTitle)
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return errors.Join(errWikiDeferredRelease, errors.Join(errs...))
 }
 
 // requeueFailedOps records in-batch failures.
@@ -1499,11 +1681,12 @@ func (s *wikiIngestService) requeueFailedOps(ctx context.Context, payload WikiIn
 			// wikiClaimStaleAfter. No-op in Lite mode (row was peeked, never
 			// claimed). ReleaseByIDs preserves fail_count, so the retry
 			// budget still counts down.
+			ids := op.pendingRowIDs()
 			var releaseErr error
 			if op.claimOwner == nil {
-				releaseErr = s.pendingRepo.ReleaseByIDs(ctx, []int64{op.dbID})
+				releaseErr = s.pendingRepo.ReleaseByIDs(ctx, ids)
 			} else if claimRepo, ok := s.pendingRepo.(interfaces.TaskPendingOpsClaimLease); ok {
-				releaseErr = claimRepo.ReleaseClaims(ctx, []int64{op.dbID}, *op.claimOwner)
+				releaseErr = claimRepo.ReleaseClaims(ctx, ids, *op.claimOwner)
 			} else {
 				releaseErr = fmt.Errorf("owner-safe pending release is unavailable")
 			}

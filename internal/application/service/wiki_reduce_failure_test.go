@@ -543,6 +543,7 @@ type wikiSettlementPendingRepo struct {
 	deleteErr     error
 	failCount     int
 	deletedIDs    []int64
+	releasedIDs   []int64
 	incrementedID []int64
 	order         *[]string
 }
@@ -569,7 +570,13 @@ func (r *wikiSettlementPendingRepo) IncrFailCount(_ context.Context, id int64) (
 	return r.failCount, nil
 }
 
-func (r *wikiSettlementPendingRepo) ReleaseByIDs(context.Context, []int64) error { return nil }
+func (r *wikiSettlementPendingRepo) ReleaseByIDs(_ context.Context, ids []int64) error {
+	if r.order != nil {
+		*r.order = append(*r.order, "release")
+	}
+	r.releasedIDs = append(r.releasedIDs, ids...)
+	return nil
+}
 
 func (r *wikiSettlementPendingRepo) PendingCount(context.Context, string, string, string) (int64, error) {
 	return int64(len(r.rows)), nil
@@ -641,6 +648,7 @@ func TestSettleWikiIngestRowsFinalizesOnlyAfterSuccessfulTrim(t *testing.T) {
 
 			err := svc.settleWikiIngestRows(
 				context.Background(), WikiIngestPayload{}, []int64{11, 12}, nil,
+				nil,
 				[]WikiPendingOp{
 					{KnowledgeID: "k-1", Attempt: 1, dbID: 11, dbIDs: []int64{11}},
 					{KnowledgeID: "k-2", Attempt: 2, dbID: 12, dbIDs: []int64{12}},
@@ -655,6 +663,24 @@ func TestSettleWikiIngestRowsFinalizesOnlyAfterSuccessfulTrim(t *testing.T) {
 	}
 }
 
+func TestSettleWikiIngestRowsDefersSlugContentionWithoutChargingFailureBudget(t *testing.T) {
+	var order []string
+	pending := &wikiSettlementPendingRepo{order: &order, failCount: wikiMaxFailRetries + 1}
+	svc := &wikiIngestService{pendingRepo: pending, spanTracker: &wikiSettlementSpanTracker{}}
+
+	err := svc.settleWikiIngestRows(
+		context.Background(), WikiIngestPayload{}, nil, nil,
+		[]WikiPendingOp{{KnowledgeID: "k-contended", dbID: 31}},
+		nil, nil,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"release"}, order)
+	assert.Equal(t, []int64{31}, pending.releasedIDs)
+	assert.Empty(t, pending.incrementedID, "healthy slug contention must preserve fail_count")
+	assert.Empty(t, pending.deletedIDs)
+}
+
 func TestSettleWikiIngestRowsDeletesSupersededOpWithoutDrainingLatestAttempt(t *testing.T) {
 	var order []string
 	pending := &wikiSettlementPendingRepo{order: &order}
@@ -663,6 +689,7 @@ func TestSettleWikiIngestRowsDeletesSupersededOpWithoutDrainingLatestAttempt(t *
 
 	err := svc.settleWikiIngestRows(
 		context.Background(), WikiIngestPayload{}, []int64{41}, nil,
+		nil,
 		[]WikiPendingOp{{KnowledgeID: "k-stale", Attempt: 1, dbID: 41, dbIDs: []int64{41}}},
 		nil,
 	)
@@ -680,6 +707,7 @@ func TestSettleWikiIngestRowsAcknowledgesSuccessfulMaintenanceOpWithoutParseTree
 
 	err := svc.settleWikiIngestRows(
 		context.Background(), WikiIngestPayload{}, []int64{45}, nil,
+		nil,
 		[]WikiPendingOp{{KnowledgeID: "k-maintenance", Attempt: 0, dbID: 45, dbIDs: []int64{45}}},
 		nil,
 	)
@@ -706,6 +734,7 @@ func TestSettleWikiIngestRowsKeepsDurableRowWhenWikiSpanIsNotTerminal(t *testing
 	}
 	err = svc.settleWikiIngestRows(
 		context.Background(), WikiIngestPayload{}, []int64{pendingRowID}, nil,
+		nil,
 		[]WikiPendingOp{{KnowledgeID: root.KnowledgeID, Attempt: attempt, dbID: pendingRowID, dbIDs: []int64{pendingRowID}}},
 		nil,
 	)
