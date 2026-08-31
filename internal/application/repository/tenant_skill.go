@@ -218,26 +218,40 @@ func (r *tenantSkillRepository) ListSkillsByTenant(
 // the stale list — or a NULL — back. UpdateSkillEnvs and UpdateSkillAdminState
 // are the only writers of that column.
 func (r *tenantSkillRepository) UpdateSkill(ctx context.Context, e *types.TenantSkillEntity) error {
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var current types.TenantSkillEntity
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Select("bundle_ref", "bundle_sha256").
-			Where("tenant_id = ? AND sandbox_config_id = ? AND id = ?",
-				e.TenantID, e.SandboxConfigID, e.ID).
-			First(&current).Error; err != nil {
-			return err
-		}
-		if strings.TrimSpace(current.BundleRef) != strings.TrimSpace(e.BundleRef) ||
-			strings.TrimSpace(current.BundleSHA256) != strings.TrimSpace(e.BundleSHA256) {
-			return ErrSkillBundleClaimRequired
-		}
-		return (&tenantSkillRepository{db: tx}).updateSkill(ctx, e, false)
-	})
+	result := r.db.WithContext(ctx).
+		Model(&types.TenantSkillEntity{}).
+		Where("tenant_id = ? AND sandbox_config_id = ? AND id = ?",
+			e.TenantID, e.SandboxConfigID, e.ID).
+		Where("COALESCE(bundle_ref, '') = ? AND COALESCE(bundle_sha256, '') = ?",
+			e.BundleRef, e.BundleSHA256).
+		Updates(skillUpdates(e, false))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		return nil
+	}
+	var current types.TenantSkillEntity
+	if err := r.db.WithContext(ctx).
+		Select("id").
+		Where("tenant_id = ? AND sandbox_config_id = ? AND id = ?",
+			e.TenantID, e.SandboxConfigID, e.ID).
+		First(&current).Error; err != nil {
+		return err
+	}
+	return ErrSkillBundleClaimRequired
 }
 
 func (r *tenantSkillRepository) updateSkill(
 	ctx context.Context, e *types.TenantSkillEntity, includeBundle bool,
 ) error {
+	return r.db.WithContext(ctx).
+		Model(&types.TenantSkillEntity{}).
+		Where("tenant_id = ? AND sandbox_config_id = ? AND id = ?", e.TenantID, e.SandboxConfigID, e.ID).
+		Updates(skillUpdates(e, includeBundle)).Error
+}
+
+func skillUpdates(e *types.TenantSkillEntity, includeBundle bool) map[string]any {
 	updates := map[string]any{
 		"name":                  e.Name,
 		"version":               e.Version,
@@ -257,10 +271,7 @@ func (r *tenantSkillRepository) updateSkill(
 		updates["bundle_ref"] = e.BundleRef
 		updates["bundle_sha256"] = e.BundleSHA256
 	}
-	return r.db.WithContext(ctx).
-		Model(&types.TenantSkillEntity{}).
-		Where("tenant_id = ? AND sandbox_config_id = ? AND id = ?", e.TenantID, e.SandboxConfigID, e.ID).
-		Updates(updates).Error
+	return updates
 }
 
 func ensureSkillBundleClaimRow(tx *gorm.DB, tenantID uint64, bundleRef string) error {
@@ -722,20 +733,26 @@ func (r *tenantSkillRepository) ListCatalogsByTenant(
 }
 
 func (r *tenantSkillRepository) UpdateCatalog(ctx context.Context, e *types.TenantSkillCatalogEntity) error {
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var current types.TenantSkillCatalogEntity
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Select("bundle_ref", "bundle_sha256").
-			Where("tenant_id = ? AND id = ?", e.TenantID, e.ID).
-			First(&current).Error; err != nil {
-			return err
-		}
-		if strings.TrimSpace(current.BundleRef) != strings.TrimSpace(e.BundleRef) ||
-			strings.TrimSpace(current.BundleSHA256) != strings.TrimSpace(e.BundleSHA256) {
-			return ErrSkillBundleClaimRequired
-		}
-		return (&tenantSkillRepository{db: tx}).updateCatalog(ctx, e, false)
-	})
+	result := r.db.WithContext(ctx).
+		Model(&types.TenantSkillCatalogEntity{}).
+		Where("tenant_id = ? AND id = ?", e.TenantID, e.ID).
+		Where("COALESCE(bundle_ref, '') = ? AND COALESCE(bundle_sha256, '') = ?",
+			e.BundleRef, e.BundleSHA256).
+		Updates(catalogUpdates(e, false))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		return nil
+	}
+	var current types.TenantSkillCatalogEntity
+	if err := r.db.WithContext(ctx).
+		Select("id").
+		Where("tenant_id = ? AND id = ?", e.TenantID, e.ID).
+		First(&current).Error; err != nil {
+		return err
+	}
+	return ErrSkillBundleClaimRequired
 }
 
 func (r *tenantSkillRepository) UpdateCatalogWithBundleClaim(
@@ -749,6 +766,13 @@ func (r *tenantSkillRepository) UpdateCatalogWithBundleClaim(
 func (r *tenantSkillRepository) updateCatalog(
 	ctx context.Context, e *types.TenantSkillCatalogEntity, includeBundle bool,
 ) error {
+	return r.db.WithContext(ctx).
+		Model(&types.TenantSkillCatalogEntity{}).
+		Where("tenant_id = ? AND id = ?", e.TenantID, e.ID).
+		Updates(catalogUpdates(e, includeBundle)).Error
+}
+
+func catalogUpdates(e *types.TenantSkillCatalogEntity, includeBundle bool) map[string]any {
 	updates := map[string]any{
 		"name": e.Name, "version": e.Version, "description": e.Description,
 		"instructions": e.Instructions, "updated_at": time.Now(),
@@ -757,10 +781,7 @@ func (r *tenantSkillRepository) updateCatalog(
 		updates["bundle_ref"] = e.BundleRef
 		updates["bundle_sha256"] = e.BundleSHA256
 	}
-	return r.db.WithContext(ctx).
-		Model(&types.TenantSkillCatalogEntity{}).
-		Where("tenant_id = ? AND id = ?", e.TenantID, e.ID).
-		Updates(updates).Error
+	return updates
 }
 
 func (r *tenantSkillRepository) SetCatalogBundleIfEmpty(

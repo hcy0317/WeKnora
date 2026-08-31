@@ -2,6 +2,8 @@ package repository
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -146,6 +148,79 @@ func TestCatalogBundleClaimInterleavingSQLite(t *testing.T) {
 				Where("tenant_id = ? AND bundle_ref = ?", 7, ref).
 				Update("updated_at", time.Now().Add(-age)).Error)
 		})
+}
+
+func TestSkillAndCatalogGuardedUpdatesUseSingleSQLiteWriteSnapshot(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "guarded-updates.db")
+	dsn := "file:" + filepath.ToSlash(dbPath) + "?_busy_timeout=5000&_journal_mode=WAL"
+	dbA, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	dbB, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, dbA.AutoMigrate(
+		&types.TenantSkillEntity{}, &types.TenantSkillCatalogEntity{}, &skillBundleRefClaim{},
+	))
+	repoA := NewTenantSkillRepository(dbA)
+	repoB := NewTenantSkillRepository(dbB)
+	ctx := context.Background()
+	const (
+		skillRef   = "file://skill-live.zip"
+		skillSHA   = "skill-sha"
+		catalogRef = "file://catalog-live.zip"
+		catalogSHA = "catalog-sha"
+	)
+	require.NoError(t, repoA.ClaimSkillBundleWrite(ctx, 7, skillRef, "create-skill"))
+	require.NoError(t, repoA.CreateSkillWithBundleClaim(ctx, &types.TenantSkillEntity{
+		ID: "sk-a", TenantID: 7, SandboxConfigID: "cfg-a", Name: "pdf",
+		BundleRef: skillRef, BundleSHA256: skillSHA, Status: types.SkillStatusReady,
+	}, "create-skill"))
+	require.NoError(t, repoA.ClaimSkillBundleWrite(ctx, 7, catalogRef, "create-catalog"))
+	require.NoError(t, repoA.CreateCatalogWithBundleClaim(ctx, &types.TenantSkillCatalogEntity{
+		ID: "cat-a", TenantID: 7, Name: "pdf", BundleRef: catalogRef, BundleSHA256: catalogSHA,
+	}, "create-catalog"))
+
+	for i := 0; i < 20; i++ {
+		skillA, loadErr := repoA.GetSkill(ctx, 7, "cfg-a", "sk-a")
+		require.NoError(t, loadErr)
+		skillB, loadErr := repoB.GetSkill(ctx, 7, "cfg-a", "sk-a")
+		require.NoError(t, loadErr)
+		skillA.Description = fmt.Sprintf("a-%d", i)
+		skillB.Description = fmt.Sprintf("b-%d", i)
+		catalogA, loadErr := repoA.GetCatalog(ctx, 7, "cat-a")
+		require.NoError(t, loadErr)
+		catalogB, loadErr := repoB.GetCatalog(ctx, 7, "cat-a")
+		require.NoError(t, loadErr)
+		catalogA.Description = fmt.Sprintf("a-%d", i)
+		catalogB.Description = fmt.Sprintf("b-%d", i)
+		start := make(chan struct{})
+		errs := make(chan error, 4)
+		go func() { <-start; errs <- repoA.UpdateSkill(ctx, skillA) }()
+		go func() { <-start; errs <- repoB.UpdateSkill(ctx, skillB) }()
+		go func() { <-start; errs <- repoA.UpdateCatalog(ctx, catalogA) }()
+		go func() { <-start; errs <- repoB.UpdateCatalog(ctx, catalogB) }()
+		close(start)
+		for range 4 {
+			require.NoError(t, <-errs, "single guarded UPDATE must not hit SQLITE_BUSY_SNAPSHOT")
+		}
+	}
+
+	staleSkill, err := repoA.GetSkill(ctx, 7, "cfg-a", "sk-a")
+	require.NoError(t, err)
+	staleSkill.BundleRef = "file://unclaimed-skill.zip"
+	require.ErrorIs(t, repoA.UpdateSkill(ctx, staleSkill), ErrSkillBundleClaimRequired)
+	staleCatalog, err := repoA.GetCatalog(ctx, 7, "cat-a")
+	require.NoError(t, err)
+	staleCatalog.BundleRef = "file://unclaimed-catalog.zip"
+	require.ErrorIs(t, repoA.UpdateCatalog(ctx, staleCatalog), ErrSkillBundleClaimRequired)
+
+	require.NoError(t, repoA.ClaimSkillBundleWrite(ctx, 7, "file://claimed-skill.zip", "move-skill"))
+	staleSkill.BundleRef = "file://claimed-skill.zip"
+	staleSkill.BundleSHA256 = "claimed-skill-sha"
+	require.NoError(t, repoA.UpdateSkillWithBundleClaim(ctx, staleSkill, "move-skill"))
+	require.NoError(t, repoA.ClaimSkillBundleWrite(ctx, 7, "file://claimed-catalog.zip", "move-catalog"))
+	staleCatalog.BundleRef = "file://claimed-catalog.zip"
+	staleCatalog.BundleSHA256 = "claimed-catalog-sha"
+	require.NoError(t, repoA.UpdateCatalogWithBundleClaim(ctx, staleCatalog, "move-catalog"))
 }
 
 func skillRow(id, configID, name string) *types.TenantSkillEntity {
