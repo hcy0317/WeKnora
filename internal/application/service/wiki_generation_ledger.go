@@ -25,7 +25,11 @@ type wikiGenerationScope struct {
 	TenantID        uint64
 	KnowledgeBaseID string
 	WorkRevision    string
-	RuntimeSnapshot string
+	// RecoveryRevision is present only for an explicit partial-repair attempt.
+	// Generated base fragments remain reusable; only ambiguous or terminal
+	// fragments fork into this attempt-scoped paid-call budget.
+	RecoveryRevision string
+	RuntimeSnapshot  string
 }
 
 type wikiGenerationScopeContextKey struct{}
@@ -48,9 +52,10 @@ type wikiGenerationFallback struct {
 }
 
 type wikiGenerationLedger struct {
-	store     interfaces.WikiGenerationFragmentStore
-	redis     *redis.Client
-	candidate *types.WikiGenerationFragment
+	store             interfaces.WikiGenerationFragmentStore
+	redis             *redis.Client
+	candidate         *types.WikiGenerationFragment
+	recoveryCandidate *types.WikiGenerationFragment
 }
 
 func (s *wikiIngestService) prepareWikiGenerationLedger(
@@ -74,19 +79,27 @@ func (s *wikiIngestService) prepareWikiGenerationLedger(
 	}
 	modelSnapshot := wikiCheckpointDigest(scope.RuntimeSnapshot, modelID)
 	fragmentKey := wikiCheckpointDigest(purpose, promptDigest)
-	fragmentID := wikiCheckpointDigest(
-		strconv.FormatUint(scope.TenantID, 10), scope.KnowledgeBaseID,
-		scope.WorkRevision, purpose, fragmentKey, promptDigest, modelSnapshot,
-	)
-	return &wikiGenerationLedger{
-		store: store,
-		redis: s.redisClient,
-		candidate: &types.WikiGenerationFragment{
+	candidateForRevision := func(workRevision string) *types.WikiGenerationFragment {
+		fragmentID := wikiCheckpointDigest(
+			strconv.FormatUint(scope.TenantID, 10), scope.KnowledgeBaseID,
+			workRevision, purpose, fragmentKey, promptDigest, modelSnapshot,
+		)
+		return &types.WikiGenerationFragment{
 			FragmentID: fragmentID, TenantID: scope.TenantID,
-			KnowledgeBaseID: scope.KnowledgeBaseID, WorkRevision: scope.WorkRevision,
+			KnowledgeBaseID: scope.KnowledgeBaseID, WorkRevision: workRevision,
 			Purpose: purpose, FragmentKey: fragmentKey, PromptDigest: promptDigest,
 			ModelSnapshot: modelSnapshot, State: types.WikiGenerationFragmentReady,
-		},
+		}
+	}
+	primary := candidateForRevision(scope.WorkRevision)
+	var recovery *types.WikiGenerationFragment
+	if scope.RecoveryRevision != "" && scope.RecoveryRevision != scope.WorkRevision {
+		recovery = candidateForRevision(scope.RecoveryRevision)
+	}
+	return &wikiGenerationLedger{
+		store:     store,
+		redis:     s.redisClient,
+		candidate: primary, recoveryCandidate: recovery,
 	}, nil
 }
 
@@ -132,12 +145,26 @@ func (l *wikiGenerationLedger) recoverFallback(
 func (l *wikiGenerationLedger) reserve(
 	ctx context.Context, attemptTimeout time.Duration,
 ) (*types.WikiGenerationFragment, bool, error) {
-	callID := uuid.NewString()
-	fragment, granted, err := l.store.ReserveWikiGenerationFragment(
-		ctx, l.candidate, callID, time.Now().Add(attemptTimeout+wikiGenerationLeaseGrace), wikiLLMMaxAttempts,
-	)
+	reserveCandidate := func(candidate *types.WikiGenerationFragment) (*types.WikiGenerationFragment, bool, error) {
+		callID := uuid.NewString()
+		return l.store.ReserveWikiGenerationFragment(
+			ctx, candidate, callID, time.Now().Add(attemptTimeout+wikiGenerationLeaseGrace), wikiLLMMaxAttempts,
+		)
+	}
+	primary := l.candidate
+	fragment, granted, err := reserveCandidate(primary)
 	if err != nil {
 		return nil, false, fmt.Errorf("reserve wiki generation fragment: %w", err)
+	}
+	l.candidate = primary
+	if !granted && l.recoveryCandidate != nil &&
+		(fragment.State == types.WikiGenerationFragmentAmbiguous ||
+			fragment.State == types.WikiGenerationFragmentTerminal) {
+		l.candidate = l.recoveryCandidate
+		fragment, granted, err = reserveCandidate(l.recoveryCandidate)
+		if err != nil {
+			return nil, false, fmt.Errorf("reserve wiki recovery fragment: %w", err)
+		}
 	}
 	if granted {
 		return fragment, true, nil
@@ -295,4 +322,16 @@ func (s *wikiIngestService) markWikiGenerationFragmentsSucceeded(ctx context.Con
 		}
 	}
 	return store.MarkWikiGenerationFragmentsSucceeded(ctx, workRevision)
+}
+
+func (s *wikiIngestService) markWikiGenerationScopeSucceeded(
+	ctx context.Context, scope wikiGenerationScope,
+) error {
+	if err := s.markWikiGenerationFragmentsSucceeded(ctx, scope.WorkRevision); err != nil {
+		return err
+	}
+	if scope.RecoveryRevision == "" || scope.RecoveryRevision == scope.WorkRevision {
+		return nil
+	}
+	return s.markWikiGenerationFragmentsSucceeded(ctx, scope.RecoveryRevision)
 }

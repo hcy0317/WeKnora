@@ -252,3 +252,130 @@ func TestGenerateWithTemplateReusesFragmentAcrossServiceRestart(t *testing.T) {
 	require.NoError(t, db.Model(&types.WikiGenerationFragment{}).Count(&fragments).Error)
 	require.EqualValues(t, 1, fragments)
 }
+
+func TestExplicitWikiRetryReusesGeneratedBaseFragment(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&types.WikiGenerationFragment{}))
+	pages := NewWikiPageService(apprepo.NewWikiPageRepository(db), nil, nil, nil, nil)
+	data := map[string]string{"Content": "source", "Language": "Chinese", "PageTitle": "title"}
+	baseCtx := withWikiGenerationScope(context.Background(), wikiGenerationScope{
+		TenantID: 7, KnowledgeBaseID: "kb", WorkRevision: "work", RuntimeSnapshot: "runtime",
+	})
+	firstModel := &scriptedWikiChat{events: []types.StreamResponse{{
+		ResponseType: types.ResponseTypeAnswer, Content: "SUMMARY: stable\n\nbody", Done: true, FinishReason: "stop",
+	}}}
+	first, err := (&wikiIngestService{wikiService: pages}).generateWithTemplate(
+		baseCtx, firstModel, agent.WikiSummaryPrompt, data)
+	require.NoError(t, err)
+
+	retryCtx := withWikiGenerationScope(context.Background(), wikiGenerationScope{
+		TenantID: 7, KnowledgeBaseID: "kb", WorkRevision: "work",
+		RecoveryRevision: "work-retry-5", RuntimeSnapshot: "runtime",
+	})
+	retryModel := &scriptedWikiChat{}
+	replayed, err := (&wikiIngestService{wikiService: pages}).generateWithTemplate(
+		retryCtx, retryModel, agent.WikiSummaryPrompt, data)
+	require.NoError(t, err)
+	require.Equal(t, first, replayed)
+	require.Zero(t, retryModel.streamCalls, "a successful base fragment must not fork a paid retry")
+	var fragments int64
+	require.NoError(t, db.Model(&types.WikiGenerationFragment{}).Count(&fragments).Error)
+	require.EqualValues(t, 1, fragments)
+}
+
+func TestExplicitWikiRetryForksAmbiguousFragmentAndReusesRecovery(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&types.WikiGenerationFragment{}))
+	pages := NewWikiPageService(apprepo.NewWikiPageRepository(db), nil, nil, nil, nil)
+	data := map[string]string{"Content": "source", "Language": "Chinese", "PageTitle": "title"}
+	baseCtx := withWikiGenerationScope(context.Background(), wikiGenerationScope{
+		TenantID: 7, KnowledgeBaseID: "kb", WorkRevision: "work", RuntimeSnapshot: "runtime",
+	})
+	ambiguousModel := &scriptedWikiChat{events: []types.StreamResponse{{
+		ResponseType: types.ResponseTypeError, Content: "Responses stream failed: stream_read_error", Done: true,
+		Data: map[string]interface{}{
+			"provider_request_id": "ambiguous-base", "last_sse_event_type": "response.output_text.delta",
+			"error_code": "stream_read_error", "error_type": "upstream_error",
+			"output_started": true, "usage_observed": false,
+		},
+	}}}
+	_, err = (&wikiIngestService{wikiService: pages}).generateWithTemplate(
+		baseCtx, ambiguousModel, agent.WikiSummaryPrompt, data)
+	require.Error(t, err)
+	require.Equal(t, WikiGenerationErrorAmbiguousCall, wikiGenerationErrorClassOf(err))
+
+	retryCtx := withWikiGenerationScope(context.Background(), wikiGenerationScope{
+		TenantID: 7, KnowledgeBaseID: "kb", WorkRevision: "work",
+		RecoveryRevision: "work-retry-5", RuntimeSnapshot: "runtime",
+	})
+	retryModel := &scriptedWikiChat{events: []types.StreamResponse{{
+		ResponseType: types.ResponseTypeAnswer, Content: "SUMMARY: recovered\n\nbody", Done: true, FinishReason: "stop",
+	}}}
+	recovered, err := (&wikiIngestService{wikiService: pages}).generateWithTemplate(
+		retryCtx, retryModel, agent.WikiSummaryPrompt, data)
+	require.NoError(t, err)
+	require.Equal(t, "SUMMARY: recovered\n\nbody", recovered)
+	require.Equal(t, 1, retryModel.streamCalls)
+
+	replayModel := &scriptedWikiChat{}
+	replayed, err := (&wikiIngestService{wikiService: pages}).generateWithTemplate(
+		retryCtx, replayModel, agent.WikiSummaryPrompt, data)
+	require.NoError(t, err)
+	require.Equal(t, recovered, replayed)
+	require.Zero(t, replayModel.streamCalls, "one explicit repair attempt has one durable recovery budget")
+	var fragments []types.WikiGenerationFragment
+	require.NoError(t, db.Order("work_revision ASC").Find(&fragments).Error)
+	require.Len(t, fragments, 2)
+	require.Equal(t, types.WikiGenerationFragmentAmbiguous, fragments[0].State)
+	require.Equal(t, "work", fragments[0].WorkRevision)
+	require.Equal(t, types.WikiGenerationFragmentGenerated, fragments[1].State)
+	require.Equal(t, "work-retry-5", fragments[1].WorkRevision)
+}
+
+func TestExplicitWikiRetryForksTerminalFragmentBudget(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&types.WikiGenerationFragment{}))
+	pages := NewWikiPageService(apprepo.NewWikiPageRepository(db), nil, nil, nil, nil)
+	service := &wikiIngestService{wikiService: pages}
+	baseScope := wikiGenerationScope{
+		TenantID: 7, KnowledgeBaseID: "kb", WorkRevision: "work", RuntimeSnapshot: "runtime",
+	}
+	baseLedger, err := service.prepareWikiGenerationLedger(
+		withWikiGenerationScope(context.Background(), baseScope), "wiki_summary", []byte(`{}`), nil)
+	require.NoError(t, err)
+	terminal := *baseLedger.candidate
+	terminal.State = types.WikiGenerationFragmentTerminal
+	terminal.Attempts = wikiLLMMaxAttempts
+	require.NoError(t, db.Create(&terminal).Error)
+
+	retryScope := baseScope
+	retryScope.RecoveryRevision = "work-retry-5"
+	retryLedger, err := service.prepareWikiGenerationLedger(
+		withWikiGenerationScope(context.Background(), retryScope), "wiki_summary", []byte(`{}`), nil)
+	require.NoError(t, err)
+	fragment, granted, err := retryLedger.reserve(context.Background(), time.Minute)
+	require.NoError(t, err)
+	require.True(t, granted)
+	require.Equal(t, "work-retry-5", fragment.WorkRevision)
+	require.Equal(t, types.WikiGenerationFragmentCalling, fragment.State)
+	var storedBase types.WikiGenerationFragment
+	require.NoError(t, db.First(&storedBase, "fragment_id = ?", terminal.FragmentID).Error)
+	require.Equal(t, types.WikiGenerationFragmentTerminal, storedBase.State)
+}
+
+func TestWikiGenerationScopeForWorkUnitUsesStableExplicitRetryEpoch(t *testing.T) {
+	payload := WikiIngestPayload{TenantID: 7, KnowledgeBaseID: "kb"}
+	unit := &types.WikiIngestWorkUnit{WorkID: "work", RuntimeSnapshotKey: "runtime"}
+	base := wikiGenerationScopeForWorkUnit(payload, WikiPendingOp{Attempt: 4}, unit)
+	require.Empty(t, base.RecoveryRevision)
+	retry := wikiGenerationScopeForWorkUnit(payload, WikiPendingOp{Attempt: 5, WorkID: "work"}, unit)
+	require.NotEmpty(t, retry.RecoveryRevision)
+	require.NotEqual(t, retry.WorkRevision, retry.RecoveryRevision)
+	require.Equal(t, retry.RecoveryRevision,
+		wikiGenerationScopeForWorkUnit(payload, WikiPendingOp{Attempt: 5, WorkID: "work"}, unit).RecoveryRevision)
+	require.NotEqual(t, retry.RecoveryRevision,
+		wikiGenerationScopeForWorkUnit(payload, WikiPendingOp{Attempt: 6, WorkID: "work"}, unit).RecoveryRevision)
+}

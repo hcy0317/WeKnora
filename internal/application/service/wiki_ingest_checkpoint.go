@@ -129,6 +129,28 @@ func (s *wikiIngestService) prepareWikiWorkUnit(
 	return store.PrepareWikiIngestWorkUnit(ctx, unit)
 }
 
+func wikiGenerationScopeForWorkUnit(
+	payload WikiIngestPayload, op WikiPendingOp, unit *types.WikiIngestWorkUnit,
+) wikiGenerationScope {
+	if unit == nil {
+		return wikiGenerationScope{}
+	}
+	scope := wikiGenerationScope{
+		TenantID: payload.TenantID, KnowledgeBaseID: payload.KnowledgeBaseID,
+		WorkRevision: unit.WorkID, RuntimeSnapshot: unit.RuntimeSnapshotKey,
+	}
+	// Partial-repair publication copies the bound work id into the durable Wiki
+	// op. That is explicit operator authorization for a new paid-call budget,
+	// but only for fragments whose base ledger is ambiguous or terminal.
+	// Asynq redelivery keeps the same attempt, so the recovery revision stays
+	// stable and cannot multiply calls inside one repair.
+	if op.Attempt > 0 && strings.TrimSpace(op.WorkID) == unit.WorkID {
+		scope.RecoveryRevision = wikiCheckpointDigest(
+			unit.WorkID, "partial-retry", strconv.Itoa(op.Attempt))
+	}
+	return scope
+}
+
 func restoreWikiMappedCheckpoint(
 	unit *types.WikiIngestWorkUnit, op WikiPendingOp, wikiSpan *Span,
 ) (*docIngestResult, []SlugUpdate, error) {
@@ -191,7 +213,7 @@ func wikiContributionMarkerKey(workID, slug, operationDigest string) string {
 
 func (s *wikiIngestService) filterPublishedWikiContributions(
 	ctx context.Context, updatesBySlug map[string][]SlugUpdate,
-) (map[string][]SlugUpdate, map[string]map[string]struct{}, error) {
+) (map[string][]SlugUpdate, map[wikiWorkKey]map[string]struct{}, error) {
 	workSet := make(map[string]struct{})
 	for _, updates := range updatesBySlug {
 		for _, update := range updates {
@@ -223,15 +245,16 @@ func (s *wikiIngestService) filterPublishedWikiContributions(
 		}
 	}
 	filtered := make(map[string][]SlugUpdate, len(updatesBySlug))
-	reused := make(map[string]map[string]struct{})
+	reused := make(map[wikiWorkKey]map[string]struct{})
 	for slug, updates := range updatesBySlug {
 		for _, update := range updates {
 			digest := wikiSlugOperationDigest(update)
 			if _, ok := published[wikiContributionMarkerKey(update.WorkID, slug, digest)]; ok {
-				if reused[update.KnowledgeID] == nil {
-					reused[update.KnowledgeID] = make(map[string]struct{})
+				workKey := wikiSlugUpdateWorkKey(update)
+				if reused[workKey] == nil {
+					reused[workKey] = make(map[string]struct{})
 				}
-				reused[update.KnowledgeID][slug] = struct{}{}
+				reused[workKey][slug] = struct{}{}
 				continue
 			}
 			filtered[slug] = append(filtered[slug], update)

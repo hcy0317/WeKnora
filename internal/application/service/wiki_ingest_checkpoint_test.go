@@ -601,7 +601,7 @@ func TestMixedCompletedAndMissingWikiContributionsOnlyGenerateMissingOnce(t *tes
 		complete.Slug: {complete}, missing.Slug: {missing},
 	})
 	require.NoError(t, err)
-	require.Contains(t, reused["kid"], complete.Slug)
+	require.Contains(t, reused[wikiSlugUpdateWorkKey(complete)], complete.Slug)
 	require.NotContains(t, filtered, complete.Slug)
 
 	batchCtx := &WikiBatchContext{
