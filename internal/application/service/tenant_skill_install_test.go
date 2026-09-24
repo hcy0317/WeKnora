@@ -1320,7 +1320,7 @@ func TestRunInstallVerifiesEveryScriptOfEveryLanguage(t *testing.T) {
 
 	pythonPass := skillPythonVerifyCommand(installSkillDir, []string{
 		"scripts/__init__.py", "scripts/extract.py", "scripts/helper.py",
-	})
+	}, nil)
 	require.Contains(t, fx.commands, pythonPass,
 		"every python file must be checked, not the first one in sort order")
 	require.Contains(t, fx.commands,
@@ -1345,7 +1345,7 @@ func TestRunInstallDoesNotExecuteAnyScriptToVerifyIt(t *testing.T) {
 }
 
 func TestSkillPythonVerifyCommandPrefersTheSkillVenv(t *testing.T) {
-	command := skillPythonVerifyCommand("/opt/skills/demo", []string{"scripts/a.py"})
+	command := skillPythonVerifyCommand("/opt/skills/demo", []string{"scripts/a.py"}, nil)
 
 	require.Contains(t, command, "if [ -x /opt/skills/demo/.venv/bin/python ]; "+
 		"then py=/opt/skills/demo/.venv/bin/python; else py=python3; fi",
@@ -1357,7 +1357,7 @@ func TestSkillPythonVerifyCommandPrefersTheSkillVenv(t *testing.T) {
 // A skill may ship a file whose name needs quoting; the command is assembled
 // by hand, so the shell must never see it as more than one word.
 func TestSkillVerifyCommandsQuoteAwkwardPaths(t *testing.T) {
-	python := skillPythonVerifyCommand("/opt/skills/demo", []string{"scripts/a b'c.py"})
+	python := skillPythonVerifyCommand("/opt/skills/demo", []string{"scripts/a b'c.py"}, nil)
 	require.Contains(t, python, `'scripts/a b'\''c.py'`)
 
 	shell := skillShellVerifyCommand("/opt/skills/demo", []string{"a b.sh"})
@@ -1811,7 +1811,7 @@ const (
 // reason; the properties worth stating verbatim are asserted separately in
 // TestSkillPythonVerifyCommand*.
 var installPythonVerifyCommand = skillPythonVerifyCommand(
-	installSkillDir, []string{"scripts/extract.py"},
+	installSkillDir, []string{"scripts/extract.py"}, nil,
 )
 
 func indexOfEvent(events []string, needle string) int {
@@ -1848,8 +1848,10 @@ type installFixture struct {
 	fingerprint string
 	// loadCheck* drive the per-language script verification pass, which is
 	// the last gate before the snapshot.
-	loadCheckExitCode int
-	loadCheckResult   *sandbox.ExecuteResult
+	loadCheckExitCode  int
+	loadCheckExitCodes []int
+	loadCheckPasses    int
+	loadCheckResult    *sandbox.ExecuteResult
 	// depsExitCode fails the declared-dependency check (venv / node_modules).
 	depsExitCode int
 	// execResult is scoped to execResultCommand: an unscoped stub result
@@ -1862,6 +1864,8 @@ type installFixture struct {
 	// beforeExecute runs at the moment the engine would start, so a test can
 	// observe the state an attaching console would see mid-install.
 	beforeExecute func()
+	afterExecute  func()
+	agentPrompts  []string
 	// beforeSeed runs on the first image file write, so a test can prove the
 	// transcript locators landed before the minutes-long copy begins.
 	beforeSeed func()
@@ -1978,6 +1982,7 @@ func newInstallFixture(t *testing.T) *installFixture {
 		nil,
 		&transcriptStreams{},
 		&transcriptMessages{},
+		HostSandboxManager{},
 	)
 	fx.svc.now = func() time.Time { return time.Date(2026, 8, 19, 9, 30, 0, 0, time.UTC) }
 	return fx
@@ -1990,6 +1995,14 @@ func (f *installFixture) record(event string) {
 // now is the fixture's clock, so a test can express "one heartbeat ago"
 // against the same instant the service reads.
 func (f *installFixture) now() time.Time { return f.svc.now() }
+
+func (f *installFixture) currentInstallMessageID() string {
+	row, _ := f.skillRepo.GetSkill(context.Background(), 7, "cfg-1", "sk-1")
+	if row == nil {
+		return ""
+	}
+	return row.InstallMessageID
+}
 
 // seedInstalledSkill puts the fixture in the state a removal starts from: the
 // skill is ready inside the config's current image, the ledger holds the active
@@ -2974,6 +2987,17 @@ func (m *installSandboxManager) WriteSessionWorkspaceFile(
 	return m.WriteSessionFile(ctx, sessionID, filePath, content)
 }
 
+func (m *installSandboxManager) WriteSessionWorkspaceFiles(
+	ctx context.Context, sessionID string, files []sandbox.SessionWorkspaceFile,
+) error {
+	for _, file := range files {
+		if err := m.WriteSessionWorkspaceFile(ctx, sessionID, file.Path, file.Content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *installSandboxManager) WriteSessionFile(
 	_ context.Context, _ string, filePath string, content []byte,
 ) error {
@@ -3088,8 +3112,17 @@ func (m *installSandboxManager) ExecShellCommandWithOptions(
 		if m.fx.loadCheckResult != nil {
 			return m.fx.loadCheckResult, nil
 		}
+		exitCode := m.fx.loadCheckExitCode
+		if len(m.fx.loadCheckExitCodes) > 0 {
+			index := m.fx.loadCheckPasses
+			if index >= len(m.fx.loadCheckExitCodes) {
+				index = len(m.fx.loadCheckExitCodes) - 1
+			}
+			exitCode = m.fx.loadCheckExitCodes[index]
+			m.fx.loadCheckPasses++
+		}
 		return &sandbox.ExecuteResult{
-			ExitCode: m.fx.loadCheckExitCode, Stderr: "scripts/extract.py imports pandas",
+			ExitCode: exitCode, Stderr: "scripts/extract.py imports pandas",
 		}, nil
 	case command == removeSkillDirCommand:
 		m.fx.record("remove-skill-dir")
@@ -3226,7 +3259,7 @@ func (s *installCustomAgentService) ListAgents(context.Context) ([]*types.Custom
 }
 
 func (s *installCustomAgentService) UpdateAgent(
-	_ context.Context, agent *types.CustomAgent,
+	_ context.Context, agent *types.CustomAgent, _ *string,
 ) (*types.CustomAgent, error) {
 	return agent, nil
 }
@@ -3272,17 +3305,28 @@ type installAgentEngine struct {
 }
 
 func (e *installAgentEngine) Execute(
-	context.Context,
-	string,
-	string,
-	string,
-	[]chat.Message,
-	...[]string,
+	_ context.Context,
+	_ string,
+	_ string,
+	prompt string,
+	_ []chat.Message,
+	_ ...[]string,
 ) (*types.AgentState, error) {
+	e.fx.agentPrompts = append(e.fx.agentPrompts, prompt)
 	if e.fx.beforeExecute != nil {
 		e.fx.beforeExecute()
 	}
+	if e.fx.sandboxMgr.files == nil {
+		e.fx.sandboxMgr.files = make(map[string][]byte)
+	}
+	reportPath := path.Join(installSkillDir, ".weknora/install-report.json")
+	if _, exists := e.fx.sandboxMgr.files[reportPath]; !exists {
+		e.fx.sandboxMgr.files[reportPath] = []byte(`{"commands":[],"blockers":[]}`)
+	}
 	e.fx.record("agent-execute")
+	if e.fx.afterExecute != nil {
+		e.fx.afterExecute()
+	}
 	if e.fx.agentDelay > 0 {
 		time.Sleep(e.fx.agentDelay)
 	}
@@ -3291,7 +3335,9 @@ func (e *installAgentEngine) Execute(
 	}
 	return &types.AgentState{IsComplete: true}, nil
 }
-func (e *installAgentEngine) SetMemoryPrompt(string) {}
+func (e *installAgentEngine) SetMemoryPrompt(string)                               {}
+func (e *installAgentEngine) SetContextCheckpointSink(types.ContextCheckpointSink) {}
+func (e *installAgentEngine) SetSteerSink(types.SteerSink)                         {}
 
 type installSessionService struct {
 	fx *installFixture
@@ -3389,9 +3435,9 @@ func (s *installSessionService) KnowledgeQAByEvent(context.Context, *types.ChatM
 }
 
 func (s *installSessionService) SearchKnowledge(
-	context.Context, []string, []string, []types.TagScope, string,
-) ([]*types.SearchResult, error) {
-	return nil, nil
+	context.Context, []string, []string, []types.TagScope, string, *types.KnowledgeSearchOptions,
+) (*types.RetrievalResult, error) {
+	return &types.RetrievalResult{}, nil
 }
 
 func (s *installSessionService) AgentQA(context.Context, *types.QARequest, *event.EventBus) error {

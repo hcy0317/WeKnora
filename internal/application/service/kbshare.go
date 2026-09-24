@@ -167,7 +167,8 @@ func (s *kbShareService) UpdateSharePermission(ctx context.Context, shareID stri
 		return err
 	}
 
-	if !s.callerCanManageShare(ctx, share.SharedByUserID, share.SourceTenantID, share.OrganizationID, userID, tenantID) {
+	if !s.callerCanManageShare(ctx, share.SharedByUserID, share.SourceTenantID, share.OrganizationID,
+		userID, tenantID, share.Permission, permission) {
 		return ErrSharePermissionDenied
 	}
 
@@ -198,7 +199,8 @@ func (s *kbShareService) RemoveShare(ctx context.Context, shareID string, userID
 		return err
 	}
 
-	if s.callerCanManageShare(ctx, share.SharedByUserID, share.SourceTenantID, share.OrganizationID, userID, tenantID) {
+	if s.callerCanManageShare(ctx, share.SharedByUserID, share.SourceTenantID, share.OrganizationID,
+		userID, tenantID, share.Permission) {
 		if err := s.shareRepo.Delete(ctx, shareID); err != nil {
 			return err
 		}
@@ -223,23 +225,59 @@ func (s *kbShareService) callerCanManageShare(
 	shareOrgID string,
 	callerUserID string,
 	callerTenantID uint64,
+	currentPermission types.OrgMemberRole,
+	requested ...types.OrgMemberRole,
 ) bool {
-	// (1) Original sharer.
-	if shareSharedByUserID == callerUserID {
-		return true
+	var requestedPermission types.OrgMemberRole
+	if len(requested) > 0 {
+		requestedPermission = requested[0]
 	}
-	// (2) Source-tenant Admin+ — Plan 3 ownership is tenant-level.
-	if callerTenantID != 0 && callerTenantID == shareSourceTenantID {
-		role := types.TenantRoleFromContext(ctx)
-		if role.HasPermission(types.TenantRoleAdmin) {
+	return canManageShare(ctx, s.orgRepo, shareRecord{
+		sharedByUserID: shareSharedByUserID,
+		sourceTenantID: shareSourceTenantID,
+		orgID:          shareOrgID,
+		permission:     currentPermission,
+	}, requestedPermission, callerUserID, callerTenantID)
+}
+
+type shareRecord struct {
+	sharedByUserID string
+	sourceTenantID uint64
+	orgID          string
+	permission     types.OrgMemberRole
+}
+
+// canManageShare centralizes share mutation authority for KB and agent shares.
+// A sharer must still belong to the source tenant with Contributor+; source
+// tenant Admins can manage all tenant shares, while target-org Admins can only
+// remove or lower an existing permission.
+func canManageShare(
+	ctx context.Context,
+	orgRepo interfaces.OrganizationRepository,
+	share shareRecord,
+	requested types.OrgMemberRole,
+	callerUserID string,
+	callerTenantID uint64,
+) bool {
+	if callerTenantID == 0 {
+		return false
+	}
+	role := types.TenantRoleFromContext(ctx)
+	if callerTenantID == share.sourceTenantID {
+		isSharer := callerUserID != "" && share.sharedByUserID == callerUserID &&
+			role.HasPermission(types.TenantRoleContributor)
+		if isSharer || role.HasPermission(types.TenantRoleAdmin) {
 			return true
 		}
 	}
-	// (3) Org admin in the target org (governance / sharer-left repair).
-	if tm, err := s.orgRepo.GetTenantMember(ctx, shareOrgID, callerTenantID); err == nil && tm.Role == types.OrgRoleAdmin {
-		return true
+	if !role.HasPermission(types.TenantRoleAdmin) {
+		return false
 	}
-	return false
+	if requested != "" && !share.permission.HasPermission(requested) {
+		return false
+	}
+	member, err := orgRepo.GetTenantMember(ctx, share.orgID, callerTenantID)
+	return err == nil && member.Role == types.OrgRoleAdmin
 }
 
 // ListSharesByKnowledgeBase lists shares for a knowledge base; caller's tenant must own the KB.

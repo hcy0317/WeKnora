@@ -310,6 +310,91 @@ func (a *asynqTaskInspector) HasQueuedTasksForKnowledge(
 	return false, nil
 }
 
+// QueuedKnowledgeIDs returns every knowledge ID referenced by cancellable
+// queued or active tasks. The caller uses this snapshot to protect rows with
+// live work during housekeeping recovery.
+func (a *asynqTaskInspector) QueuedKnowledgeIDs(ctx context.Context) (map[string]struct{}, error) {
+	out := make(map[string]struct{})
+	if a == nil || a.inspector == nil {
+		return out, nil
+	}
+	for _, queue := range queuesScanned {
+		for _, state := range a.cancellableTaskStates() {
+			for page := 1; ; page++ {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				tasks, err := state.list(queue, asynq.PageSize(listPageSize), asynq.Page(page))
+				if err != nil {
+					if isAsynqQueueNotFound(err) {
+						break
+					}
+					return nil, fmt.Errorf("list %s tasks in queue %s: %w", state.name, queue, err)
+				}
+				for _, task := range tasks {
+					if task == nil {
+						continue
+					}
+					if _, ok := taskTypesForKnowledgeCancel[task.Type]; !ok {
+						continue
+					}
+					var probe knowledgeIDProbe
+					if json.Unmarshal(task.Payload, &probe) == nil && probe.KnowledgeID != "" {
+						out[probe.KnowledgeID] = struct{}{}
+					}
+				}
+				if len(tasks) < listPageSize {
+					break
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+func matchesKnowledgeListDelete(taskType string, payload []byte, knowledgeID string) bool {
+	if taskType != types.TypeKnowledgeListDelete {
+		return false
+	}
+	var probe struct {
+		KnowledgeIDs []string `json:"knowledge_ids"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return false
+	}
+	for _, id := range probe.KnowledgeIDs {
+		if id == knowledgeID {
+			return true
+		}
+	}
+	return false
+}
+
+// HasQueuedDeleteTasksForKnowledge protects a backlog of list-delete tasks
+// from being mistaken for an orphaned knowledge delete.
+func (a *asynqTaskInspector) HasQueuedDeleteTasksForKnowledge(
+	ctx context.Context, knowledgeID string,
+) (bool, error) {
+	if a == nil || a.inspector == nil || knowledgeID == "" {
+		return false, nil
+	}
+	matcher := func(taskType string, payload []byte) bool {
+		return matchesKnowledgeListDelete(taskType, payload, knowledgeID)
+	}
+	for _, queue := range queuesScanned {
+		for _, state := range a.cancellableTaskStates() {
+			matched, err := a.queueStateHasMatch(ctx, queue, state.name, state.list, matcher)
+			if err != nil {
+				return false, err
+			}
+			if matched {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // QueueStats returns a depth snapshot for every queue this app enqueues
 // into. Read-only: it calls Inspector.GetQueueInfo per queue and maps
 // the result onto types.QueueStat, attaching static pool/weight metadata
@@ -1257,6 +1342,16 @@ func (noopTaskInspector) HasQueuedTasksForKnowledge(
 	ctx context.Context, knowledgeID string,
 ) (bool, error) {
 	return false, nil
+}
+
+func (noopTaskInspector) HasQueuedDeleteTasksForKnowledge(
+	ctx context.Context, knowledgeID string,
+) (bool, error) {
+	return false, nil
+}
+
+func (noopTaskInspector) QueuedKnowledgeIDs(context.Context) (map[string]struct{}, error) {
+	return map[string]struct{}{}, nil
 }
 
 // QueueStats reports "not supported" in Lite mode: there is no Redis /

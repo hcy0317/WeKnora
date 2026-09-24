@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -335,5 +336,35 @@ func TestLangfuseChatStreamSuccessWithoutUsageStaysDoneAndUnavailable(t *testing
 		}
 	case <-time.After(time.Second):
 		t.Fatal("knowledge usage was not recorded")
+	}
+}
+
+func TestBuildLangfuseChatMetadataIncludesMCPCatalog(t *testing.T) {
+	meta := buildLangfuseChatMetadata("model-1", "agent", "fp", true, &ChatOptions{
+		Tools: []Tool{
+			{Function: FunctionDef{Name: "knowledge_search", Description: "search kb"}},
+			{Function: FunctionDef{
+				Name:        langfuseDiscoverMCPTool,
+				Description: "MCP tools are available without an @mention.\n{\"server_id\":\"svc\"}",
+			}},
+			{Function: FunctionDef{Name: "call_mcp_tool", Description: "call"}},
+		},
+	})
+	if meta["has_tools"] != true || meta["streaming"] != true {
+		t.Fatalf("flags = %#v", meta)
+	}
+	names, _ := meta["tool_names"].([]string)
+	if !reflect.DeepEqual(names, []string{"knowledge_search", langfuseDiscoverMCPTool, "call_mcp_tool"}) {
+		t.Fatalf("tool_names = %#v", names)
+	}
+	catalog, _ := meta["mcp_catalog"].(string)
+	if !strings.Contains(catalog, `"server_id":"svc"`) {
+		t.Fatalf("mcp_catalog = %q", catalog)
+	}
+}
+
+func TestTruncateLangfuseText(t *testing.T) {
+	if got := truncateLangfuseText("一二三四五", 3); got != "一二三…" {
+		t.Fatalf("got %q", got)
 	}
 }

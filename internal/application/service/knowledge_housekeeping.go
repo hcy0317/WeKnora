@@ -20,6 +20,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -46,9 +47,15 @@ type HousekeepingService struct {
 	// Durable Wiki ownership in task_pending_ops is always probed through db,
 	// so the sweep never falls back to the span/updated_at heuristics alone.
 	inspector interfaces.TaskInspector
+	// task re-arms an ephemeral Wiki trigger when durable ingest operations
+	// still hold stale finalizing rows.
+	task interfaces.TaskEnqueuer
 
 	mu      sync.Mutex
 	started bool
+
+	kickMu    sync.Mutex
+	wikiKicks map[string]time.Time
 }
 
 const knowledgeCompletionDrainLimit = 100
@@ -57,12 +64,14 @@ const knowledgeCompletionDrainLimit = 100
 // the cron — call Start in the application bootstrap so a misconfigured
 // cron schedule cannot prevent the rest of the service from coming up.
 func NewHousekeepingService(
-	db *gorm.DB, cfg *config.Config, inspector interfaces.TaskInspector,
+	db *gorm.DB, cfg *config.Config, inspector interfaces.TaskInspector, task interfaces.TaskEnqueuer,
 ) *HousekeepingService {
 	return &HousekeepingService{
 		db:        db,
 		cfg:       cfg,
 		inspector: inspector,
+		task:      task,
+		wikiKicks: make(map[string]time.Time),
 		cron: cron.New(cron.WithSeconds(), cron.WithChain(
 			cron.Recover(cron.DefaultLogger),
 		)),
@@ -113,6 +122,40 @@ func (h *HousekeepingService) Stop() {
 	h.started = false
 }
 
+// QueuedWork reports which knowledge IDs still have runnable or durable Wiki
+// work, so UI stall hints distinguish backpressure from an orphan.
+func (h *HousekeepingService) QueuedWork(ctx context.Context, ids []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	if h != nil && h.inspector != nil {
+		queued, err := h.inspector.QueuedKnowledgeIDs(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
+			_, out[id] = queued[id]
+		}
+	}
+	if h == nil || h.db == nil {
+		return out, nil
+	}
+	var durableIDs []string
+	if err := h.db.WithContext(ctx).
+		Model(&types.TaskPendingOp{}).
+		Where("task_type = ? AND scope = ? AND op = ? AND dedup_key IN ?",
+			wikiTaskType, wikiTaskScope, WikiOpIngest, ids).
+		Distinct("dedup_key").
+		Pluck("dedup_key", &durableIDs).Error; err != nil {
+		return nil, fmt.Errorf("durable queue probe: %w", err)
+	}
+	for _, id := range durableIDs {
+		out[id] = true
+	}
+	return out, nil
+}
+
 // runSweep is exported on the type for testability — tests can drive a
 // single sweep without waiting for the cron tick.
 func (h *HousekeepingService) runSweep(ctx context.Context) {
@@ -120,6 +163,7 @@ func (h *HousekeepingService) runSweep(ctx context.Context) {
 
 	threshold := h.staleThreshold()
 	cutoff := time.Now().Add(-threshold)
+	h.rearmWikiTriggers(ctx, h.wikiHeldFinalizingRows(ctx, cutoff), threshold)
 
 	// Sweep A: legacy knowledge stuck before post-processing.
 	//
@@ -225,6 +269,87 @@ func (h *HousekeepingService) runSweep(ctx context.Context) {
 		logger.Warnf(ctx, "[Housekeeping] summary sweep failed: %v", resSummary.Error)
 	} else if resSummary.RowsAffected > 0 {
 		logger.Infof(ctx, "[Housekeeping] recovered %d stuck summary rows", resSummary.RowsAffected)
+	}
+}
+
+// wikiHeldFinalizingRows returns stale finalizing rows that still have a
+// durable Wiki ingest operation. They stay finalizing under the postprocess
+// owner/recovery rules; housekeeping only restores the missing trigger.
+func (h *HousekeepingService) wikiHeldFinalizingRows(ctx context.Context, cutoff time.Time) []types.Knowledge {
+	if h == nil || h.db == nil || h.task == nil {
+		return nil
+	}
+	var pending []types.TaskPendingOp
+	if err := h.db.WithContext(ctx).
+		Where("task_type = ? AND scope = ? AND op = ?", wikiTaskType, wikiTaskScope, WikiOpIngest).
+		Find(&pending).Error; err != nil {
+		logger.Warnf(ctx, "[Housekeeping] Wiki pending-op probe failed: %v", err)
+		return nil
+	}
+	type key struct {
+		tenantID    uint64
+		kbID        string
+		knowledgeID string
+	}
+	held := make(map[key]struct{}, len(pending))
+	for _, op := range pending {
+		if op.TenantID != 0 && op.ScopeID != "" && op.DedupKey != "" {
+			held[key{tenantID: op.TenantID, kbID: op.ScopeID, knowledgeID: op.DedupKey}] = struct{}{}
+		}
+	}
+	if len(held) == 0 {
+		return nil
+	}
+	var candidates []types.Knowledge
+	if err := h.db.WithContext(ctx).
+		Where("parse_status = ? AND updated_at < ?", types.ParseStatusFinalizing, cutoff).
+		Find(&candidates).Error; err != nil {
+		logger.Warnf(ctx, "[Housekeeping] finalizing Wiki candidate query failed: %v", err)
+		return nil
+	}
+	rows := make([]types.Knowledge, 0)
+	for _, candidate := range candidates {
+		if _, ok := held[key{tenantID: candidate.TenantID, kbID: candidate.KnowledgeBaseID, knowledgeID: candidate.ID}]; ok {
+			rows = append(rows, candidate)
+		}
+	}
+	return rows
+}
+
+// rearmWikiTriggers sends at most one trigger per KB per stale threshold.
+func (h *HousekeepingService) rearmWikiTriggers(ctx context.Context, held []types.Knowledge, threshold time.Duration) {
+	if h == nil || h.task == nil || len(held) == 0 {
+		return
+	}
+	h.kickMu.Lock()
+	defer h.kickMu.Unlock()
+	now := time.Now()
+	for kbID, last := range h.wikiKicks {
+		if now.Sub(last) >= threshold {
+			delete(h.wikiKicks, kbID)
+		}
+	}
+	rearmed := 0
+	for _, knowledge := range held {
+		if knowledge.KnowledgeBaseID == "" {
+			continue
+		}
+		if _, recent := h.wikiKicks[knowledge.KnowledgeBaseID]; recent {
+			continue
+		}
+		triggerCtx := ctx
+		if language := WikiPendingLanguage(ctx, h.db, knowledge.TenantID, knowledge.KnowledgeBaseID); language != "" {
+			triggerCtx = context.WithValue(ctx, types.LanguageContextKey, language)
+		}
+		if err := enqueueWikiIngestTrigger(triggerCtx, h.task, knowledge.TenantID, knowledge.KnowledgeBaseID); err != nil {
+			logger.Warnf(ctx, "[Housekeeping] re-arm Wiki trigger for KB %s failed: %v", knowledge.KnowledgeBaseID, err)
+			continue
+		}
+		h.wikiKicks[knowledge.KnowledgeBaseID] = now
+		rearmed++
+	}
+	if rearmed > 0 {
+		logger.Infof(ctx, "[Housekeeping] re-armed Wiki ingest trigger for %d knowledge base(s)", rearmed)
 	}
 }
 

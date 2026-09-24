@@ -2,6 +2,150 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.2] - 2026-09-24
+
+### New Features
+
+- **NEW**: **Local Browser (BrowserSkill)** — agents in smart-reasoning chats can drive the user's own Chrome or Edge through the open-source [BrowserSkill](https://github.com/Tencent/BrowserSkill) extension (v0.3.1+). Pair once from Toolbox → Browser Connection, turn on "Local Browser" in the composer, and the new `local_browser` tool opens pages, clicks, fills forms and reads content in a dedicated task window. The chat shows a live (picture-in-picture) task preview with pause / resume / end controls; logins and CAPTCHAs are handed to the user through `request_help`, and interrupted tasks can be resumed. The app image bundles the `bsk` daemon, the matching extension ZIP and licenses; multi-replica deployments set `BROWSERSKILL_INTERNAL_URL` / `BROWSERSKILL_CLUSTER_SECRET` (#3180, #3193, #3206, #3563).
+- **NEW**: **Built-in MCP Server** — each workspace can publish MCP endpoints at `/mcp/<endpoint_id>` (Streamable HTTP) from Settings → Integrations → MCP Server, with its own token, knowledge-base scope, per-minute rate limit (default 60) and tool groups: retrieval & reading, `ask` (runs the endpoint's default agent), Wiki, and write tools (off by default). The page generates `mcpServers` config for Cursor / VS Code / Claude Desktop and a one-line Claude Code command; tokens can be rotated. Endpoints are managed through `/api/v1/mcp-endpoints` (API key capability `manage_channels`). The Python `mcp-server/` is now deprecated (#3371).
+- **NEW**: **Toolbox** — skills, MCP services and the browser connection move from Settings into a sidebar Toolbox (old settings links redirect); the sidebar shows the browser connection status.
+- **NEW**: **Conversation control** — append requirements to a running agent turn (queued until the step ends, or injected immediately) (#3123); fork a conversation from any earlier question (#3304); rewind in place, resetting the sandbox workspace to the matching checkpoint (#3469); choose the reasoning effort per session.
+- **NEW**: **Artifacts library** — a sidebar "Artifacts" page lists every generated file across conversations with type filters, search, date grouping and version history, backed by a `message_artifacts` table; generated files can be deleted (#3384, #3447).
+- **NEW**: **Sandbox terminal & graphical desktop** — the sandbox panel beside the chat gains an interactive terminal (Cube / E2B) that reconnects to running shells (#3110, #3128) and a browser-based XFCE desktop for sandboxes built from a desktop template (`desktop_enabled`) (#3245). Shell and skill-install commands stream their output live; idle terminal/desktop sessions disconnect after `terminal_idle_disconnect_sec` (default 900 s).
+- **NEW**: **Lite host sandbox & project folders** — the desktop app (macOS) runs sessions without a pinned sandbox inside an OS sandbox (Seatbelt): no network, writes limited to the chosen project folder, `.git` read-only, credential directories blocked. New chats can bind a host project directory or use a dated temporary workspace (#3472, #3549, #3554).
+- **NEW**: **Model catalog** — model integration is rebuilt on protocol, vendor and catalog layers (#3470, #3589): 27 built-in vendors, a generated catalog that fills context window, max output, reasoning levels and vision support, a "resolved call" panel in the model editor, per-model protocol override and protocol-compat JSON, `GET/POST /models/catalog/resolve`, and a deployment overlay file (`config/models.json`, `MODELS_CONFIG`). Speech-to-text now covers every vendor that documents it (#3503).
+- **NEW**: **Confluence & DingTalk Docs data sources** — Confluence Cloud and Server/Data Center spaces sync published pages incrementally with deletion protection (#3287); DingTalk Docs sync with localized setup (#2313). IMA sync traverses subfolders.
+- **NEW**: **Bocha and Serply web search** providers (#3036); `country` / `freshness` filters work with Brave and Serply.
+- **NEW**: **Japanese UI** (`ja-JP`), selectable at runtime or via `DEFAULT_LOCALE` (#3080).
+- **NEW**: **Per-channel IM reply language** — each IM channel can set its reply locale; unset channels follow `WEKNORA_LANGUAGE` (#3455).
+- **NEW**: **Knowledge base workflow** — batch download of original files as a ZIP (#3300); configurable sorting for document and resource lists (#3318); documents that stop making progress are flagged as queued or stalled with a `TASK_STALLED` code (#3557); per-upload option to skip summary generation; knowledge base descriptions generated from document profiles (#3370); an upload panel with overall progress, cancel and retry (#3399); FAQ list filter by enabled status (#3157); activity records show the API key name (#3405).
+- **NEW**: **Whitelist-only outbound mode** — `SSRF_DNS_WHITELIST_ONLY=true` refuses any host outside `SSRF_WHITELIST` before DNS resolution, closing DNS-based exfiltration from offline deployments (#3393).
+- **NEW**: **Admin user creation UI** — system administrators create accounts from Settings with a one-time password and a copyable account summary (#3034, #3039).
+- **NEW**: **CLI setup page** under Integrations with a three-step guide (#3081).
+
+### Improvements
+
+- **IMPROVED**: **Agent knowledge-retrieval tools consolidated** — `knowledge_search` and `grep_chunks` are replaced by a single `search_knowledge` tool (`query`, `mode` = `hybrid` | `semantic` | `keyword`, optional `knowledge_base_ids`, `limit` default 10 / max 30); keyword mode is served by the keyword index (BM25 / engine keyword retrieval) instead of an unindexed regular-expression scan of the chunks table. `list_knowledge_chunks`, `get_document_info` and `wiki_read_source_doc` are replaced by `read_document` (`id` = a `dN` document or `cN` chunk handle, `offset` / `limit` paging, in-document `query` with optional `regex`, `context` neighbours around a chunk), which always returns the document metadata header together with the chunks. New `list_documents` (`knowledge_base_id`, `keyword`, `page`, `page_size`) pages through one knowledge base. `wiki_search` takes a single `query` (a case-insensitive regular expression, as before) plus optional `regex`, `knowledge_base_ids` and `limit`; the old `queries` / `knowledge_base_id` parameters are still accepted. `query_knowledge_graph` is only offered when a graph-enabled knowledge base is in scope. New agents default to `search_knowledge`, `read_document`, `list_documents` and `search_conversations`. The built-in MCP server keeps its tool names: `search_knowledge` gains `mode` and `limit`, `grep_chunks` keeps its regular-expression contract on index-backed retrieval and gains `limit`, `read_document` gains `query`, and `wiki_search` gains `regex`.
+- **IMPROVED**: **Retrieval tool compatibility fixes** — `search_knowledge` no longer refuses a mode that some bases cannot serve: FAQ and vector-only bases answer `keyword` requests semantically and keyword-only bases answer `semantic` requests by keyword, with `requested_mode` / `mode_fallbacks` in the result and `<mode_fallback>` in the model rendering, which now shows the mode actually used instead of always `semantic`. `read_document` and `list_documents` are offered on wiki-only scopes (chunks are always stored) without widening RAG agents' derived KB filter; `list_documents` applies the @file / @tag scope before paging so totals and pages only count readable documents; chunk context is resolved by chunk index so parent, summary and image chunks no longer shift the neighbourhood. `wiki_search` (agent and MCP) keeps its regular-expression semantics by default and only falls back to a literal match for text that is not a valid expression; MCP `grep_chunks` keeps grep semantics by fetching candidates with the pattern's literal terms and verifying each chunk against the pattern.
+- **IMPROVED**: **Backward-compatible tool aliasing** — old tool names stored in agent configurations, presets and API calls are mapped to their successors at run time (`legacyToolSuccessors` / `NormalizeAllowedTools`); no data migration is needed, and stored chat history that references the old tool names still renders.
+- **IMPROVED**: **Agent context** — history is sized by the model's context window with calibrated token estimates (#3413); compaction checkpoints persist across turns (#3407); `search_knowledge` reranks with document titles and allows a keyword retry after a rerank rejection; `read_document` queries are keyword-based and bounded.
+- **IMPROVED**: **MCP client** — tool catalogs are persisted per service and caller with a guided two-step setup and AI-drafted usage notes (#3118); tools can be enabled or disabled individually (#2989); agents discover and call MCP tools on demand through `discover_mcp_tools` / `call_mcp_tool` instead of loading every tool; `advanced_config.timeout` extends the call window; multi-line SSE events are assembled correctly.
+- **IMPROVED**: **Skills** — outdated sandbox skills upgrade without rolling back the catalog or taking the skill offline (#3406); runtime prerequisites are verified after install and installs accept extra guidance; manifests with a UTF-8 BOM load.
+- **IMPROVED**: **Chat UX** — rebuilt Markdown editor for saving answers to a knowledge base (#3467); in-progress status and API-session owner badges in the sidebar; full dates on older message timestamps (#3576); truncated answers are marked instead of silently cut; stored streams replay one segment at a time; the chat stream recovers from an expired access token (#3028).
+- **IMPROVED**: **Wiki** — whole-page rewrites continue when cut by the completion budget and are refused if still incomplete (#3582); same-title items reuse the existing page across types (#3547); cited chunks include image captions (#3292); ambiguous single-Han auto-links are skipped (#2860); taxonomy embeddings are batched.
+- **IMPROVED**: **Retrieval & graph** — Milvus supports multilingual BM25 (#3235); keyword-only BM25 scores are bounded before rerank (#3343); Neo4j node search caps seeds and rows (#3550); entity extraction gets a larger output budget (#2859) and uses OCR text of scanned pages (#3092).
+- **IMPROVED**: **Parsing** — PaddleOCR-VL request timeout is configurable via `WEKNORA_PADDLEOCR_VL_TIMEOUT` (#3537); timed-out converter process groups are killed (#2990); PDFs stay on the builtin parser even when anydoc is linked; inline HTML tables no longer produce oversized chunks (#3404); the OCR prompt no longer includes the knowledge base's image-caption instructions (#3291).
+- **IMPROVED**: **Performance** — faster chunk ingestion and batch updates (#3369); fewer redundant sandbox remote calls.
+- **IMPROVED**: **Storage** — OBS uses virtual-hosted addressing (#3273); object-storage transfers may exceed 30 seconds (#3368); the KS3 client keeps the SSRF redirect policy.
+- **IMPROVED**: **Frontend** — style consistency pass with shared shells, tokens and unified confirmations (#3376); list title icons and resource cards refined; embedded pages enforce host origin allowlists.
+
+### Bug Fixes
+
+- **FIXED**: Documents no longer get stranded in `processing` or `deleting`: pipeline errors and panics fail the row, never-run stages are not reported as failed, stranded Wiki queues release their documents, and housekeeping recovers stuck deletions (#3445, #3367).
+- **FIXED**: Cross-workspace access paths in shared spaces are closed (#3408, #3416); path traversal in local prefixes, task IDs and Wiki sort is rejected.
+- **FIXED**: Wiki tasks of soft-deleted tenants stop issuing model requests (#3602); deleting a knowledge base cleans up its Wiki data (#3109).
+- **FIXED**: The agent ends the turn when the completion cap truncates an answer (#3449); failed tool executions are reported as `tool_result` rather than `error`; MCP answers no longer cite unrelated knowledge-base sources (#3144); `@Skill` / `@MCP` pickers list only the resources of the agent that will run (#3475).
+- **FIXED**: Updating an agent's config no longer erases its avatar, and driver errors stay server-side (#3230).
+- **FIXED**: Remote embedders, rerankers and four vendor chat request shapes now match the vendors' documentation (#3484, #3488, #3489, #3500, #3513).
+- **FIXED**: Queue claims order by failure count so retries cannot starve new work (#3444).
+- **FIXED**: Invalid QA queries are rejected before the session lookup (#3477); suggested follow-ups no longer echo the current question (#2582); images from organization-shared knowledge bases load through the message file proxy (#3069).
+- **FIXED**: Long-term memory ranks recalled items by the query and preserves extraction progress (#3224).
+- **FIXED**: IM replies finalize when agent QA returns; Yunzhijia recovers stale WebSocket connections; Feishu keeps images in post messages and keeps streams alive during long answers; clearing an IM channel's knowledge base is persisted.
+- **FIXED**: Multipart upload temp files are cleaned up; XMind files are accepted before parser discovery; the upload timeout scales with payload size; a non-ASCII base64 image no longer fails the whole parse.
+
+### Breaking Changes
+
+- **BREAKING**: **DingTalk channels support Stream mode only.** Migration `000096` switches existing webhook channels to `websocket`; enable Stream for the app in the DingTalk developer console.
+- **BREAKING**: **Sandbox commands run as `root` by default** (previously uid 1000) (#3067). Each session owns its sandbox, so isolation stays at the container boundary.
+- **BREAKING**: MCP service updates that include `usage_instructions` must send non-blank text of at most 16,000 characters; omitting the field keeps the existing instructions.
+- **BREAKING**: `.env.example` no longer ships default `JWT_SECRET` / `SYSTEM_AES_KEY` values and adds `SYSTEM_SIGNING_KEY`. New deployments must generate them; **existing deployments must keep their current `SYSTEM_AES_KEY`**, or stored credentials cannot be decrypted. An unset `JWT_SECRET` falls back to a random per-process value, so logins do not survive restarts and replicas must share it.
+- **BREAKING**: Organization invites resolve an exact workspace ID (`/organizations/{id}/search-tenants`); searching workspaces by name is removed.
+- **BREAKING**: Go SDK `UpdateAgentRequest.Avatar` is now `*string`: `nil` keeps the avatar, an empty string clears it.
+
+### Infrastructure & Build
+
+- **BUILD**: Migrations `000091`–`000110` (MCP tool toggles and catalogs, browser authorization, memory consistency and vector search, DingTalk Stream-only, session fork and snapshot leases, ParadeDB `pg_search` 0.22.6, chunk index diet, knowledge profiles, MCP endpoints, message artifacts, skill served version, context checkpoints, message index, session sandbox tenant and host workspace dir, IM channel locale); SQLite migrations `000013`–`000030`. Migration `000106` builds an index `CONCURRENTLY`; if interrupted, drop the invalid index and rerun.
+- **BUILD**: ParadeDB image upgraded to run on CPUs without AVX2; the MinIO image is pulled from `quay.io`.
+- **BUILD**: The frontend image builds in a multi-stage Dockerfile without host npm (#3074); the app image bundles BrowserSkill (`scripts/build_browserskill.sh`, pinned by `scripts/browserskill-release.json`); sandbox image targets `sandbox`, `cube`, `desktop` and `desktop-cube`.
+- **BUILD**: Model catalog generation and checks (`make model-catalog-generate`, `model-catalog-check`, `model-catalog-diff`); per-vendor golden request tests.
+- **BUILD**: The GPL document converter and vendored archives are removed; third-party license sources are bundled; Helm exposes `global.maxFileSizeMB`.
+
+### Documentation
+
+- **DOC**: The official site and documentation are unified under `website-docs/` — a product homepage plus the docs, built and deployed together as static files or a Docker image (#3297). Valid content from the old `docs/` is migrated and the outdated pages are removed (#3580).
+- **DOC**: Documentation synced for v0.8.2: local browser, built-in MCP Server, toolbox, conversation control, artifacts, sandbox terminal/desktop and Lite host sandbox, model catalog and protocol-compat fields, Confluence / DingTalk sources, new configuration variables, and migrations through `000110`.
+- **DOC**: Removed unsupported Homebrew installation guidance and the claim that MySQL is a supported `DB_DRIVER`.
+
+## [0.8.0] - 2026-09-03
+
+### New Features
+
+- **NEW**: **Skill Sandbox Runtime (Docker / E2B / Cube)** — the headline of this release. Agent skills now run in a **session-persistent sandbox**: one sandbox per chat session, with `shell_exec`, file read/write/edit, attachment staging, and generated-file collection all landing in the same workspace. Three backends share one `RemoteSandboxClient` protocol: **Docker** (single-host / self-hosted, talking to the Engine API rather than `docker run --rm`), **E2B** (cloud or any E2B-compatible control plane, including self-hosted), and **CubeSandbox**. Per-workspace configs cover image, CPU/memory, TTL, DNS, templates and snapshots (migrations `000082_tenant_sandbox_config`, `000083_session_sandbox_config`). Admins can set a **network policy** per config (default-deny egress, allow/deny lists, Cube L7 rules, E2B host rules) (#2995). The old **Local host-process backend is removed**. The Docker backend is **opt-in** (`WEKNORA_SANDBOX_DOCKER_ENABLED` or System Settings → Network Security) because a mounted `docker.sock` is host root (#2936). See [Sandbox deployment and troubleshooting](./website-docs/06-development/04-sandbox-deployment.md).
+- **NEW**: **Tenant Skill Catalog** — skills are first-class workspace resources, not files dropped next to the process (migrations `000086_tenant_skills`, `000087_skill_install_transcript`, `000088_skill_snapshot_planned_name`, `000090_skill_catalog`). Install from **ClawHub**, **SkillHub / skills.sh**, **GitHub/GitLab URLs**, or a zip upload; each install is a snapshot on the chosen sandbox config, with live circular progress, install transcripts, stop/reinstall, and uninstall that keeps catalog archives. Browse and edit installed skill files from Settings; agents get `write_skill_file` / `edit_skill_file` plus `shell_exec` that no longer requires a skill to be installed. Personal and workspace **skill env vars** inject at execution without ever being read back (migration `000089_env_vars`). `@mention` no longer silently shrinks the skill whitelist.
+- **NEW**: **Cross-Session Long-Term Memory** — a new memory product (migration `000084_memory`), independent of the Neo4j conversation-memory that 0.7.1 removed. Workspaces opt in; each user can further turn it off. Memories are typed (`profile` / `preference` / `fact` / `task` / `interest`), written either explicitly or by a background extractor, and **inferred items stay pending until the user confirms**. Resident profile/preference blocks ride in every turn; situational facts are recalled lexically and (optionally) semantically; `search_memory` looks up on demand. Document affinity conditions retrieval toward sources the user keeps citing. Settings, items, topics, document affinity, confirm/reject, export and forced consolidation are exposed as `/api/v1/memory/*` (full-access API keys only; the subject is always the caller).
+- **NEW**: **In-Process anydoc Parser** — Office documents (doc/docx/ppt/pptx and the types anydoc converts) can be parsed **inside the Go app** via `third_party/anydoc-go`, without a round-trip to docreader. When the binding is linked, anydoc is preferred for every type it converts; PPT/PPTX still default to MarkItDown when no engine rule is set. The app image links anydoc by default.
+- **NEW**: **DeepSeek Harness Plugin** — official npm package [`@wxg-prc-cpg/dsh-weknora`](https://www.npmjs.com/package/@wxg-prc-cpg/dsh-weknora) exposes four read-only tools (`weknora_search`, `weknora_read_document`, `weknora_ask`, `weknora_list_knowledge_bases`) so a DeepSeek Harness coding agent can retrieve from a WeKnora deployment (#2759).
+- **NEW**: **GitLab & Tencent IMA Data Sources** — GitLab projects sync as a knowledge source (#2656); Tencent IMA notes sync through the note OpenAPI, with retries on transient failures.
+- **NEW**: **LiteLLM Model Provider** — LiteLLM is a first-class chat/embedding/rerank provider, so one gateway URL can front many upstream models (#2923).
+- **NEW**: **Exa & Metaso Web Search** — two new web-search providers join the existing set (#2617).
+- **NEW**: **XMind Outline Parsing** — `.xmind` files are parsed into an outline and indexed like other documents (#2713).
+- **NEW**: **Chat Artifacts, Question Outline & Timestamps** — sandbox-generated files collect into a per-message artifacts drawer (migration `000081_message_artifacts`) with download and a pulse on the folder when new files arrive; long overflowing sessions get a Codex-style question outline / minimap (#2839); messages show timestamps as conversation-flow dividers.
+- **NEW**: **Document Auto-Tagging** — after parse, a chat model may pick matching tags from the knowledge base's existing tag set and attach them incrementally, without creating tags or overwriting manual ones (migration `000080_knowledge_base_auto_tag_config`).
+- **NEW**: **Context Compaction & Prompt-Cache Markers** — long sandbox turns compact tool history instead of truncating or rewriting files; stable prompt prefixes plus provider cache markers improve cache hit rate on Anthropic/OpenAI-compatible backends. Per-turn LLM token usage is attributed and stored (migration `000085_message_usage`).
+- **NEW**: **OIDC JWKS Verification & `/auth/oidc/start`** — ID tokens are signature-verified via JWKS (#2799); a direct 302 start endpoint supports login without a pre-rendered SPA handshake.
+- **NEW**: **Optional Complex Passwords** — registration, self-service change-password and admin reset can require mixed-case, digits and special characters (`WEKNORA_AUTH_COMPLEX_PASSWORD_ENABLED` / system setting) (#2929).
+- **NEW**: **System-Admin User Creation** — platform admins can create users from the console without an invite link (#2722).
+- **NEW**: **Invitation Auto-Accept & Invite-Only Join** — inviting an already-registered user can auto-accept; in invite-only mode, share links send the visitor through login before joining the workspace.
+
+### Improvements
+
+- **IMPROVED**: **Sandbox security** — all Docker execs (scripts, `shell_exec`, file ops, artifact bootstrap) run as the sandbox user (uid 1000), not root; symlink-following `chown`/file ops that could escape the workspace are closed; zombie processes from cancelled execs are reaped; in-use snapshot deletes retry as conflicts; idle sandboxes detach and sweep; skill image pointers stay out of config PUT.
+- **IMPROVED**: **Skill install UX** — catalog cards, avatar shortcut, live circular progress that keeps the drawer open, batch install verification, stop-in-flight, ClawHub `@owner/slug` and skills.sh catalog pages, GitHub subtree counting, and sandbox uninstall moved into the manage-drawer header.
+- **IMPROVED**: **Chat / Agent UX** — `shell_exec` renders as a command + stream card; sandbox file lists and skill names show on tool cards; generated-files drawer restyled to match settings lists; Mermaid diagrams stay rendered while streaming; message timestamps align with persisted `created_at`.
+- **IMPROVED**: **Knowledge search** — MMR selection is incremental; hybrid-search honors `resource_urls=public`; MatchCount=0 no longer truncates every result; parent-child embeddings survive chunking; deleted images in a chunk are no longer retrieved.
+- **IMPROVED**: **Docreader / anydoc** — DOCX vertical merges and table text preserved; PDF embedded-image SMask applied (no more all-black figures); MHTML header objects stripped correctly; URL scrapes fail closed instead of indexing error pages; PPT/PPTX attachments get a parser engine.
+- **IMPROVED**: **IM** — Feishu websocket long-connection reverse-proxy support (#2550); Feishu streaming cards finalize and show progress in full-output mode; WeCom 32-byte PKCS7 padding; DingTalk rich-text follow-ups; Yunzhijia thread sessions; IM file attachments in QA.
+- **IMPROVED**: **Auth / tenancy** — `SwitchTenant` records last-active-tenant preference; self-service change password in the profile; folder drag-and-drop upload preserves directory structure; document download action; editable document summaries; paginated document chunks; FAQ batch actions restored.
+- **IMPROVED**: **Observability** — sandbox operations emit product-level Langfuse spans; follow-up completions nest under the parent chat trace; prompt-cache markers stay stable across turns.
+- **IMPROVED**: **Deployment capabilities** — menus and settings hide modules the binary did not register (`GET /system/capabilities`), so Lite / trimmed builds stop advertising missing features (#2674).
+- **IMPROVED**: **CI** — golangci-lint workflow gates new PR code; path-filtered checks avoid triggering anydoc/unrelated lints; git pre-commit / pre-push hooks; Playwright WebKit for docreader URL tests; dsh-weknora e2e cache.
+
+### Bug Fixes
+
+- **FIXED**: OIDC ID-token signature is verified through JWKS, including explicit-endpoint configs; JWKS response bodies are closed (#2799).
+- **FIXED**: High-risk system settings and agent skill pickers read the latest stored value instead of a stale form snapshot.
+- **FIXED**: Sandbox tools are scoped to the workspace they actually serve; agents are told which workspace they are in; file tools can read staged attachments without hanging empty skill tools; skill-script stdout is kept on failure.
+- **FIXED**: Tool-call JSON with a stray trailing fragment is recovered; stringified JSON arrays in skill args parse; `@mention` no longer narrows the skill whitelist.
+- **FIXED**: Feishu streaming cards no longer stick in an in-progress state; full-output mode shows the progress card (#2911, #2909).
+- **FIXED**: Model deletion blocked by usage now shows the usage details (#2975).
+- **FIXED**: `nginx-api-proxy.conf` is included in the UI image build, restoring API proxying in the frontend container.
+- **FIXED**: Postgres `docker-compose` image no longer fails the default security check (#2704); S3-compatible endpoints disable optional checksums; MinerU results resolve by upload filename stem and preserve the extension.
+- **FIXED**: Wiki housekeeping no longer force-fails documents that still have a durable Wiki backlog; concurrent duplicate wiki page identities are prevented; wiki generate-with-template calls set `MaxTokens`.
+- **FIXED**: Shared knowledge bases no longer report `doc_count=0` in agent `runtime_context`; data-source deletion sync is scoped per connector and actually persisted.
+- **FIXED**: Chunk merge no longer drops content when contiguous chunks repeat text; context headers are sanitized before persistence; markdown table regex catastrophic backtracking is stopped (#2770).
+- **FIXED**: Built-in agent names/descriptions follow the UI locale (#2828); default locale can be set at runtime via `DEFAULT_LOCALE`.
+- **FIXED**: Direct invites are reconciled after a share-link join; stale home tenant is cleared after member removal.
+
+### Breaking Changes
+
+- **BREAKING**: The **Local host-process sandbox backend is removed**. Existing Local configs must be recreated against Docker (opt-in), E2B, or Cube.
+- **BREAKING**: The Docker sandbox backend is **off by default**. Enable it in System Settings → Network Security, or set `WEKNORA_SANDBOX_DOCKER_ENABLED=true`.
+- **BREAKING**: Complex-password mode, when enabled, rejects registration / password-change payloads that do not mix upper, lower, digit and special characters.
+
+### Infrastructure & Build
+
+- **BUILD**: Migrations `000080`–`000090` (auto-tag, message artifacts, tenant/session sandbox config, memory, message usage, tenant skills, install transcript, snapshot planned name, env vars, skill catalog); matching SQLite migrations `000003`–`000012`.
+- **BUILD**: New `internal/sandbox` remote-client stack (Docker Engine API, E2B, Cube), `internal/agent/compaction`, `internal/application/service/memory`, `internal/ipclass` (shared SSRF + sandbox URL classification), `third_party/anydoc-go`.
+- **BUILD**: Go client: sandbox skill install/stop/files, personal env-var APIs, long-term memory APIs.
+- **BUILD**: `wechatopenai/weknora-sandbox` image; Docker backend requires `appuser` in the `docker.sock` group inside the app container.
+- **BUILD**: golangci-lint, anydoc, and dsh-plugin GitHub Actions workflows.
+
+### Documentation
+
+- **DOC**: Sandbox protocol / Docker backend / cluster guides under `docs/sandbox-*.md`; skill env-var surface documented in `docs/api/skill.md`; long-term memory in `docs/api/memory.md`.
+- **DOC**: `docs/QA.md` extended for Docker opt-in, Local-backend removal, skill catalog, long-term memory, anydoc, and OIDC JWKS.
+- **DOC**: Architecture diagram updated for sandbox backends, skill catalog, long-term memory, anydoc, GitLab/IMA, LiteLLM, and the DeepSeek Harness plugin.
+
 ## [0.7.2] - 2026-08-07
 
 ### New Features

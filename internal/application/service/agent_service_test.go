@@ -91,6 +91,14 @@ func (stubSessionFileStore) WriteSessionInputFile(context.Context, string, strin
 func (stubSessionFileStore) WriteSessionWorkspaceFile(context.Context, string, string, []byte) error {
 	return nil
 }
+func (s stubSessionFileStore) WriteSessionWorkspaceFiles(ctx context.Context, sessionID string, files []sandbox.SessionWorkspaceFile) error {
+	for _, file := range files {
+		if err := s.WriteSessionWorkspaceFile(ctx, sessionID, file.Path, file.Content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func (stubSessionFileStore) RemoveSessionInputPath(context.Context, string, string) error { return nil }
 
 func (s *fakeAgentKnowledgeService) ListPagedKnowledgeByKnowledgeBaseID(
@@ -155,7 +163,7 @@ func TestCreateAgentEngineOpensSandboxToolsOnlyForInstallMode(t *testing.T) {
 			SkillsEnabled:   false,
 			AllowedTools:    []string{tools.ToolShellExec},
 		}
-		config.EnableSkillInstallMode(types.BuiltinSkillInstallerID)
+		config.EnableSkillInstallMode(types.BuiltinSkillInstallerID, sandbox.SkillsImageRoot+"/test-skill")
 
 		engine, err := svc.CreateAgentEngine(ctx, config, chatModel, nil, nil, "sess-1", "msg-1")
 
@@ -573,4 +581,191 @@ func TestGetKnowledgeBaseInfos_ExcludesUnprocessedDocuments(t *testing.T) {
 	assert.Equal(t, 1, infos[0].DocCount)
 	require.Len(t, infos[0].RecentDocs, 1)
 	assert.Equal(t, "doc-completed", infos[0].RecentDocs[0].KnowledgeID)
+}
+func TestRegisterSandboxShellIfAllowedHostIgnoresSkillsGate(t *testing.T) {
+	registry := tools.NewToolRegistry()
+	svc := &agentService{
+		hostSandbox: &capableManager{
+			typ:   sandbox.SandboxTypeHost,
+			shell: &stubShellExecutor{},
+		},
+	}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+
+	svc.registerSandboxShellIfAllowed(ctx, registry, "sess-1", &types.AgentConfig{
+		SkillsEnabled: false,
+	})
+
+	require.True(t, toolRegistered(registry, tools.ToolShellExec),
+		"the host backend is the Lite feature and must not wait on SkillsEnabled")
+}
+
+type hostLayoutManager struct {
+	capableManager
+	layout sandbox.WorkspaceLayout
+}
+
+func (m *hostLayoutManager) SessionWorkspaceLayout(context.Context, string) (sandbox.WorkspaceLayout, error) {
+	layout := m.layout
+	if layout.Origin == sandbox.WorkspaceOriginUnspecified {
+		layout.Origin = sandbox.WorkspaceOriginHost
+	}
+	return layout, nil
+}
+
+func TestCreateAgentEngineInjectsHostWorkspaceIntoPromptAndTools(t *testing.T) {
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+	root := "/Users/dev/My Project"
+	layout := sandbox.WorkspaceLayout{
+		Origin:     sandbox.WorkspaceOriginHost,
+		Root:       root,
+		WriteRoots: []string{root},
+		ReadRoots:  []string{root},
+		Hint:       root,
+	}
+	chatModel := &fakeAgentChatModel{}
+	svc := &agentService{
+		hostSandbox: &hostLayoutManager{
+			capableManager: capableManager{
+				typ:   sandbox.SandboxTypeHost,
+				shell: &stubShellExecutor{layout: layout},
+				files: stubSessionFileStore{},
+			},
+			layout: layout,
+		},
+	}
+
+	engine, err := svc.CreateAgentEngine(ctx, &types.AgentConfig{
+		SkillsEnabled: false,
+		AllowedTools:  []string{tools.ToolShellExec},
+	}, chatModel, nil, nil, "sess-1", "msg-1")
+	require.NoError(t, err)
+	_, err = engine.Execute(ctx, "sess-1", "msg-1", "hello", nil)
+	require.NoError(t, err)
+
+	require.Contains(t, chatModel.lastSystemPrompt, root)
+	require.NotContains(t, chatModel.lastSystemPrompt, "Session workspace: /workspace")
+	require.NotContains(t, chatModel.lastSystemPrompt, "There is no /workspace")
+	require.Contains(t, chatModel.lastToolDescriptions[tools.ToolShellExec], root)
+	require.NotContains(t, chatModel.lastToolDescriptions[tools.ToolShellExec], sandbox.SessionWorkspaceRoot)
+}
+
+func TestLookupSessionWorkspaceLayoutFailsClosedWhenHostPinReadFails(t *testing.T) {
+	db := newPinTestDB(t)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	require.NoError(t, sqlDB.Close())
+
+	svc := &agentService{
+		hostSandbox:   &capableManager{typ: sandbox.SandboxTypeHost},
+		sandboxPinner: NewSessionSandboxPinner(db),
+	}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+
+	layout := svc.lookupSessionWorkspaceLayout(ctx, "sess-1", &types.AgentConfig{})
+
+	require.Equal(t, sandbox.FailedHostWorkspaceLayout(), layout)
+	require.NotEqual(t, sandbox.RemoteWorkspaceLayout().Root, layout.Root)
+}
+
+func TestLookupSessionWorkspaceLayoutFailsClosedWhenHostScriptsDisabled(t *testing.T) {
+	svc := &agentService{
+		hostSandbox:   &capableManager{typ: sandbox.SandboxTypeHost},
+		sandboxPolicy: disabledPolicy{},
+	}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+
+	layout := svc.lookupSessionWorkspaceLayout(ctx, "sess-1", &types.AgentConfig{})
+
+	require.Equal(t, sandbox.FailedHostWorkspaceLayout(), layout)
+}
+
+func TestLookupSessionWorkspaceLayoutStaysRemoteWithoutHostSandbox(t *testing.T) {
+	layout := (&agentService{}).lookupSessionWorkspaceLayout(
+		context.Background(), "sess-1", &types.AgentConfig{},
+	)
+	require.Equal(t, sandbox.RemoteWorkspaceLayout(), layout)
+}
+
+func TestLookupSessionWorkspaceLayoutKeepsRemoteWhenNamedConfigFails(t *testing.T) {
+	svc := &agentService{
+		hostSandbox: &capableManager{typ: sandbox.SandboxTypeHost},
+	}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+
+	layout := svc.lookupSessionWorkspaceLayout(ctx, "sess-1", &types.AgentConfig{
+		SandboxConfigID: "cfg-cube",
+	})
+
+	require.Equal(t, sandbox.RemoteWorkspaceLayout(), layout)
+}
+
+func TestRegisterSandboxShellIfAllowedRemoteKeepsSkillsGate(t *testing.T) {
+	registry := tools.NewToolRegistry()
+	svc := &agentService{
+		sandboxResolver: stubSandboxResolver{
+			mgr: &capableManager{
+				typ:   sandbox.SandboxTypeE2B,
+				shell: &stubShellExecutor{},
+			},
+		},
+		hostSandbox: &capableManager{
+			typ:   sandbox.SandboxTypeHost,
+			shell: &stubShellExecutor{},
+		},
+	}
+	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
+
+	svc.registerSandboxShellIfAllowed(ctx, registry, "sess-1", &types.AgentConfig{
+		SandboxConfigID: "cfg-1",
+		SkillsEnabled:   false,
+	})
+
+	require.False(t, toolRegistered(registry, tools.ToolShellExec),
+		"a remote shell still exists only to serve skill scripts")
+}
+
+func TestValidateConfigMaxIterationsUnlimited(t *testing.T) {
+	s := &agentService{}
+
+	unlimited := &types.AgentConfig{MaxIterations: -1}
+	require.NoError(t, s.ValidateConfig(unlimited))
+	assert.Equal(t, types.UnlimitedMaxIterations, unlimited.MaxIterations)
+
+	normalized := &types.AgentConfig{MaxIterations: -9}
+	require.NoError(t, s.ValidateConfig(normalized))
+	assert.Equal(t, types.UnlimitedMaxIterations, normalized.MaxIterations)
+
+	unset := &types.AgentConfig{}
+	require.NoError(t, s.ValidateConfig(unset))
+	assert.Equal(t, 5, unset.MaxIterations)
+
+	tooHigh := &types.AgentConfig{MaxIterations: MAX_ITERATIONS + 1}
+	require.Error(t, s.ValidateConfig(tooHigh))
+}
+
+func TestValidInstallDirUsesTheHostVersionsRoot(t *testing.T) {
+	versions := "/Users/dev/.weknora/skills/.versions"
+	s := &agentService{hostSkillVersionsRoot: versions}
+
+	host := &types.AgentConfig{SandboxConfigID: sandbox.HostSkillTargetID}
+	host.EnableSkillInstallMode(types.BuiltinSkillInstallerID, versions+"/pdf-2")
+	dir, ok := s.validInstallDir(host)
+	require.True(t, ok)
+	require.Equal(t, versions+"/pdf-2", dir)
+
+	escaped := &types.AgentConfig{SandboxConfigID: sandbox.HostSkillTargetID}
+	escaped.EnableSkillInstallMode(types.BuiltinSkillInstallerID, "/Users/dev/My Project")
+	_, ok = s.validInstallDir(escaped)
+	require.False(t, ok)
+
+	remote := &types.AgentConfig{SandboxConfigID: "cfg-1"}
+	remote.EnableSkillInstallMode(types.BuiltinSkillInstallerID, sandbox.SkillsImageRoot+"/pdf")
+	dir, ok = s.validInstallDir(remote)
+	require.True(t, ok)
+	require.Equal(t, sandbox.SkillsImageRoot+"/pdf", dir)
+
+	noRoot := &agentService{}
+	_, ok = noRoot.validInstallDir(host)
+	require.False(t, ok)
 }

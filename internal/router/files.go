@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Tencent/WeKnora/internal/application/access"
 	filesvc "github.com/Tencent/WeKnora/internal/application/service/file"
 	"github.com/gin-gonic/gin"
 
@@ -523,6 +525,7 @@ func newMessageScopedFileServeHandler(
 	globalFileService interfaces.FileService,
 	storageResolver interfaces.StorageBackendResolver,
 	resourceCatalog interfaces.ResourceCatalog,
+	kbShareAuthorizer access.MessageKBShareAuthorizer,
 ) gin.HandlerFunc {
 	absDir := localStorageAbsDir()
 
@@ -538,81 +541,38 @@ func newMessageScopedFileServeHandler(
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized: workspace context missing"})
 			return
 		}
-		if messageService == nil {
-			c.Status(http.StatusNotFound)
-			return
-		}
-
-		message, err := messageService.GetMessage(ctx, c.Param("id"), c.Param("message_id"))
-		if err != nil || message == nil {
-			// Do not reveal whether a message exists outside the caller's session.
-			c.Status(http.StatusNotFound)
-			return
-		}
-
-		resolvedPath := filePath
-		var resource *types.StoredResource
-		if resourceCatalog != nil {
-			resolvedPath, resource, err = resourceCatalog.ResolvePath(ctx, filePath)
-			if err != nil {
+		fileAccess, err := access.ResolveMessageFile(
+			ctx,
+			c.Param("id"),
+			c.Param("message_id"),
+			filePath,
+			messageService,
+			agentShareService,
+			resourceCatalog,
+			kbShareAuthorizer,
+		)
+		if err != nil {
+			switch {
+			case errors.Is(err, access.ErrUnauthorized):
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized: workspace context missing"})
+			case errors.Is(err, access.ErrNotFound):
 				c.Status(http.StatusNotFound)
-				return
+			default:
+				c.JSON(http.StatusForbidden, gin.H{"error": "forbidden: file not accessible"})
 			}
-		}
-
-		ownerTenantID := message.AgentTenantID
-		if resource != nil {
-			ownerTenantID = resource.TenantID
-			// A modern message records its source tenant. A resource from any
-			// other tenant cannot be smuggled through that message even if the
-			// caller happens to have another shared agent with the same ID.
-			if message.AgentTenantID != 0 && message.AgentTenantID != ownerTenantID {
-				c.JSON(http.StatusForbidden, gin.H{"error": "forbidden: resource not accessible from this message"})
-				return
-			}
-		}
-		if ownerTenantID == 0 {
-			c.JSON(http.StatusForbidden, gin.H{"error": "forbidden: message resource workspace missing"})
 			return
 		}
-
-		if ownerTenantID != callerTenantID {
-			if message.AgentID == "" || agentShareService == nil {
-				c.JSON(http.StatusForbidden, gin.H{"error": "forbidden: shared agent access required"})
-				return
-			}
-			agent, shareErr := agentShareService.GetSharedAgentForTenant(
-				ctx,
-				callerTenantID,
-				types.TenantRoleFromContext(ctx),
-				message.AgentID,
-				ownerTenantID,
-			)
-			if shareErr != nil || agent == nil || agent.TenantID != ownerTenantID {
-				c.JSON(http.StatusForbidden, gin.H{"error": "forbidden: shared agent access revoked"})
-				return
-			}
-		}
-
-		// Registered resources carry authoritative tenant ownership. Legacy
-		// provider paths must still encode the authorized owner tenant.
-		if resource == nil {
-			if err := secutils.ValidateStoragePathTenant(resolvedPath, ownerTenantID); err != nil {
-				logger.Warnf(ctx,
-					"[Router] message files denied cross-tenant or invalid path: owner_tenant_id=%d file_path=%q err=%v",
-					ownerTenantID, resolvedPath, err)
-				c.JSON(http.StatusForbidden, gin.H{"error": "forbidden: file path not accessible"})
-				return
-			}
-		}
-
+		ownerTenantID := fileAccess.OwnerTenantID
 		ownerTenant, err := tenantService.GetTenantByID(ctx, ownerTenantID)
 		if err != nil || ownerTenant == nil {
 			c.Status(http.StatusNotFound)
 			return
 		}
 
-		backendID, provider := parseStorageTarget(resolvedPath)
+		backendID, provider := parseStorageTarget(fileAccess.Path)
+		if fileAccess.StorageBackendID != "" {
+			backendID = fileAccess.StorageBackendID
+		}
 		fileSvc, resolvedProvider, ok := resolveTenantFileServiceWithFallback(
 			ctx,
 			"/sessions/:id/messages/:message_id/files",
@@ -628,18 +588,18 @@ func newMessageScopedFileServeHandler(
 			return
 		}
 
-		reader, err := fileSvc.GetFile(ctx, resolvedPath)
+		reader, err := fileSvc.GetFile(ctx, fileAccess.Path)
 		if err != nil {
 			logger.Warnf(ctx,
 				"[Router] message files get file failed: owner_tenant_id=%d provider=%s path=%q err=%v",
-				ownerTenantID, resolvedProvider, resolvedPath, err)
+				ownerTenantID, resolvedProvider, fileAccess.Path, err)
 			c.Status(http.StatusNotFound)
 			return
 		}
 
-		contentType, inline := secutils.SafeContentTypeByFilename(resolvedPath)
-		if resource != nil && resource.MimeType != "" && inline {
-			contentType = resource.MimeType
+		contentType, inline := secutils.SafeContentTypeByFilename(fileAccess.Filename)
+		if fileAccess.MimeType != "" && inline {
+			contentType = fileAccess.MimeType
 		}
 		streamStoredFile(c, reader, contentType, inline, "private, max-age=86400", "message files")
 	}
@@ -657,7 +617,15 @@ func serveMessageScopedFiles(
 	globalFileService interfaces.FileService,
 	storageResolver interfaces.StorageBackendResolver,
 	resourceCatalog interfaces.ResourceCatalog,
+	kbShareService interfaces.KBShareService,
+	kbService interfaces.KnowledgeBaseService,
+	knowledgeService interfaces.KnowledgeService,
 ) {
+	kbShareAuthorizer := access.MessageKBShareAuthorizer{
+		ShareGuard: kbShareService,
+		KBs:        kbService,
+		Knowledges: knowledgeService,
+	}
 	g.apiKeyRoute(
 		r,
 		http.MethodGet,
@@ -671,6 +639,7 @@ func serveMessageScopedFiles(
 			globalFileService,
 			storageResolver,
 			resourceCatalog,
+			kbShareAuthorizer,
 		),
 	)
 }
@@ -787,7 +756,12 @@ func presignedFileHandler(tenantService interfaces.TenantService, absDir string,
 //
 // Route:
 //   - GET /api/v1/files/presigned-preview?file_path=<provider://...>
-func servePresignedPreview(r *gin.Engine, cfg *config.Config, storageResolver interfaces.StorageBackendResolver) {
+func servePresignedPreview(
+	r *gin.Engine,
+	cfg *config.Config,
+	storageResolver interfaces.StorageBackendResolver,
+	resourceCatalog interfaces.ResourceCatalog,
+) {
 	absDir := localStorageAbsDir()
 
 	// This route is registered on the engine root, NOT the /api/v1 group,
@@ -808,6 +782,16 @@ func servePresignedPreview(r *gin.Engine, cfg *config.Config, storageResolver in
 			if tenant == nil {
 				c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized: workspace context missing"})
 				return
+			}
+			filePath, isResource, ok := resolveCatalogResource(c, resourceCatalog, filePath, tenant.ID)
+			if !ok {
+				return
+			}
+			if !isResource {
+				if err := secutils.ValidateStoragePathTenant(filePath, tenant.ID); err != nil {
+					c.JSON(http.StatusForbidden, gin.H{"error": "forbidden: file path not accessible"})
+					return
+				}
 			}
 
 			backendID, provider := parseStorageTarget(filePath)

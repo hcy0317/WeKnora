@@ -12,6 +12,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
+	"github.com/Tencent/WeKnora/internal/common"
 	werrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/chunker"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
@@ -859,10 +860,10 @@ func sortChunksForSummary(chunks []*types.Chunk) []*types.Chunk {
 // getSummary generates a summary for knowledge content using an AI model
 func (s *knowledgeService) getSummary(ctx context.Context,
 	summaryModel chat.Chat, knowledge *types.Knowledge, chunks []*types.Chunk,
-) (string, error) {
+) (*documentSummaryResult, error) {
 	// Get knowledge info from the first chunk
 	if len(chunks) == 0 {
-		return "", fmt.Errorf("no chunks provided for summary generation")
+		return nil, fmt.Errorf("no chunks provided for summary generation")
 	}
 
 	// Determine max input chars from config
@@ -942,7 +943,7 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 	// hallucinate a scanner manual instead of admitting the document had no
 	// extractable text.
 	if err := checkSufficientSummaryContent(ctx, knowledge.ID, chunkContents); err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// User-authored metadata is trusted document context. Internal ingestion
@@ -981,15 +982,65 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 	})
 	if err != nil {
 		logger.GetLogger(ctx).WithField("error", err).Errorf("GetSummary failed")
-		return "", err
+		return nil, err
 	}
 	content, err := validateSummaryOutput(summary)
 	if err != nil {
 		logger.GetLogger(ctx).WithField("error", err).Warnf("GetSummary returned no usable content")
-		return "", err
+		return nil, err
 	}
-	logger.GetLogger(ctx).WithField("summary", content).Infof("GetSummary success")
-	return content, nil
+	result := parseDocumentSummaryOutput(content)
+	logger.GetLogger(ctx).WithField("summary", result.Summary).
+		WithField("has_profile", result.Profile != nil).Infof("GetSummary success")
+	return result, nil
+}
+
+type documentSummaryResult struct {
+	Summary string
+	Profile *types.KnowledgeProfile
+}
+
+// documentProfileOutput mirrors the structured JSON contract of the summary
+// prompt while still accepting legacy plain-text model responses.
+type documentProfileOutput struct {
+	Summary         string   `json:"summary"`
+	Gist            string   `json:"gist"`
+	Topics          []string `json:"topics"`
+	DocType         string   `json:"doc_type"`
+	TypicalQuestion string   `json:"typical_question"`
+}
+
+func parseDocumentSummaryOutput(content string) *documentSummaryResult {
+	content = strings.TrimSpace(content)
+	var out documentProfileOutput
+	if err := common.ParseLLMJsonResponse(content, &out); err != nil {
+		return &documentSummaryResult{Summary: content}
+	}
+	summary := strings.TrimSpace(out.Summary)
+	profile := (&types.KnowledgeProfile{
+		Gist:            out.Gist,
+		Topics:          out.Topics,
+		DocType:         out.DocType,
+		TypicalQuestion: out.TypicalQuestion,
+	}).Normalize()
+	if summary == "" && profile != nil {
+		summary = profile.Gist
+	}
+	if summary == "" {
+		return &documentSummaryResult{Summary: content}
+	}
+	return &documentSummaryResult{Summary: summary, Profile: profile}
+}
+
+func buildSummaryChunkContent(summary string, profile *types.KnowledgeProfile) string {
+	summary = strings.TrimSpace(summary)
+	if profile != nil {
+		gist := strings.TrimSpace(profile.Gist)
+		if gist != "" && !strings.EqualFold(gist, summary) {
+			return "# Summary\n" + gist + "\n\n" + summary
+		}
+	}
+	return "# Summary\n" + summary
 }
 
 // sampleLongContent returns content that fits within maxChars.
@@ -1312,7 +1363,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 	}
 
 	// Generate summary
-	summary, err := s.getSummary(ctx, chatModel, knowledge, textChunks)
+	summaryResult, err := s.getSummary(ctx, chatModel, knowledge, textChunks)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to generate summary for knowledge %s: %v", payload.KnowledgeID, err)
 		// Surface the underlying LLM/IO error on the span so the trace UI
@@ -1328,6 +1379,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		// and surfacing it in the description is misleading.
 		if errors.Is(err, errInsufficientSummaryContent) {
 			knowledge.Description = ""
+			knowledge.Profile = nil
 			knowledge.SummaryStatus = types.SummaryStatusFailed
 			knowledge.UpdatedAt = time.Now()
 			if updateErr := ownerLease.CommitWithFence(ctx, func(guardedCtx context.Context) error {
@@ -1337,6 +1389,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 				summaryErr = updateErr
 				return fmt.Errorf("summary processing owner guarded failure write: %w", updateErr)
 			}
+			_ = requestKnowledgeBaseProfileRefresh(ctx, s.task, kb, false)
 			summaryOut["fallback"] = "insufficient_content"
 			summaryErr = err
 			return nil
@@ -1359,11 +1412,14 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		summaryOut["skipped"] = "content_revision_changed"
 		return nil
 	}
-	// Update knowledge description
+	// Update the display summary and the structured source profile together.
+	summary := summaryResult.Summary
 	knowledge.Description = summary
+	knowledge.Profile = summaryResult.Profile
 	knowledge.SummaryStatus = types.SummaryStatusCompleted
 	knowledge.UpdatedAt = time.Now()
 	summaryOut["summary_chars"] = len([]rune(summary))
+	summaryOut["has_profile"] = summaryResult.Profile != nil
 	// Preview the generated summary on the span output so the trace
 	// viewer can show "this is what the LLM produced" at a glance,
 	// without hopping to the knowledge-detail page. Capped to keep
@@ -1376,6 +1432,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		summaryErr = err
 		return fmt.Errorf("summary processing owner guarded knowledge write: %w", err)
 	}
+	_ = requestKnowledgeBaseProfileRefresh(ctx, s.task, kb, false)
 
 	// Create summary chunk and index it — only when RAG indexing is enabled.
 	// Wiki-only KBs don't need summary chunks in the vector index.
@@ -1398,7 +1455,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 			TenantID:        knowledge.TenantID,
 			KnowledgeID:     knowledge.ID,
 			KnowledgeBaseID: knowledge.KnowledgeBaseID,
-			Content:         fmt.Sprintf("# Summary\n%s", summary),
+			Content:         buildSummaryChunkContent(summary, summaryResult.Profile),
 			ChunkIndex:      maxChunkIndex + 1,
 			IsEnabled:       true,
 			CreatedAt:       time.Now(),
@@ -2492,11 +2549,13 @@ func (s *knowledgeService) RegenerateKnowledgeSummary(
 	}
 	if len(textChunks) == 0 {
 		knowledge.Description = ""
+		knowledge.Profile = nil
 		knowledge.SummaryStatus = types.SummaryStatusFailed
 		knowledge.UpdatedAt = time.Now()
 		if updateErr := s.repo.UpdateKnowledge(ctx, knowledge); updateErr != nil {
 			return knowledge, updateErr
 		}
+		_ = requestKnowledgeBaseProfileRefresh(ctx, s.task, kb, false)
 		return knowledge, errInsufficientSummaryContent
 	}
 	sort.Slice(textChunks, func(i, j int) bool {
@@ -2510,11 +2569,13 @@ func (s *knowledgeService) RegenerateKnowledgeSummary(
 	handleGenerationFailure := func(generationErr error) (*types.Knowledge, error) {
 		if errors.Is(generationErr, errInsufficientSummaryContent) {
 			knowledge.Description = ""
+			knowledge.Profile = nil
 			knowledge.SummaryStatus = types.SummaryStatusFailed
 			knowledge.UpdatedAt = time.Now()
 			if updateErr := s.repo.UpdateKnowledge(ctx, knowledge); updateErr != nil {
 				return knowledge, updateErr
 			}
+			_ = requestKnowledgeBaseProfileRefresh(ctx, s.task, kb, false)
 			return knowledge, generationErr
 		}
 		if summaryTaskWillRetry(ctx) {
@@ -2548,7 +2609,7 @@ func (s *knowledgeService) RegenerateKnowledgeSummary(
 	if err != nil {
 		return handleGenerationFailure(fmt.Errorf("get chat model: %w", err))
 	}
-	summary, err := s.getSummary(ctx, chatModel, knowledge, textChunks)
+	summaryResult, err := s.getSummary(ctx, chatModel, knowledge, textChunks)
 	if err != nil {
 		return handleGenerationFailure(err)
 	}
@@ -2562,12 +2623,15 @@ func (s *knowledgeService) RegenerateKnowledgeSummary(
 		logger.Infof(ctx, "Discarding stale summary refresh for knowledge %s", knowledgeID)
 		return nil, ErrSummaryRefreshStale
 	}
+	summary := summaryResult.Summary
 	knowledge.Description = summary
+	knowledge.Profile = summaryResult.Profile
 	knowledge.SummaryStatus = types.SummaryStatusCompleted
 	knowledge.UpdatedAt = time.Now()
 	if err := s.repo.UpdateKnowledge(ctx, knowledge); err != nil {
 		return nil, err
 	}
+	_ = requestKnowledgeBaseProfileRefresh(ctx, s.task, kb, false)
 	if kb.NeedsEmbeddingModel() {
 		maxIndex := 0
 		for _, chunk := range allChunks {
@@ -2588,7 +2652,7 @@ func (s *knowledgeService) RegenerateKnowledgeSummary(
 		}
 		summaryChunks := make([]*types.Chunk, 0, len(existingSummaries))
 		for _, chunk := range existingSummaries {
-			chunk.Content = "# Summary\n" + summary
+			chunk.Content = buildSummaryChunkContent(summary, summaryResult.Profile)
 			chunk.SourceContent = chunk.Content
 			chunk.IsEnabled = true
 			chunk.UpdatedAt = time.Now()
@@ -2600,7 +2664,7 @@ func (s *knowledgeService) RegenerateKnowledgeSummary(
 		if len(summaryChunks) == 0 {
 			summaryChunk := &types.Chunk{
 				ID: uuid.NewString(), TenantID: tenantID, KnowledgeID: knowledge.ID,
-				KnowledgeBaseID: knowledge.KnowledgeBaseID, Content: "# Summary\n" + summary,
+				KnowledgeBaseID: knowledge.KnowledgeBaseID, Content: buildSummaryChunkContent(summary, summaryResult.Profile),
 				ChunkIndex: maxIndex + 1, IsEnabled: true, ChunkType: types.ChunkTypeSummary,
 				ParentChunkID: textChunks[0].ID, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 			}
@@ -4031,6 +4095,7 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 
 		logger.Infof(ctx, "Resolved %d total images for knowledge %s", len(storedImages), knowledge.ID)
 	}
+	s.bindStoredImages(ctx, knowledge, storedImages)
 
 	// Step 3: Split into chunks using Go chunker. Browser textareas normalize
 	// pasted content to LF, so normalize uploaded source text before calculating
@@ -4782,13 +4847,18 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 	}
 
 	attempt := attemptFromCtx(ctx)
-	redisKey := fmt.Sprintf("multimodal:pending:%s", knowledge.ID)
+	lang := types.LanguageFromContextOrDefault(ctx)
+	redisKey := multimodalPendingKey(knowledge.ID)
+	counterSeeded := false
 	if s.redisClient != nil {
 		if err := s.redisClient.Set(ctx, redisKey, len(images), 24*time.Hour).Err(); err != nil {
 			logger.Warnf(ctx, "Failed to set multimodal pending count for %s: %v", knowledge.ID, err)
+		} else {
+			counterSeeded = true
 		}
 	}
 
+	enqueued := 0
 	for idx, img := range images {
 		// Match image to the ParsedChunk whose content contains the image URL.
 		// ChunkID was populated by processChunks with the real DB UUID.
@@ -4803,7 +4873,6 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 			chunkID = chunks[0].ChunkID
 		}
 
-		lang := types.LanguageFromContextOrDefault(ctx)
 		payload := types.ImageMultimodalPayload{
 			TenantID:        knowledge.TenantID,
 			KnowledgeID:     knowledge.ID,
@@ -4829,10 +4898,12 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 			asynq.Queue(types.QueueMultimodal), asynq.MaxRetry(3), asynq.Timeout(30*time.Minute))
 		if _, err := s.task.Enqueue(task); err != nil {
 			logger.Warnf(ctx, "Failed to enqueue image multimodal task for %s: %v", img.ServingURL, err)
-		} else {
-			logger.Infof(ctx, "Enqueued image:multimodal task for %s", img.ServingURL)
+			continue
 		}
+		enqueued++
+		logger.Infof(ctx, "Enqueued image:multimodal task for %s", img.ServingURL)
 	}
+	s.releaseUnownedMultimodalSlots(ctx, knowledge, redisKey, counterSeeded, len(images), enqueued)
 }
 
 // ProcessKnowledgeListReparse handles Asynq knowledge list reparse tasks.

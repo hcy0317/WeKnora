@@ -1,9 +1,6 @@
 import { get, post, put, del, patch, postUpload } from '@/utils/request'
 import type { CreatedTenantAPIKey, TenantAPIKey, TenantAPIKeyCapability } from '@/api/tenant'
-import type {
-  EngineLifecycleConfig,
-  EngineLifecycleUpdatePayload,
-} from '@/stores/engineLifecyclePolicy'
+import type { EngineLifecycleConfig, EngineLifecycleUpdatePayload } from '@/stores/engineLifecyclePolicy'
 
 const ENGINE_LIFECYCLE_ROUTE = '/api/v1/system/admin/engine-lifecycle'
 
@@ -56,7 +53,7 @@ export interface SystemInfo {
   db_version?: string
   /** Human-readable error message when the startup migration failed.
    *  When non-empty, the system info view should surface a troubleshooting
-   *  banner (see docs/migration-troubleshooting.md). */
+   *  banner (see website-docs/01-getting-started/05-troubleshooting.md#database-migrations). */
   db_migration_error?: string
   /** Server process boot time (RFC3339, UTC). */
   started_at?: string
@@ -137,7 +134,10 @@ export interface ParserEngineConfig {
   docreader_transport?: string
   mineru_endpoint?: string
   mineru_api_key?: string
-  // MinerU 自建参数
+  // MinerU 自建参数（协议自动识别：4.0+ 走 V1 API）
+  mineru_server_api_key?: string
+  mineru_tier?: string // flash / basic / standard / advanced，空为服务端默认
+  // 以下仅对 MinerU 3.x 及更早版本生效
   mineru_model?: string
   mineru_vlm_server_url?: string
   mineru_enable_formula?: boolean | null
@@ -176,9 +176,6 @@ export function getParserEngines(): Promise<ParserEnginesResponse> {
 
 /** 使用当前填写的参数检测引擎可用性（不保存），用于填写新参数后即时测试 */
 export function checkParserEngines(config: ParserEngineConfig): Promise<ParserEnginesResponse> {
-  // Managed engines may need a cold start. The server already bounds this probe
-  // with the configured lifecycle startup timeout plus transport grace, so the
-  // generic 30-second Axios timeout would only cancel a still-valid startup.
   return post('/api/v1/system/parser-engines/check', config, { timeout: 0 })
 }
 
@@ -423,14 +420,23 @@ export interface CreateSystemUserResponse {
   generated_password?: string
 }
 
+export interface CreateSystemUserResult extends CreateSystemUserResponse {
+  /**
+   * True only when this call created the account (HTTP 201), false on the
+   * idempotent 200 retry (identity already existed).
+   */
+  created: boolean
+}
+
 /**
  * Provision a new local user account (SystemAdmin only).
- * Backend returns the unwrapped CreateSystemUserResponse body.
- * Responses 201 on success.
+ * The backend answers 201 on create and 200 on the idempotent retry with
+ * the same CreateSystemUserResponse body. The status is projected onto
+ * `created`.
  */
-export async function createSystemUser(req: CreateSystemUserRequest): Promise<CreateSystemUserResponse> {
-  const response = await post('/api/v1/system/admin/users/create', req)
-  return response as unknown as CreateSystemUserResponse
+export async function createSystemUser(req: CreateSystemUserRequest): Promise<CreateSystemUserResult> {
+  const response = await post<CreateSystemUserResponse>('/api/v1/system/admin/users/create', req)
+  return { ...response, created: response.$httpStatus === 201 }
 }
 
 // ---- System Settings (P1) ----
@@ -784,11 +790,14 @@ export interface SandboxSkillImage {
 export interface SandboxConfig {
   sandbox_type?: string
   default_timeout_sec?: number
+  terminal_idle_disconnect_sec?: number
+  desktop_enabled?: boolean
   allow_private_endpoints?: boolean
   env_vars?: Record<string, string>
   volume_mount?: SandboxVolumeMountConfig
   skill_image?: SandboxSkillImage
   skill_rollout?: 'next_turn' | 'new_session'
+  network?: SandboxNetworkPolicy
   cube?: SandboxCubeConfig
   e2b?: SandboxE2BConfig
   docker?: SandboxDockerConfig
@@ -806,6 +815,51 @@ export interface SandboxDockerConfig {
   runtime?: string
   idle_ttl_seconds?: number
   http_timeout_sec?: number
+}
+
+/** One injected credential header on a Cube L7 rule. */
+export interface SandboxCubeHeaderInject {
+  header: string
+  /** Masked as '***' in responses; send the placeholder back to keep it. */
+  secret?: string
+  /** Defaults to '${SECRET}' server-side. */
+  format?: string
+}
+
+/** One CubeEgress L7 rule. Match fields are AND-ed; methods are OR-ed. */
+export interface SandboxCubeEgressRule {
+  name: string
+  scheme?: string
+  sni?: string
+  host?: string
+  methods?: string[]
+  path?: string
+  /** Absent means allow. A deny rule still needs host or sni. */
+  deny?: boolean
+  audit?: string
+  inject?: SandboxCubeHeaderInject[]
+}
+
+/** One E2B per-host request transform. host must also be in allow_out. */
+export interface SandboxE2BHostRule {
+  host: string
+  /** Values are masked as '***' in responses. */
+  headers?: Record<string, string>
+}
+
+/**
+ * Network policy for every sandbox created from this config. Absent fields
+ * mean egress allowed. Inbound is always credential-required:
+ * allow_public_inbound is accepted then ignored/cleared.
+ */
+export interface SandboxNetworkPolicy {
+  deny_egress_by_default?: boolean
+  /** Ignored. Inbound is always credential-required. */
+  allow_public_inbound?: boolean
+  allow_out?: string[]
+  deny_out?: string[]
+  cube_rules?: SandboxCubeEgressRule[]
+  e2b_host_rules?: SandboxE2BHostRule[]
 }
 
 /** `ok: null` means the probe was not executed in this run. */
@@ -834,6 +888,8 @@ export interface SandboxTemplate {
   created_at?: string
   updated_at?: string
   standard: boolean
+  /** XFCE sibling of `standard`. The admin picks one ID as this config's boot target. */
+  desktop?: boolean
   /** The provider's own explanation for a failed build, when it reports one. */
   error?: string
   instance_type?: string
@@ -844,6 +900,7 @@ export interface SandboxTemplate {
 export interface SandboxTemplateCatalog {
   templates: SandboxTemplate[]
   standard_template_id?: string
+  desktop_template_id?: string
   provisioned: boolean
 }
 
@@ -947,16 +1004,21 @@ export function getSandboxConfigInventory(id: string): Promise<{ data: SandboxIn
 
 /**
  * Fetch templates using the connection currently entered in the drawer.
- * `ensure_standard` starts a provider-side build when no WeKnora template is
- * present. `replace_standard` rebuilds the WeKnora template so a new spec
- * (DNS, image) can take effect; it requires `config_id`. The returned
- * building item can be polled through the same endpoint.
+ * `ensure_standard` starts a provider-side CLI build when that WeKnora
+ * template is missing. `ensure_desktop` does the same for the XFCE image, but
+ * the settings UI only sends it when the admin clicks Create — listing must
+ * not provision a desktop template as a side effect. `replace_standard` /
+ * `replace_desktop` rebuild the matching template so a new spec (DNS, image)
+ * can take effect; they require `config_id`. The returned building item can
+ * be polled through the same endpoint.
  */
 export function querySandboxTemplates(payload: {
   config: SandboxConfig
   config_id?: string
   ensure_standard?: boolean
   replace_standard?: boolean
+  ensure_desktop?: boolean
+  replace_desktop?: boolean
 }): Promise<{ data: SandboxTemplateCatalog }> {
   return post('/api/v1/sandbox-configs/templates/query', payload) as unknown as Promise<{
     data: SandboxTemplateCatalog
@@ -1056,6 +1118,9 @@ export interface ConfigSkill {
   // decides whether to offer the "view install" entry point.
   install_session_id?: string
   install_message_id?: string
+  // Present while a newer install is in flight or has failed and the sandbox
+  // still runs the previous version.
+  served?: { version?: string }
   created_at: string
   updated_at: string
   // Absent for a skill whose installer declared nothing, which is how the
@@ -1100,11 +1165,24 @@ export function installConfigSkillFromSource(
 export function reinstallConfigSkill(
   configId: string,
   skillId: string,
+  instructions = '',
 ): Promise<{ data: { skill_id: string } }> {
   return post(
     `/api/v1/sandbox-configs/${configId}/skills/${skillId}/reinstall`,
-    {},
+    { instructions },
   ) as unknown as Promise<{ data: { skill_id: string } }>
+}
+
+// Aborts an in-flight install so retry/uninstall become available.
+// After a process restart the row may still say installing with nothing running.
+export function stopConfigSkill(
+  configId: string,
+  skillId: string,
+): Promise<{ data: ConfigSkill }> {
+  return post(
+    `/api/v1/sandbox-configs/${configId}/skills/${skillId}/stop`,
+    {},
+  ) as unknown as Promise<{ data: ConfigSkill }>
 }
 
 /**
@@ -1184,4 +1262,19 @@ export function getConfigSkillFile(
   return get(`/api/v1/sandbox-configs/${configId}/skills/${skillId}/files/content`, {
     params: { path },
   }) as unknown as Promise<{ data: ConfigSkillFileContent }>
+}
+
+export interface SkillInstallGuidanceState {
+  accepting: boolean
+  messages: Array<{ id: string; content: string; status: 'pending' | 'injected' | 'unprocessed' }>
+}
+
+export function getConfigSkillGuidance(configId: string, skillId: string) {
+  return get(`/api/v1/sandbox-configs/${configId}/skills/${skillId}/guidance`) as unknown as Promise<{ data: SkillInstallGuidanceState }>
+}
+
+export function steerConfigSkill(configId: string, skillId: string, payload: {
+  expected_message_id: string; steer_id: string; content: string
+}) {
+  return post(`/api/v1/sandbox-configs/${configId}/skills/${skillId}/guidance`, payload)
 }

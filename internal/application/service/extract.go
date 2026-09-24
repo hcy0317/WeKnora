@@ -667,7 +667,7 @@ func (s *DataTableSummaryService) processTableData(ctx context.Context, resource
 	// 获取样本数据用于生成摘要
 	input := tools.DataAnalysisInput{
 		KnowledgeID: resources.knowledge.ID,
-		Sql:         fmt.Sprintf("SELECT * FROM \"%s\" LIMIT 10", tableSchema.TableName),
+		SQL:         fmt.Sprintf("SELECT * FROM \"%s\" LIMIT 10", tableSchema.TableName),
 	}
 	jsonData, err := json.Marshal(input)
 	if err != nil {

@@ -3,7 +3,6 @@ package chat
 import (
 	"strings"
 
-	"github.com/Tencent/WeKnora/internal/models/provider"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -138,24 +137,6 @@ func parseThinkingOverride(extraConfig map[string]string) ThinkingStrategy {
 		// "chat_template_kwargs" and any unknown non-empty value.
 		return chatTemplateKwargs{}
 	}
-}
-
-// EffectiveThinkingControl reports the provider field that will carry
-// ChatOptions.Thinking. It intentionally shares the same adapter/override
-// resolution as the real request path so diagnostics do not guess from the
-// frontend selection.
-func EffectiveThinkingControl(config *ChatConfig) string {
-	if config == nil {
-		return "none"
-	}
-	if override := parseThinkingOverride(config.ExtraConfig); override != nil {
-		return thinkingStrategyName(override)
-	}
-	providerName := provider.ProviderName(config.Provider)
-	if providerName == "" {
-		providerName = provider.DetectProvider(config.BaseURL)
-	}
-	return thinkingStrategyName(resolveProvider(providerName, config.ModelName).Thinking())
 }
 
 func thinkingStrategyName(strategy ThinkingStrategy) string {

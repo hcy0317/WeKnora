@@ -311,6 +311,31 @@ func (v *KeywordsVectorHybridRetrieveEngineService) DeleteByKnowledgeIDList(ctx 
 	return v.indexRepository.DeleteByKnowledgeIDList(ctx, knowledgeIDList, dimension, knowledgeType)
 }
 
+func (v *KeywordsVectorHybridRetrieveEngineService) ValidateKnowledgeIndexMove(ctx context.Context) error {
+	if _, ok := v.indexRepository.(interfaces.KnowledgeIndexMover); !ok {
+		return fmt.Errorf("retriever %s does not support moving indices", v.EngineType())
+	}
+	if validator, ok := v.indexRepository.(interface{ ValidateKnowledgeIndexMove(context.Context) error }); ok {
+		return validator.ValidateKnowledgeIndexMove(ctx)
+	}
+	return nil
+}
+
+func (v *KeywordsVectorHybridRetrieveEngineService) MoveKnowledgeIndices(
+	ctx context.Context,
+	sourceKB, targetKB, knowledgeID string,
+	chunkIDs []string,
+	dimension int,
+	knowledgeType string,
+) error {
+	if err := v.ValidateKnowledgeIndexMove(ctx); err != nil {
+		return err
+	}
+	return v.indexRepository.(interfaces.KnowledgeIndexMover).MoveKnowledgeIndices(
+		ctx, sourceKB, targetKB, knowledgeID, chunkIDs, dimension, knowledgeType,
+	)
+}
+
 // Support returns the retriever types supported by this engine
 func (v *KeywordsVectorHybridRetrieveEngineService) Support() []types.RetrieverType {
 	return v.indexRepository.Support()

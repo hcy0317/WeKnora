@@ -12,7 +12,8 @@ func TestHoldSandboxTurnOpensAndClosesTheLease(t *testing.T) {
 	holder := &turnLeaseManager{}
 	svc := &sessionService{sandboxMgr: holder}
 
-	release := svc.holdSandboxTurn(context.Background(), "session-a", "")
+	release, err := svc.holdSandboxTurn(context.Background(), "session-a", "")
+	require.NoError(t, err)
 	require.Equal(t, 1, holder.begins)
 	require.Zero(t, holder.ends)
 
@@ -23,7 +24,7 @@ func TestHoldSandboxTurnOpensAndClosesTheLease(t *testing.T) {
 func TestHoldSandboxTurnUsesPinnedNamedConfig(t *testing.T) {
 	pinner := NewSessionSandboxPinner(newPinTestDB(t))
 	ctx := context.WithValue(context.Background(), types.TenantIDContextKey, uint64(7))
-	_, err := pinner.Pin(ctx, "s-1", "cfg-pinned")
+	_, err := pinner.Pin(ctx, "s-1", SandboxPin{ConfigID: "cfg-pinned", TenantID: 7})
 	require.NoError(t, err)
 	deploymentDefault := &turnLeaseManager{}
 	named := &turnLeaseManager{}
@@ -32,7 +33,8 @@ func TestHoldSandboxTurnUsesPinnedNamedConfig(t *testing.T) {
 		sandboxPinner: pinner,
 	}
 
-	release := svc.holdSandboxTurn(ctx, "s-1", "cfg-agent-now")
+	release, err := svc.holdSandboxTurn(ctx, "s-1", "cfg-agent-now")
+	require.NoError(t, err)
 	require.Zero(t, deploymentDefault.begins)
 	require.Equal(t, 1, named.begins)
 	release()
@@ -43,7 +45,8 @@ func TestHoldSandboxTurnIsNoopWhenBeginFails(t *testing.T) {
 	holder := &turnLeaseManager{beginErr: context.Canceled}
 	svc := &sessionService{sandboxMgr: holder}
 
-	release := svc.holdSandboxTurn(context.Background(), "session-a", "")
+	release, err := svc.holdSandboxTurn(context.Background(), "session-a", "")
+	require.NoError(t, err)
 	require.Equal(t, 1, holder.begins)
 	release()
 	require.Zero(t, holder.ends)

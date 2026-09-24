@@ -237,3 +237,13 @@ func (r *kbShareRepository) CountByOrganizations(ctx context.Context, orgIDs []s
 	}
 	return out, nil
 }
+
+// DeleteByOrganizationAndSourceTenant removes KB shares created by a tenant
+// that is leaving the organization, preserving shares from other members.
+func (r *kbShareRepository) DeleteByOrganizationAndSourceTenant(
+	ctx context.Context, orgID string, sourceTenantID uint64,
+) error {
+	return r.db.WithContext(ctx).
+		Where("organization_id = ? AND source_tenant_id = ?", orgID, sourceTenantID).
+		Delete(&types.KnowledgeBaseShare{}).Error
+}

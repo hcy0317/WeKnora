@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/url"
 	"strings"
+
+	"github.com/Tencent/WeKnora/internal/utils"
 )
 
 func deriveWebSocketURL(sendMsgURL, allowedHostSuffix string) (string, error) {
@@ -65,6 +67,10 @@ func safeDialContext(ctx context.Context, network, address string) (net.Conn, er
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, fmt.Errorf("split dial address: %w", err)
+	}
+	// Whitelist-only mode refuses an unapproved hostname before DNS.
+	if err := utils.CheckDialWhitelistOnly(host); err != nil {
+		return nil, fmt.Errorf("endpoint host %q refused: %w", host, err)
 	}
 	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {

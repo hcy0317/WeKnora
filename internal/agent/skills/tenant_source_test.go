@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,7 +71,7 @@ func TestTenantSkillSourceBasePathIsTheImageDir(t *testing.T) {
 func TestTenantSkillSourceHidesUnusableSkillsFromEveryLookup(t *testing.T) {
 	src := NewTenantSkillSource([]*types.TenantSkillEntity{
 		{ID: "sk-2", Name: "ready-disabled", Status: types.SkillStatusReady, Enabled: false},
-	}, func(string) ([]byte, error) { return nil, errors.New("must not be called") })
+	}, func(*types.TenantSkillEntity) ([]byte, error) { return nil, errors.New("must not be called") })
 
 	_, err := src.GetSkillBasePath("ready-disabled")
 	require.Error(t, err)
@@ -91,7 +92,7 @@ func TestTenantSkillSourceLoadsInstructionsFromTheRow(t *testing.T) {
 		ID: "sk-1", Name: "pdf", Description: "PDF helpers",
 		Instructions: "Run scripts/extract.py.",
 		Status:       types.SkillStatusReady, Enabled: true,
-	}}, func(string) ([]byte, error) { return nil, errors.New("must not be called") })
+	}}, func(*types.TenantSkillEntity) ([]byte, error) { return nil, errors.New("must not be called") })
 
 	skill, err := src.LoadSkillInstructions("pdf")
 
@@ -113,9 +114,9 @@ func TestTenantSkillSourceReadsLevel3FilesFromTheBundle(t *testing.T) {
 	})
 	src := NewTenantSkillSource([]*types.TenantSkillEntity{{
 		ID: "sk-1", Name: "pdf", Status: types.SkillStatusReady, Enabled: true,
-		BundleRef: "local://sk-1.zip", BundleSHA256: bundleArchiveSHA256(archive),
-	}}, func(ref string) ([]byte, error) {
-		require.Equal(t, "local://sk-1.zip", ref)
+		BundleRef: "local://sk-1.zip", BundleSHA256: "sha-1",
+	}}, func(row *types.TenantSkillEntity) ([]byte, error) {
+		require.Equal(t, "local://sk-1.zip", row.BundleRef)
 		return archive, nil
 	})
 
@@ -143,8 +144,8 @@ func TestTenantSkillSourceDownloadsEachBundleOnce(t *testing.T) {
 	downloads := 0
 	src := NewTenantSkillSource([]*types.TenantSkillEntity{{
 		ID: "sk-1", Name: "pdf", Status: types.SkillStatusReady, Enabled: true,
-		BundleRef: "local://sk-1.zip", BundleSHA256: bundleArchiveSHA256(archive),
-	}}, func(string) ([]byte, error) {
+		BundleRef: "local://sk-1.zip", BundleSHA256: "sha-1",
+	}}, func(*types.TenantSkillEntity) ([]byte, error) {
 		downloads++
 		return archive, nil
 	})
@@ -158,25 +159,11 @@ func TestTenantSkillSourceDownloadsEachBundleOnce(t *testing.T) {
 		"one read_skill call per file would re-download the whole archive every time")
 }
 
-func TestTenantSkillSourceRejectsBundleWithWrongDeclaredSHA(t *testing.T) {
-	archive := zipArchive(t, map[string]string{
-		"SKILL.md": "---\nname: pdf\ndescription: d\n---\nbody\n",
-	})
-	src := NewTenantSkillSource([]*types.TenantSkillEntity{{
-		ID: "sk-1", Name: "pdf", Status: types.SkillStatusReady, Enabled: true,
-		BundleRef: "local://sk-1.zip", BundleSHA256: strings.Repeat("0", 64),
-	}}, func(string) ([]byte, error) { return archive, nil })
-
-	_, err := src.ListSkillFiles("pdf")
-	require.ErrorContains(t, err, "does not match its declared sha256")
-	require.Empty(t, src.cache)
-}
-
 func TestTenantSkillSourceRefusesPathsOutsideTheSkill(t *testing.T) {
 	src := NewTenantSkillSource([]*types.TenantSkillEntity{{
 		ID: "sk-1", Name: "pdf", Status: types.SkillStatusReady, Enabled: true,
 		BundleRef: "local://sk-1.zip",
-	}}, func(string) ([]byte, error) {
+	}}, func(*types.TenantSkillEntity) ([]byte, error) {
 		return nil, errors.New("must not be called")
 	})
 
@@ -203,8 +190,8 @@ func TestTenantSkillSourceReportsAMissingBundleWithoutBlockingExecution(t *testi
 	require.Equal(t, "/opt/weknora/tenant/skills/pdf/scripts/extract.py", remote)
 }
 
-func TestManagerIgnoresPreloadedSkillsWhenTenantSourceIsAttached(t *testing.T) {
-	dir := preloadedSkillDir(t, "document-analyzer", "preloaded description")
+func TestManagerIgnoresHostSkillsWhenTenantSourceIsAttached(t *testing.T) {
+	dir := hostSkillDir(t, "document-analyzer", "host description")
 	mgr := NewManager(&ManagerConfig{SkillDirs: []string{dir}, Enabled: true}, nil)
 	mgr.WithTenantSource(NewTenantSkillSource([]*types.TenantSkillEntity{
 		{
@@ -225,7 +212,7 @@ func TestManagerIgnoresPreloadedSkillsWhenTenantSourceIsAttached(t *testing.T) {
 	}
 	require.Len(t, byName, 2)
 	require.NotContains(t, byName, "document-analyzer",
-		"host preloaded skills are not in the sandbox image")
+		"host skills are not in the sandbox image")
 	require.Equal(t, "tenant description", byName["pdf"].Description)
 	require.Equal(t, "tenant only", byName["csv"].Description)
 
@@ -237,88 +224,6 @@ func TestManagerIgnoresPreloadedSkillsWhenTenantSourceIsAttached(t *testing.T) {
 	require.Error(t, err, "a host-only skill must not be readable once the image is the source")
 }
 
-func TestManagerRunsATenantSkillFromTheImageWithoutUploading(t *testing.T) {
-	sandboxMgr := &recordingSandboxManager{}
-	mgr := NewManager(&ManagerConfig{SkillDirs: nil, Enabled: true}, sandboxMgr)
-	mgr.WithTenantSource(NewTenantSkillSource([]*types.TenantSkillEntity{{
-		ID: "sk-1", Name: "pdf", Status: types.SkillStatusReady, Enabled: true,
-	}}, nil))
-	require.NoError(t, mgr.Initialize(context.Background()))
-
-	_, err := mgr.ExecuteScript(
-		types.WithSessionID(context.Background(), "sess-1"),
-		"pdf", "scripts/extract.py", []string{"--flag"}, "",
-	)
-
-	require.NoError(t, err)
-	require.NotNil(t, sandboxMgr.config)
-	require.Equal(t, "/opt/weknora/tenant/skills/pdf/scripts/extract.py",
-		sandboxMgr.config.RemoteScriptPath)
-	require.Empty(t, sandboxMgr.config.Script,
-		"there is no host-side copy of an installed skill to upload")
-	require.Equal(t, []string{"--flag"}, sandboxMgr.config.Args)
-	require.Equal(t, "sess-1", sandboxMgr.config.SessionID)
-	require.Equal(t, sandbox.SkillsImageRoot+"/pdf",
-		sandboxMgr.config.Env["WEKNORA_SKILL_DIR"])
-	require.Equal(t, "/workspace/output", sandboxMgr.config.Env[artifactOutputEnvVar])
-	require.Equal(t, sandbox.SessionSkillPackageDir("pdf"),
-		sandboxMgr.config.Env["PYTHONPATH"])
-	require.Equal(t, sandbox.SessionSkillPackageDir("pdf"),
-		sandboxMgr.config.Env["NODE_PATH"])
-}
-
-func TestManagerRunsAWorkspaceScriptWithInstalledSkillInterpreter(t *testing.T) {
-	sandboxMgr := &recordingSandboxManager{}
-	mgr := NewManager(&ManagerConfig{SkillDirs: nil, Enabled: true}, sandboxMgr)
-	mgr.WithTenantSource(NewTenantSkillSource([]*types.TenantSkillEntity{{
-		ID: "sk-1", Name: "ppt-generator", Status: types.SkillStatusReady, Enabled: true,
-	}}, nil))
-	require.NoError(t, mgr.Initialize(context.Background()))
-
-	_, err := mgr.ExecuteScript(
-		types.WithSessionID(context.Background(), "sess-1"),
-		"ppt-generator", "/workspace/output/generate_rencui_ppt.py", []string{"--theme", "doraemon"}, "",
-	)
-
-	require.NoError(t, err)
-	require.NotNil(t, sandboxMgr.config)
-	require.Equal(t, "/workspace/output/generate_rencui_ppt.py", sandboxMgr.config.RemoteScriptPath)
-	require.Equal(t, sandbox.SkillsImageRoot+"/ppt-generator", sandboxMgr.config.SkillDir)
-	require.Empty(t, sandboxMgr.config.Script)
-	require.Equal(t, []string{"--theme", "doraemon"}, sandboxMgr.config.Args)
-	require.Equal(t, sandbox.SkillsImageRoot+"/ppt-generator",
-		sandboxMgr.config.Env["WEKNORA_SKILL_DIR"])
-}
-
-func TestManagerRejectsWorkspaceScriptForPreloadedSkill(t *testing.T) {
-	dir := preloadedSkillDir(t, "pdf", "preloaded description")
-	sandboxMgr := &recordingSandboxManager{}
-	mgr := NewManager(&ManagerConfig{SkillDirs: []string{dir}, Enabled: true}, sandboxMgr)
-	require.NoError(t, mgr.Initialize(context.Background()))
-
-	_, err := mgr.ExecuteScript(context.Background(), "pdf", "/workspace/output/custom.py", nil, "")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "shell_exec")
-	require.Zero(t, sandboxMgr.calls)
-}
-
-func TestManagerRejectsWorkspaceInputAsSkillScript(t *testing.T) {
-	sandboxMgr := &recordingSandboxManager{}
-	mgr := NewManager(&ManagerConfig{SkillDirs: nil, Enabled: true}, sandboxMgr)
-	mgr.WithTenantSource(NewTenantSkillSource([]*types.TenantSkillEntity{{
-		ID: "sk-1", Name: "pdf", Status: types.SkillStatusReady, Enabled: true,
-	}}, nil))
-	require.NoError(t, mgr.Initialize(context.Background()))
-
-	_, err := mgr.ExecuteScript(context.Background(), "pdf", "/workspace/input/upload.py", nil, "")
-	require.Error(t, err)
-	require.Zero(t, sandboxMgr.calls)
-}
-
-// The in-sandbox directory is what read_skill shows the model so it can name
-// the skill's own interpreter instead of probing the system python3. A
-// preloaded skill has no such directory: its base path is on the WeKnora host,
-// which no command in the sandbox can reach.
 func TestSandboxSkillDirOnlyAnswersForInstalledSkills(t *testing.T) {
 	installed := NewManager(&ManagerConfig{Enabled: true}, nil)
 	installed.WithTenantSource(NewTenantSkillSource([]*types.TenantSkillEntity{{
@@ -330,33 +235,18 @@ func TestSandboxSkillDirOnlyAnswersForInstalledSkills(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, sandbox.SkillsImageRoot+"/pdf", dir)
 
-	preloaded := NewManager(&ManagerConfig{
-		SkillDirs: []string{preloadedSkillDir(t, "pdf", "preloaded description")},
+	host := NewManager(&ManagerConfig{
+		SkillDirs: []string{hostSkillDir(t, "pdf", "host description")},
 		Enabled:   true,
 	}, nil)
-	require.NoError(t, preloaded.Initialize(context.Background()))
+	require.NoError(t, host.Initialize(context.Background()))
 
-	_, ok = preloaded.SandboxSkillDir("pdf")
+	_, ok = host.SandboxSkillDir("pdf")
 	require.False(t, ok)
 }
 
-// Preloaded skills keep uploading from the host and keep running in their own
-// directory; the tenant source must not change that path at all.
-func TestManagerKeepsPreloadedSkillExecutionWhenNoTenantSource(t *testing.T) {
-	dir := preloadedSkillDir(t, "pdf", "preloaded description")
-	sandboxMgr := &recordingSandboxManager{}
-	mgr := NewManager(&ManagerConfig{SkillDirs: []string{dir}, Enabled: true}, sandboxMgr)
-	require.NoError(t, mgr.Initialize(context.Background()))
-
-	_, err := mgr.ExecuteScript(context.Background(), "pdf", "scripts/run.py", nil, "")
-
-	require.NoError(t, err)
-	require.NotNil(t, sandboxMgr.config)
-	require.Empty(t, sandboxMgr.config.RemoteScriptPath)
-	require.Equal(t, filepath.Join(dir, "pdf", "scripts", "run.py"), sandboxMgr.config.Script)
-	require.Equal(t, dir+"/pdf", sandboxMgr.config.WorkDir)
-}
-
+// Host skills keep uploading from the WeKnora machine and keep running in
+// their staged directory; the tenant source must not change that path at all.
 type recordingSandboxManager struct {
 	config *sandbox.ExecuteConfig
 	calls  int
@@ -374,18 +264,82 @@ func (m *recordingSandboxManager) Cleanup(context.Context) error { return nil }
 func (m *recordingSandboxManager) GetSandbox() sandbox.Sandbox   { return nil }
 func (m *recordingSandboxManager) GetType() sandbox.SandboxType  { return sandbox.SandboxTypeCube }
 
-// preloadedSkillDir writes one deployment-preloaded skill to a temp directory
-// and returns the search root it lives under.
-func preloadedSkillDir(t *testing.T, name, description string) string {
+// hostSkillDir writes one host skill to a temp directory and returns the
+// search root it lives under.
+func hostSkillDir(t *testing.T, name, description string) string {
 	t.Helper()
 	root := t.TempDir()
 	skillDir := filepath.Join(root, name)
 	require.NoError(t, os.MkdirAll(filepath.Join(skillDir, "scripts"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(skillDir, SkillFileName),
-		[]byte("---\nname: "+name+"\ndescription: "+description+"\n---\npreloaded body\n"), 0o644))
+		[]byte("---\nname: "+name+"\ndescription: "+description+"\n---\nhost body\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(skillDir, "scripts", "run.py"),
-		[]byte("print('preloaded')\n"), 0o644))
+		[]byte("print('host')\n"), 0o644))
 	return root
+}
+
+func TestTenantSkillSourceCacheKeepsOneOversizeArchive(t *testing.T) {
+	src := NewTenantSkillSource(nil, nil)
+	src.store("small", bytes.Repeat([]byte("s"), 32))
+	src.store("big", bytes.Repeat([]byte("b"), cachedBundleBytes+1))
+
+	require.Equal(t, bytes.Repeat([]byte("b"), cachedBundleBytes+1), src.cached("big"))
+	require.Nil(t, src.cached("small"),
+		"a zip over the keep-around budget must not sit next to other entries")
+}
+
+// The agent reads the same archive the install accepted, so the two have to
+// count it the same way. Counting raw zip entries against the skill-file cap
+// rejects bundles the install took — directory entries alone can carry a real
+// skill past 20k — and read_skill then fails on an install that works.
+const bundleIndexSkillMD = "---\nname: pdf\ndescription: d\n---\nbody\n"
+
+func TestSkillBundleFileIndexCountsFilesTheWayTheInstallDid(t *testing.T) {
+	files := map[string]string{"repo-main/" + SkillFileName: bundleIndexSkillMD}
+	for i := 0; i < maxBundleEntries-1; i++ {
+		files[fmt.Sprintf("repo-main/templates/asset-%d.txt", i)] = ""
+	}
+	// Directory entries push the raw count past the skill-file cap without
+	// adding a single file the skill is made of.
+	dirs := make([]string, 0, 2000)
+	for i := 0; i < 2000; i++ {
+		dirs = append(dirs, fmt.Sprintf("repo-main/templates/dir-%d/", i))
+	}
+
+	index, err := skillBundleFileIndex(zipArchiveWithDirs(t, files, dirs))
+
+	require.NoError(t, err)
+	require.Len(t, index, maxBundleEntries)
+	require.Contains(t, index, SkillFileName)
+}
+
+func TestSkillBundleFileIndexRejectsMoreSkillFilesThanTheCap(t *testing.T) {
+	files := map[string]string{"repo-main/" + SkillFileName: bundleIndexSkillMD}
+	for i := 0; i < maxBundleEntries; i++ {
+		files[fmt.Sprintf("repo-main/templates/asset-%d.txt", i)] = ""
+	}
+
+	_, err := skillBundleFileIndex(zipArchiveWithDirs(t, files, nil))
+
+	require.ErrorContains(t, err, "more than 20000 files")
+}
+
+func zipArchiveWithDirs(t *testing.T, files map[string]string, dirs []string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	writer := zip.NewWriter(&buf)
+	for _, name := range dirs {
+		_, err := writer.Create(name)
+		require.NoError(t, err)
+	}
+	for name, content := range files {
+		entry, err := writer.Create(name)
+		require.NoError(t, err)
+		_, err = entry.Write([]byte(content))
+		require.NoError(t, err)
+	}
+	require.NoError(t, writer.Close())
+	return buf.Bytes()
 }
 
 func zipArchive(t *testing.T, files map[string]string) []byte {
@@ -402,15 +356,32 @@ func zipArchive(t *testing.T, files map[string]string) []byte {
 	return buf.Bytes()
 }
 
-func TestTenantSkillSourceCacheUsesUncompressedByteBudget(t *testing.T) {
-	src := &TenantSkillSource{maxCacheBytes: 10}
-	first := map[string][]byte{"SKILL.md": make([]byte, 6)}
-	second := map[string][]byte{"SKILL.md": make([]byte, 6)}
+func TestTenantSkillSourceRejectsBundleWithWrongDeclaredSHA(t *testing.T) {
+	archive := zipArchive(t, map[string]string{
+		"SKILL.md": "---\nname: pdf\ndescription: d\n---\nbody\n",
+	})
+	src := NewTenantSkillSource([]*types.TenantSkillEntity{{
+		ID: "sk-1", Name: "pdf", Status: types.SkillStatusReady, Enabled: true,
+		BundleRef: "local://sk-1.zip", BundleSHA256: strings.Repeat("0", 64),
+	}}, func(*types.TenantSkillEntity) ([]byte, error) { return archive, nil })
 
-	src.store("first", first)
-	src.store("second", second)
+	_, err := src.ListSkillFiles("pdf")
+	require.ErrorContains(t, err, "does not match its declared sha256")
+	require.Empty(t, src.cache, "unverified archives must not enter the source cache")
+}
 
-	require.Nil(t, src.cached("first"), "least-recent bundle must be evicted by byte budget")
-	require.Equal(t, second, src.cached("second"))
-	require.LessOrEqual(t, src.cacheBytes, int64(10))
+func TestTenantSkillSourceAtUsesTheGivenRoot(t *testing.T) {
+	rows := []*types.TenantSkillEntity{{Name: "pdf", Status: types.SkillStatusReady, Enabled: true}}
+	src := NewTenantSkillSourceAt("/Users/dev/.weknora/skills", rows, nil)
+	meta, err := src.DiscoverSkills()
+	require.NoError(t, err)
+	require.Equal(t, "/Users/dev/.weknora/skills/pdf", meta[0].BasePath)
+	script, err := src.RemoteScriptPath("pdf", "scripts/run.py")
+	require.NoError(t, err)
+	require.Equal(t, "/Users/dev/.weknora/skills/pdf/scripts/run.py", script)
+
+	legacy := NewTenantSkillSource(rows, nil)
+	dir, err := legacy.GetSkillBasePath("pdf")
+	require.NoError(t, err)
+	require.Equal(t, sandbox.SkillsImageRoot+"/pdf", dir)
 }

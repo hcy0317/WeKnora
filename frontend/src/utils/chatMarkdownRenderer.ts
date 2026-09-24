@@ -2,6 +2,7 @@ import { marked, type Renderer } from 'marked'
 import markedKatex from 'marked-katex-extension'
 import type { Tokens } from 'marked'
 
+import type { CachedMermaidSvgHtml } from './mermaidStreaming.ts'
 import { normalizeSandboxArtifactRefs } from './sandboxArtifactRefs.ts'
 import {
   collapseStandaloneCitationParagraphs,
@@ -40,9 +41,9 @@ export type RenderChatMarkdownOptions = {
   streaming?: boolean
   collapseStandaloneCitations?: boolean
   knowledgeReferences?: CitationKnowledgeRef[] | null
-  cachedMermaidSvgHtml?: string | null
-  injectCachedMermaidSvg?: (html: string, cachedSvgHtml?: string | null) => string
-  prepareMarkdown?: (markdown: string, cachedSvgHtml?: string | null) => string
+  cachedMermaidSvgHtml?: CachedMermaidSvgHtml
+  injectCachedMermaidSvg?: (html: string, cachedSvgHtml?: CachedMermaidSvgHtml) => string
+  prepareMarkdown?: (markdown: string, cachedSvgHtml?: CachedMermaidSvgHtml) => string
 }
 
 export function configureMarkedForChatMarkdown(): void {
@@ -393,6 +394,7 @@ export function createChatMarkdownRenderer(options: ChatMarkdownRendererOptions 
   if (options.imageRenderer) {
     renderer.image = ({ href, title, text }: Tokens.Image) => {
       const imageHref = href || ''
+      if (!imageHref.trim()) return ''
       if (options.isValidImageUrl && !options.isValidImageUrl(imageHref)) {
         return options.invalidImageHtml?.(imageHref) ?? ''
       }

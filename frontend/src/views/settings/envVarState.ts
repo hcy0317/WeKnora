@@ -122,15 +122,10 @@ export const RESERVED_ENV_NAMES: Set<string> = new Set([
   'PYTHONPATH',
   'PYTHONHOME',
   'NODE_OPTIONS',
-  'NODE_PATH',
-  'WEKNORA_SKILL_OUTPUT_DIR',
-  'WEKNORA_SESSION_INPUT_DIR',
-  'WEKNORA_SKILL_HISTORY_ROOT',
-  'WEKNORA_SKILL_DIR',
 ])
 
-/** Future sandbox-injected skill paths are reserved without blocking credentials. */
-const RESERVED_ENV_PREFIX = 'WEKNORA_SKILL_'
+/** The sandbox hands the skill its artifact directory through this prefix. */
+const RESERVED_ENV_PREFIX = 'WEKNORA_'
 
 /** Mirrors `envNamePattern` server-side: UPPER_SNAKE_CASE, at most 128 chars. */
 const ENV_NAME_PATTERN = /^[A-Z_][A-Z0-9_]{0,127}$/
@@ -154,7 +149,11 @@ export function statusOf(v: EnvVarView): EnvStatus {
 }
 
 /** The config's display name, falling back to its id so a group is never nameless. */
-export function configLabel(group: Pick<ConfigEnvGroup, 'sandbox_config_id' | 'sandbox_config_name'>): string {
+export function configLabel(
+  group: Pick<ConfigEnvGroup, 'sandbox_config_id' | 'sandbox_config_name'>,
+  hostLabel = '',
+): string {
+  if (hostLabel && group.sandbox_config_id === 'host') return hostLabel
   return group.sandbox_config_name?.trim() || group.sandbox_config_id
 }
 

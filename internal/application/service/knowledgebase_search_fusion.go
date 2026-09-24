@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"math"
 
 	"slices"
 
@@ -39,6 +40,7 @@ func fuseOrDeduplicate(ctx context.Context, vectorResults, keywordResults []*typ
 	}
 	if len(vectorResults) == 0 {
 		// Keyword-only: keep original scores (important for FAQ)
+		rescaleUnboundedScores(keywordResults)
 		result := deduplicateByScore(keywordResults)
 		logger.Infof(ctx, "Result count after deduplication: %d", len(result))
 		return result
@@ -47,6 +49,34 @@ func fuseOrDeduplicate(ctx context.Context, vectorResults, keywordResults []*typ
 	result := fuseWithRRF(ctx, vectorResults, keywordResults, retrievalCfg)
 	logger.Infof(ctx, "Result count after RRF fusion: %d", len(result))
 	return result
+}
+
+// rescaleUnboundedScores maps unbounded BM25 scores into [0,1] for callers
+// that display or fuse keyword-only results. Scores already in [0,1] are
+// preserved so FAQ and bounded retriever scores retain their original meaning.
+func rescaleUnboundedScores(results []*types.IndexWithScore) {
+	maxScore := 0.0
+	for _, result := range results {
+		if result == nil {
+			continue
+		}
+		if math.IsNaN(result.Score) || math.IsInf(result.Score, 0) {
+			result.Score = 0
+			continue
+		}
+		if result.Score > maxScore {
+			maxScore = result.Score
+		}
+	}
+	if maxScore <= 1 {
+		return
+	}
+	for _, result := range results {
+		if result == nil || math.IsNaN(result.Score) || math.IsInf(result.Score, 0) {
+			continue
+		}
+		result.Score /= maxScore
+	}
 }
 
 // sortByScoreDesc is a reusable sort comparator for IndexWithScore slices (descending by Score).

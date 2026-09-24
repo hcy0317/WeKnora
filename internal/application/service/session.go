@@ -6,18 +6,17 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Tencent/WeKnora/internal/application/repository"
+	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/config"
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
-
-	"github.com/Tencent/WeKnora/internal/application/repository"
-	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
-	"github.com/Tencent/WeKnora/internal/sandbox"
 )
 
 func sessionUserIDFromContext(ctx context.Context) string {
@@ -129,12 +128,20 @@ type sessionService struct {
 	sandboxResolver       sandbox.TenantSandboxResolver
 	sandboxPinner         *SessionSandboxPinner
 	sandboxPolicy         WorkspaceSandboxPolicy
+	hostSandbox           sandbox.Manager
+	hostDesktop           bool
+	hostSkillTree         HostSkillTree
 	memoryService         interfaces.MemoryService // Service for cross-session long-term memory
 	// sandboxConfigRepo and tenantSkillRepo answer "which installed skills can
 	// this turn actually invoke". They are repositories rather than
 	// TenantSkillService because that service depends on this one.
 	sandboxConfigRepo repository.TenantSandboxConfigRepository
 	tenantSkillRepo   repository.TenantSkillRepository
+	// forkSnapshots retires provider snapshots when a forked session is deleted
+	// before its sandbox is provisioned. Nil uses NewResolverForkSnapshotDeleter
+	// from sandboxResolver/sandboxMgr.
+	forkSnapshots ForkSnapshotDeleter
+	busyGate      *SessionBusyGate
 }
 
 // NewSessionService creates a new session service instance with all required dependencies
@@ -156,9 +163,11 @@ func NewSessionService(cfg *config.Config,
 	sandboxResolver sandbox.TenantSandboxResolver,
 	sandboxPinner *SessionSandboxPinner,
 	sandboxPolicy WorkspaceSandboxPolicy,
+	hostSandbox HostSandboxManager,
 	memoryService interfaces.MemoryService,
 	sandboxConfigRepo repository.TenantSandboxConfigRepository,
 	tenantSkillRepo repository.TenantSkillRepository,
+	busyGate *SessionBusyGate,
 ) interfaces.SessionService {
 	return &sessionService{
 		cfg:                   cfg,
@@ -179,9 +188,13 @@ func NewSessionService(cfg *config.Config,
 		sandboxResolver:       sandboxResolver,
 		sandboxPinner:         sandboxPinner,
 		sandboxPolicy:         sandboxPolicy,
+		hostSandbox:           hostSandbox.Manager,
+		hostDesktop:           hostSandbox.Desktop,
+		hostSkillTree:         hostSandbox.SkillTree,
 		memoryService:         memoryService,
 		sandboxConfigRepo:     sandboxConfigRepo,
 		tenantSkillRepo:       tenantSkillRepo,
+		busyGate:              busyGate,
 	}
 }
 
@@ -481,7 +494,8 @@ func (s *sessionService) DeleteSession(ctx context.Context, id string) error {
 	tenantID := types.MustTenantIDFromContext(ctx)
 	userID := sessionUserIDFromContext(ctx)
 
-	if _, err := s.sessionRepo.Get(ctx, tenantID, userID, id); err != nil {
+	session, err := s.sessionRepo.Get(ctx, tenantID, userID, id)
+	if err != nil {
 		return err
 	}
 
@@ -495,7 +509,7 @@ func (s *sessionService) DeleteSession(ctx context.Context, id string) error {
 			return
 		}
 		if len(knowledgeIDs) > 0 {
-			if err := s.knowledgeService.DeleteKnowledgeList(bgCtx, knowledgeIDs); err != nil {
+			if err := deleteReferencedKnowledge(bgCtx, s.knowledgeService, "", knowledgeIDs); err != nil {
 				logger.Warnf(bgCtx, "Failed to delete chat history knowledge for session %s: %v", id, err)
 			}
 		}
@@ -535,6 +549,7 @@ func (s *sessionService) DeleteSession(ctx context.Context, id string) error {
 		return apperrors.ErrSessionNotFound
 	}
 
+	s.releaseForkSnapshot(ctx, session)
 	return nil
 }
 
@@ -549,9 +564,12 @@ func (s *sessionService) BatchDeleteSessions(ctx context.Context, ids []string) 
 	tenantID := types.MustTenantIDFromContext(ctx)
 	userID := sessionUserIDFromContext(ctx)
 
+	visible := make([]*types.Session, 0, len(ids))
 	visibleIDs := make([]string, 0, len(ids))
 	for _, id := range ids {
-		if _, err := s.sessionRepo.Get(ctx, tenantID, userID, id); err == nil {
+		session, err := s.sessionRepo.Get(ctx, tenantID, userID, id)
+		if err == nil {
+			visible = append(visible, session)
 			visibleIDs = append(visibleIDs, id)
 		} else if !stderrors.Is(err, apperrors.ErrSessionNotFound) {
 			return err
@@ -572,7 +590,7 @@ func (s *sessionService) BatchDeleteSessions(ctx context.Context, ids []string) 
 				return
 			}
 			if len(knowledgeIDs) > 0 {
-				if err := s.knowledgeService.DeleteKnowledgeList(bgCtx, knowledgeIDs); err != nil {
+				if err := deleteReferencedKnowledge(bgCtx, s.knowledgeService, "", knowledgeIDs); err != nil {
 					logger.Warnf(bgCtx, "Failed to delete chat history knowledge for session %s: %v", sessionID, err)
 				}
 			}
@@ -606,6 +624,7 @@ func (s *sessionService) BatchDeleteSessions(ctx context.Context, ids []string) 
 		}
 	}
 
+	s.releaseForkSnapshots(ctx, visible)
 	return nil
 }
 
@@ -629,7 +648,7 @@ func (s *sessionService) DeleteAllSessions(ctx context.Context) error {
 					return
 				}
 				if len(knowledgeIDs) > 0 {
-					if err := s.knowledgeService.DeleteKnowledgeList(bgCtx, knowledgeIDs); err != nil {
+					if err := deleteReferencedKnowledge(bgCtx, s.knowledgeService, "", knowledgeIDs); err != nil {
 						logger.Warnf(bgCtx, "Failed to delete chat history knowledge for session %s: %v", sessionID, err)
 					}
 				}
@@ -664,6 +683,7 @@ func (s *sessionService) DeleteAllSessions(ctx context.Context) error {
 		}
 	}
 
+	s.releaseForkSnapshots(ctx, sessions)
 	logger.Infof(ctx, "All sessions deleted for tenant %d", tenantID)
 	return nil
 }
@@ -686,8 +706,8 @@ func (s *sessionService) destroyBoundSandbox(ctx context.Context, sessionID stri
 	// Resolve the workspace's own manager: the sandbox to release lives on
 	// whichever backend that workspace is configured for, not necessarily the
 	// process-wide default.
-	tenantID, _ := types.TenantIDFromContext(ctx)
-	configID, err := sandboxConfigForExistingSandbox(ctx, s.sandboxPinner, sessionID)
+	sessionTenantID, _ := types.TenantIDFromContext(ctx)
+	pin, err := sandboxConfigForExistingSandbox(ctx, s.sandboxPinner, sessionID)
 	if err != nil {
 		logger.Warnf(ctx, "Failed to read sandbox pin for session %s cleanup: %v", sessionID, err)
 		return
@@ -698,14 +718,27 @@ func (s *sessionService) destroyBoundSandbox(ctx context.Context, sessionID stri
 	// binding lookup that no-ops when the session truly has no sandbox, whereas
 	// skipping would abandon a paused instance that keeps billing.
 	//
+	// The workspace comes from the pin. This runs from a plain DELETE whose
+	// only tenant is the session's own, but a shared agent's sandbox was
+	// created on the LENDING workspace's config: resolving that here as the
+	// session owner finds nothing and abandons a paused MicroVM that keeps
+	// billing with nobody holding its id.
+	//
 	// Pass nil policy so the workspace kill switch cannot strand an already
 	// created sandbox: disabling script execution must still allow teardown.
-	mgr, err := resolveTenantSandboxForConfig(ctx, s.sandboxResolver, s.sandboxMgr, tenantID, configID, nil)
+	mgr, err := resolveTenantSandboxForConfig(
+		ctx, s.sandboxResolver, s.sandboxMgr,
+		pin.TenantOr(sessionTenantID), pin.ConfigID, nil,
+	)
 	if err != nil {
 		logger.Warnf(ctx, "Failed to resolve sandbox for session %s cleanup: %v", sessionID, err)
 		return
 	}
 	if mgr == nil {
+		return
+	}
+	if mgr.GetType() == sandbox.SandboxTypeHost {
+		// Deleting a chat is not deleting the user's directory.
 		return
 	}
 	destroyer, ok := mgr.(interface {
@@ -725,24 +758,33 @@ func (s *sessionService) destroyBoundSandbox(ctx context.Context, sessionID stri
 	}
 }
 
-// maxSessionTitleRunes bounds the auto-generated session title. sessions.title
-// is VARCHAR(255) in every shipped migration, so an over-long model response
-// would be rejected by the database; 100 runes stays well clear of that limit
-// while still being a reasonable title length in the UI.
-const maxSessionTitleRunes = 100
-
-// sanitizeGeneratedTitle turns a raw title completion into something safe to
-// persist: the reasoning prefix some models emit is dropped, surrounding
-// whitespace is trimmed, and the result is truncated by rune (not byte) so a
-// multi-byte character is never cut in half. It reports whether truncation
-// happened so the caller can log it.
-func sanitizeGeneratedTitle(raw string) (string, bool) {
-	title := strings.TrimSpace(strings.TrimPrefix(raw, "<think>\n\n</think>"))
-	runes := []rune(title)
-	if len(runes) <= maxSessionTitleRunes {
-		return title, false
+func (s *sessionService) releaseForkSnapshot(ctx context.Context, session *types.Session) {
+	if s == nil || session == nil {
+		return
 	}
-	return strings.TrimSpace(string(runes[:maxSessionTitleRunes])), true
+	snapshots := s.forkSnapshots
+	if snapshots == nil {
+		snapshots = NewResolverForkSnapshotDeleter(s.sandboxResolver, s.sandboxMgr)
+	}
+	releaseForkSnapshotOnDelete(ctx, s.sessionRepo, snapshots, session)
+}
+
+func (s *sessionService) releaseForkSnapshots(ctx context.Context, sessions []*types.Session) {
+	seen := make(map[string]struct{}, len(sessions))
+	for _, session := range sessions {
+		if session == nil || session.ForkBootstrap == nil {
+			continue
+		}
+		snapshotID := strings.TrimSpace(session.ForkBootstrap.SnapshotID)
+		if snapshotID == "" {
+			continue
+		}
+		if _, ok := seen[snapshotID]; ok {
+			continue
+		}
+		seen[snapshotID] = struct{}{}
+		s.releaseForkSnapshot(ctx, session)
+	}
 }
 
 // GenerateTitle generates a title for the current conversation content
@@ -822,13 +864,7 @@ func (s *sessionService) GenerateTitle(ctx context.Context,
 	titlePrompt := types.RenderPromptPlaceholders(s.cfg.Conversation.GenerateSessionTitlePrompt, types.PlaceholderValues{
 		"language": types.LanguageNameFromContext(ctx),
 	})
-	var chatMessages []chat.Message
-	chatMessages = append(chatMessages,
-		chat.Message{Role: "system", Content: titlePrompt},
-	)
-	chatMessages = append(chatMessages,
-		chat.Message{Role: "user", Content: message.Content},
-	)
+	chatMessages := buildSessionTitleMessages(titlePrompt, message.Content)
 
 	// Call model to generate title
 	thinking := false
@@ -842,14 +878,20 @@ func (s *sessionService) GenerateTitle(ctx context.Context,
 	}
 
 	// Process and store the generated title
-	title, truncated := sanitizeGeneratedTitle(response.Content)
-	if truncated {
+	sanitized := sanitizeGeneratedTitle(response.Content, message.Content)
+	if sanitized.Truncated {
 		logger.Warnf(ctx,
 			"Generated session title exceeded %d runes and was truncated, session=%s, model=%s",
 			maxSessionTitleRunes, session.ID, modelID,
 		)
 	}
-	session.Title = title
+	if sanitized.FromQuery {
+		logger.Warnf(ctx,
+			"Generated session title was not plain text, falling back to the user query, session=%s, model=%s",
+			session.ID, modelID,
+		)
+	}
+	session.Title = sanitized.Title
 
 	// Update session with new title
 	_, err = s.sessionRepo.Update(ctx, session, session.UserID)
@@ -941,68 +983,144 @@ func (s *sessionService) GenerateTitleAsync(
 // a skill-image change mid-turn cannot rebuild the VM between tool calls.
 // The first resolve of this turn may still pick up a stale mark from the
 // previous turn. The returned closer must be called.
+//
+// A rewind in progress is a hard failure: the agent must not start on a
+// workspace that git reset is about to rewrite. Every other lease error
+// degrades to "no lease" and lets the turn run, as it did before rewind
+// existed — a Redis blip on the lease script must not reject the user's
+// message, and rewind reads the same Redis to decide it is busy, so it
+// cannot silently proceed while this store is unreachable either.
 func (s *sessionService) holdSandboxTurn(
 	ctx context.Context, sessionID, configID string,
-) func() {
+) (func(), error) {
+	noop := func() {}
 	if strings.TrimSpace(sessionID) == "" {
-		return func() {}
+		return noop, nil
 	}
-	begin := func(mgr sandbox.Manager) func() error {
+	releaseGate := noop
+	if s.busyGate != nil {
+		release, err := s.busyGate.HoldSend(sessionID)
+		if err != nil {
+			return noop, err
+		}
+		if release != nil {
+			releaseGate = release
+		}
+	}
+	begin := func(mgr sandbox.Manager) (func() error, error) {
 		if mgr == nil {
-			return nil
+			return nil, nil
+		}
+		// Tokenized releases prevent a delayed handler from decrementing a
+		// newer turn after the old lease expired and was replaced.
+		if holder, ok := mgr.(interface {
+			HoldSessionTurn(context.Context, string) (func() error, error)
+		}); ok {
+			release, err := holder.HoldSessionTurn(ctx, sessionID)
+			if err != nil && stderrors.Is(err, sandbox.ErrSessionRewindLocked) {
+				return nil, err
+			}
+			if err != nil {
+				logger.Warnf(ctx, "[sandbox] begin turn for session %s failed: %v", sessionID, err)
+				return nil, nil
+			}
+			return release, nil
 		}
 		holder, ok := mgr.(sandbox.SessionTurnHolder)
 		if !ok {
-			return nil
+			return nil, nil
 		}
-		release, err := holder.HoldSessionTurn(ctx, sessionID)
-		if err != nil {
+		if err := holder.BeginSessionTurn(ctx, sessionID); err != nil {
 			logger.Warnf(ctx, "[sandbox] begin turn for session %s failed: %v", sessionID, err)
-			return nil
+			if stderrors.Is(err, sandbox.ErrSessionRewindLocked) {
+				return nil, err
+			}
+			return nil, nil
 		}
-		return release
+		return func() error { return holder.EndSessionTurn(context.WithoutCancel(ctx), sessionID) }, nil
 	}
 
-	// An existing sandbox's pin is authoritative over the agent's current
-	// config. Repointing an agent must not place this turn's lease on a different
-	// backend while the old sandbox is still serving the session.
-	selectedConfigID := strings.TrimSpace(configID)
-	if s.sandboxPinner != nil {
-		pinned, err := s.sandboxPinner.Read(ctx, sessionID)
-		if err != nil {
-			logger.Warnf(ctx, "[sandbox] read pin to begin turn for session %s failed: %v", sessionID, err)
-			return func() {}
-		}
-		if strings.TrimSpace(pinned) != "" {
-			selectedConfigID = strings.TrimSpace(pinned)
-		}
+	release, err := begin(s.sandboxMgr)
+	if err != nil {
+		releaseGate()
+		return noop, err
+	}
+	if release != nil {
+		return func() {
+			if err := release(); err != nil {
+				logger.Warnf(ctx, "[sandbox] end turn for session %s failed: %v", sessionID, err)
+			}
+			releaseGate()
+		}, nil
 	}
 
 	tenantID, _ := types.TenantIDFromContext(ctx)
-	var mgr sandbox.Manager
-	if selectedConfigID == "" || selectedConfigID == types.SandboxConfigIDGlobalDefault {
-		mgr = s.sandboxMgr
-	} else {
-		if s.sandboxResolver == nil || tenantID == 0 {
-			return func() {}
-		}
-		var err error
-		mgr, err = resolveTenantSandboxForConfig(
-			ctx, s.sandboxResolver, s.sandboxMgr, tenantID, selectedConfigID, s.sandboxPolicy,
-		)
-		if err != nil {
-			logger.Warnf(ctx, "[sandbox] resolve config %s to begin turn of session %s failed: %v",
-				selectedConfigID, sessionID, err)
-			return func() {}
-		}
+	if s.sandboxResolver == nil || tenantID == 0 {
+		return releaseGate, nil
 	}
-	release := begin(mgr)
+	mgr, _, err := resolveSandboxForExecution(
+		ctx, s.sandboxResolver, s.sandboxMgr, s.sandboxPinner,
+		tenantID, sessionID, configID, s.sandboxPolicy,
+		withLiteHostSandbox(s.hostSandbox), withLiteDesktop(s.hostDesktop),
+	)
+	if err != nil {
+		logger.Warnf(ctx, "[sandbox] resolve config %s to begin turn of session %s failed: %v",
+			configID, sessionID, err)
+		return releaseGate, nil
+	}
+	release, err = begin(mgr)
+	if err != nil {
+		releaseGate()
+		return noop, err
+	}
 	if release == nil {
-		return func() {}
+		return releaseGate, nil
 	}
 	return func() {
 		if err := release(); err != nil {
 			logger.Warnf(ctx, "[sandbox] end turn for session %s failed: %v", sessionID, err)
 		}
+		releaseGate()
+	}, nil
+}
+
+// RejectSendIfRewinding fails when rewind currently holds sessionID, so
+// knowledge-chat (no sandbox turn lease) cannot persist a new turn on a
+// session that is about to delete those messages.
+func (s *sessionService) RejectSendIfRewinding(ctx context.Context, sessionID string) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil
 	}
+	if s.busyGate != nil && s.busyGate.RewindHeld(sessionID) {
+		return sandbox.ErrSessionRewindLocked
+	}
+	type rewindLockReader interface {
+		HasRewindLock(context.Context, string) (bool, error)
+	}
+	check := func(mgr sandbox.Manager) error {
+		if mgr == nil {
+			return nil
+		}
+		reader, ok := mgr.(rewindLockReader)
+		if !ok {
+			return nil
+		}
+		held, err := reader.HasRewindLock(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		if held {
+			return sandbox.ErrSessionRewindLocked
+		}
+		return nil
+	}
+	return check(s.sandboxMgr)
+}
+
+// HoldSandboxTurn is the exported turn-lease entry so HTTP send can take the
+// lease before persisting messages, matching rewind's busy check.
+func (s *sessionService) HoldSandboxTurn(
+	ctx context.Context, sessionID, configID string,
+) (func(), error) {
+	return s.holdSandboxTurn(ctx, sessionID, configID)
 }

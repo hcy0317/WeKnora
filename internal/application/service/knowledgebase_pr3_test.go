@@ -115,6 +115,9 @@ func (r *fakeKBRepo) ListKnowledgeBasesByTenantID(_ context.Context, tenantID ui
 func (r *fakeKBRepo) UpdateKnowledgeBase(_ context.Context, _ *types.KnowledgeBase) error {
 	return nil
 }
+func (r *fakeKBRepo) UpdateKnowledgeBaseGeneratedProfile(context.Context, string, *types.KnowledgeBaseProfile) error {
+	return nil
+}
 func (r *fakeKBRepo) DeleteKnowledgeBase(_ context.Context, _ string) error { return nil }
 func (r *fakeKBRepo) TogglePinKnowledgeBase(_ context.Context, _ string, _ uint64) (*types.KnowledgeBase, error) {
 	return nil, nil
@@ -124,6 +127,9 @@ func (r *fakeKBRepo) CountByVectorStoreID(_ context.Context, _ *gorm.DB, _ uint6
 }
 func (r *fakeKBRepo) CountByModelID(_ context.Context, _ uint64, _ string) (int64, error) {
 	return 0, nil
+}
+func (r *fakeKBRepo) ListModelUsages(_ context.Context, _ uint64, _ string) ([]types.ModelUsageResource, error) {
+	return nil, nil
 }
 func (r *fakeKBRepo) SetUserKBPin(_ context.Context, _ uint64, _ string, _ string, _ bool) (*time.Time, error) {
 	return nil, nil

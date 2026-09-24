@@ -50,6 +50,7 @@ type knowledgeBaseService struct {
 	dsScheduler          *datasource.Scheduler
 	audit                interfaces.AuditLogService
 	resourceCatalog      interfaces.ResourceCatalog
+	wikiRepo             interfaces.WikiPageRepository
 }
 
 // NewKnowledgeBaseService creates a new knowledge base service
@@ -74,6 +75,7 @@ func NewKnowledgeBaseService(repo interfaces.KnowledgeBaseRepository,
 	dsScheduler *datasource.Scheduler,
 	audit interfaces.AuditLogService,
 	resourceCatalog interfaces.ResourceCatalog,
+	wikiRepo interfaces.WikiPageRepository,
 ) interfaces.KnowledgeBaseService {
 	return &knowledgeBaseService{
 		repo:                 repo,
@@ -97,6 +99,7 @@ func NewKnowledgeBaseService(repo interfaces.KnowledgeBaseRepository,
 		dsScheduler:          dsScheduler,
 		audit:                audit,
 		resourceCatalog:      resourceCatalog,
+		wikiRepo:             wikiRepo,
 	}
 }
 
@@ -822,7 +825,7 @@ func (s *knowledgeBaseService) DeleteKnowledgeBase(ctx context.Context, id strin
 
 // ProcessKBDelete handles async knowledge base deletion task
 // This method performs heavy cleanup operations: deleting embeddings, chunks, files, and graph data
-func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Task) error {
+func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Task) (retErr error) {
 	var payload types.KBDeletePayload
 	if err := json.Unmarshal(t.Payload(), &payload); err != nil {
 		logger.Errorf(ctx, "Failed to unmarshal KB delete payload: %v", err)
@@ -845,6 +848,16 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 
 	// Set tenant context for downstream services
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, tenantID)
+	defer func() {
+		wikiCtx, cancelWiki := context.WithTimeout(context.WithoutCancel(ctx), kbTaskCleanupTimeout)
+		defer cancelWiki()
+		if wikiErr := s.cleanupWikiForKnowledgeBase(wikiCtx, tenantID, kbID); wikiErr != nil {
+			logger.Warnf(ctx, "Failed to clean wiki data for KB %s: %v", kbID, wikiErr)
+			if retErr == nil || errors.Is(retErr, asynq.SkipRetry) {
+				retErr = wikiErr
+			}
+		}
+	}()
 	if s.shareRepo != nil {
 		if err := s.shareRepo.DeleteByKnowledgeBaseID(ctx, kbID); err != nil {
 			return fmt.Errorf("delete KB shares during durable cleanup: %w", err)
@@ -1046,6 +1059,26 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 
 	logger.Infof(ctx, "KB delete task completed successfully, knowledge base ID: %s", kbID)
 	return nil
+}
+
+func (s *knowledgeBaseService) cleanupWikiForKnowledgeBase(
+	ctx context.Context, tenantID uint64, kbID string,
+) error {
+	if s.wikiRepo == nil {
+		return nil
+	}
+	var cleanupErr error
+	for _, remove := range []func(context.Context, uint64, string) error{
+		s.wikiRepo.DeleteByKnowledgeBaseID,
+		s.wikiRepo.DeleteFoldersByKnowledgeBaseID,
+		s.wikiRepo.DeleteRevisionsByKnowledgeBaseID,
+		s.wikiRepo.DeleteIssuesByKnowledgeBaseID,
+	} {
+		if err := remove(ctx, tenantID, kbID); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
+	}
+	return cleanupErr
 }
 
 func (s *knowledgeBaseService) drainQuestionGenerationManifests(

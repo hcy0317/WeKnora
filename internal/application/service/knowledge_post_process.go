@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -24,6 +25,7 @@ type KnowledgePostProcessService struct {
 	knowledgeRepo interfaces.KnowledgeRepository
 	kbService     interfaces.KnowledgeBaseService
 	chunkService  interfaces.ChunkService
+	chunkRepo     interfaces.ChunkRepository
 	taskEnqueuer  interfaces.TaskEnqueuer
 	pendingRepo   interfaces.TaskPendingOpsRepository
 	redisClient   *redis.Client
@@ -77,7 +79,7 @@ func buildPostProcessFanoutPlan(
 	if plan.Summary && kb.NeedsEmbeddingModel() && eff.QuestionGenerationConfig.Enabled {
 		questionChunks := make([]*types.Chunk, 0, len(textChunks))
 		for _, chunk := range textChunks {
-			if chunk.ChunkType == types.ChunkTypeText {
+			if chunk.ChunkType == types.ChunkTypeText && chunkHasExtractableText(chunk.Content) {
 				questionChunks = append(questionChunks, chunk)
 			}
 		}
@@ -104,7 +106,7 @@ func buildPostProcessFanoutPlan(
 	}
 
 	if eff.GraphEnabled {
-		for index, chunk := range textChunks {
+		for index, chunk := range selectGraphChunks(textChunks) {
 			plan.GraphChunks = append(plan.GraphChunks, postProcessGraphChunkPlan{
 				ChunkID: chunk.ID, ChunkIndex: index, ModelID: kb.SummaryModelID,
 			})
@@ -112,6 +114,44 @@ func buildPostProcessFanoutPlan(
 	}
 	plan.ExpectedBranches, plan.ExpectedSubtasks = expectedPostProcessFanout(plan)
 	return plan
+}
+
+// selectGraphChunks excludes non-prose captions and image placeholders while
+// retaining OCR for scanned pages that have no extractable text parent.
+func selectGraphChunks(chunks []*types.Chunk) []*types.Chunk {
+	textByID := make(map[string]*types.Chunk, len(chunks))
+	for _, chunk := range chunks {
+		if chunk != nil && chunk.ChunkType == types.ChunkTypeText {
+			textByID[chunk.ID] = chunk
+		}
+	}
+	var selected []*types.Chunk
+	for _, chunk := range chunks {
+		if chunk == nil {
+			continue
+		}
+		switch chunk.ChunkType {
+		case types.ChunkTypeImageCaption:
+			continue
+		case types.ChunkTypeImageOCR:
+			if !chunkHasExtractableText(chunk.Content) {
+				continue
+			}
+			if parent := textByID[chunk.ParentChunkID]; parent != nil && chunkHasExtractableText(parent.Content) {
+				continue
+			}
+			selected = append(selected, chunk)
+		case types.ChunkTypeText:
+			if chunkHasExtractableText(chunk.Content) {
+				selected = append(selected, chunk)
+			}
+		}
+	}
+	return selected
+}
+
+func chunkHasExtractableText(content string) bool {
+	return extractRealText(docparser.StripMarkdownImages(content)) != ""
 }
 
 func expectedPostProcessFanout(plan postProcessFanoutPlan) ([]string, int) {
@@ -226,7 +266,7 @@ func buildLegacyPostProcessFanoutPlan(
 	if questionBatchCount > 0 {
 		questionChunks := make([]*types.Chunk, 0, len(textChunks))
 		for _, chunk := range textChunks {
-			if chunk.ChunkType == types.ChunkTypeText {
+			if chunk.ChunkType == types.ChunkTypeText && chunkHasExtractableText(chunk.Content) {
 				questionChunks = append(questionChunks, chunk)
 			}
 		}
@@ -303,10 +343,15 @@ func NewKnowledgePostProcessService(
 	redisClient *redis.Client,
 	spanTracker SpanTracker,
 ) interfaces.TaskHandler {
+	var chunkRepo interfaces.ChunkRepository
+	if chunkService != nil {
+		chunkRepo = chunkService.GetRepository()
+	}
 	return &KnowledgePostProcessService{
 		knowledgeRepo: knowledgeRepo,
 		kbService:     kbService,
 		chunkService:  chunkService,
+		chunkRepo:     chunkRepo,
 		taskEnqueuer:  taskEnqueuer,
 		pendingRepo:   pendingRepo,
 		redisClient:   redisClient,
@@ -462,7 +507,15 @@ func (s *KnowledgePostProcessService) Handle(ctx context.Context, task *asynq.Ta
 		if err != nil || kb == nil {
 			return fmt.Errorf("get knowledge base %s: %w", payload.KnowledgeBaseID, err)
 		}
-		chunks, err := s.chunkService.ListChunksByKnowledgeID(ctx, payload.KnowledgeID)
+		var chunks []*types.Chunk
+		if s.chunkRepo != nil {
+			chunks, err = s.chunkRepo.ListChunksByKnowledgeIDAndTypes(ctx, payload.TenantID, payload.KnowledgeID,
+				[]types.ChunkType{types.ChunkTypeText, types.ChunkTypeImageOCR, types.ChunkTypeImageCaption})
+		} else if s.chunkService != nil {
+			chunks, err = s.chunkService.ListChunksByKnowledgeID(ctx, payload.KnowledgeID)
+		} else {
+			err = errors.New("chunk reader is not configured")
+		}
 		if err != nil {
 			return fmt.Errorf("list chunks for knowledge %s: %w", payload.KnowledgeID, err)
 		}

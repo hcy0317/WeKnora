@@ -243,7 +243,182 @@ publish token 只保存在站长自己的后端，页面通过 `data-token-endpo
 - 宿主 → iframe（`source: "weknora-host"`）：`provide_token`（下发 token）、`set_context`、`set_locale`、`open_with_query`；
 - iframe → 宿主（`source: "weknora-embed"`）：`ready`、`bootstrap_request`（请求 token）、`message_sent`、`message_received`。
 
-## 端到端时序
+## 鉴权与匿名会话
+
+### 两种 Token
+
+| Token | 前缀 | 生命周期 | 用途 |
+| --- | --- | --- | --- |
+| Publish Token | `em_` | 长效（直到轮换） | 渠道发布令牌，可直接嵌入页面（静态模式），或仅保存在业务后端（安全模式） |
+| Session Token | `ems_` | **30 分钟**（Redis TTL） | 由 publish token 通过 `/exchange` 换取的短效令牌，浏览器侧使用 |
+
+所有公开接口通过请求头 `Authorization: Embed <token>` 携带令牌（**不接受 query string**）。`EmbedAuth` 中间件（`internal/middleware/embed_auth.go`）依次执行：
+
+1. 按 `channel_id` 查渠道，校验 token 与 `publish_token` 匹配，或在 Redis（key `embed:session:{token}`）中查到 session token 归属该渠道；
+2. 校验渠道 `enabled`；
+3. 允许 iframe 内的同源 API 请求；跨源 API 请求及安全模式服务端 exchange 的 `Origin` 需命中 `allowed_origins`。空白名单仍拒绝一切；宿主限制由嵌入 HTML 的 CSP 执行；
+4. 限流（Redis Lua 脚本，滑动窗口）：
+   - 单 IP 每分钟 ≤ `RateLimitPerMinute`；
+   - 渠道全局每分钟 ≤ `max(RateLimitPerMinute × 20, 120)`——防止攻击者轮换 IP 绕过单 IP 限流；
+   - 渠道每日总量 ≤ `RateLimitPerDay`。
+
+### 宿主来源与部署
+
+A 网站嵌入 B 的 WeKnora 时，白名单填 A。标准 Nginx 使用 `/api/v1/embed-frame-policy` 获取渠道策略（无需 token，仅返回 CSP，不返回渠道配置），并在 `/embed/:channelId` 的 HTML 响应中设置 `frame-ancestors`；Lite 使用同一策略。该页面不缓存，策略获取失败时不返回嵌入 HTML。
+
+升级时，过去仅填 B 的渠道需改填实际宿主 A，并同时更新前后端。自定义反向代理需保留 CSP、原始 Host（含端口）、协议及 `Sec-Fetch-Site`。白名单限制浏览器嵌入，不能代替访客认证或阻止持有 token 的非浏览器客户端；此类访问控制使用安全模式和限流。
+
+#### 独立子域（可选） {#embed-subdomain}
+
+默认 embed 页面和管理端共用域名即可。需要独立入口或 Cookie 隔离时，可以把 embed 页面放在 `https://embed.example.com`，管理端留在 `https://app.example.com`，业务宿主为 `https://shop.example.com`。
+
+管理端通过 `frontend/public/config.js` 的 `window.__RUNTIME_CONFIG__.EMBED_BASE_URL` 指定 embed 源站，或使用构建期 `VITE_EMBED_BASE_URL`；留空则跟随当前页面 origin。修改后确认生成的 Widget/iframe 代码指向新地址。
+
+独立 Nginx server 只提供 `/embed/*`、`/weknora-widget.js`、`/assets/*` 和必要的后端代理，不挂管理端 `index.html`。保留标准 `frontend/nginx.conf` 中 `/embed/` 的 `auth_request`、内部 `/_embed-frame-policy` 和 CSP 响应头：获取策略失败时必须拒绝返回页面，网关/CDN 不应缓存或丢弃该策略。
+
+白名单仍填写实际业务宿主 `https://shop.example.com`，安全模式 exchange 声明相同 Origin；不需要为正常同源聊天请求额外加入 embed 源站。Widget 在宿主与 embed 不同源时自动添加 iframe sandbox。验证时从实际宿主打开页面，检查 iframe、API、CSP 和生成代码，不能只在管理端预览。
+
+### Token 交换（安全模式核心）
+
+`POST /api/v1/embed/:channel_id/exchange`，请求头 `Authorization: Embed em_xxx`（**只接受 publish token**，session token 会被拒绝）。响应：
+
+```json
+{ "success": true, "data": { "session_token": "ems_...", "expires_in": 1800 } }
+```
+
+实现见 `internal/application/service/embed_session.go` 的 `IssueSessionToken`：随机 32 字节 base64 加 `ems_` 前缀，写入 Redis，TTL 30 分钟。
+
+### 匿名会话建立
+
+`POST /api/v1/embed/:channel_id/sessions` 创建聊天会话，返回：
+
+```json
+{ "success": true, "data": { "id": "<session_uuid>", "sig": "<HMAC-SHA256 base64>" } }
+```
+
+- 会话写入 `sessions` 表，`Description` 标记为 `embed_channel:{channel_id}`，`UserID` 使用 `EmbedSessionPrincipal(tenantID, channelID, sessionID).StorageID()` 生成的不透明访客标识；
+- `sig` 为 **会话签名**：`HMAC-SHA256(channel.PublishToken, "{channel_id}|{session_id}")`。此后每次访问 `/sessions/:session_id/*` 都必须携带请求头 `X-Embed-Session: <sig>`，服务端做常量时间比较（`internal/handler/embed_channel.go`）。这防止仅凭 session_id 冒用他人会话；轮换 publish token 后所有签名同时失效。
+
+前端还可附带 `X-Embed-Visitor: <uuid>` 用于访客维度统计。会话 id 与 sig 会按渠道缓存到 `localStorage`，页面刷新后直接恢复会话（`frontend/src/composables/useEmbedBridge.ts`）。
+
+## Webhook 回调
+
+配置了 `webhook_url` 的渠道会在以下事件时向业务后端 POST JSON（`internal/application/service/embed_webhook.go`）：
+
+| 事件 | 触发时机 | 载荷字段 |
+| --- | --- | --- |
+| `message_sent` | 访客发出提问 | `type`、`channel_id`、`session_id`、`timestamp`、`query` |
+| `message_received` | 助手回复完成 | `type`、`channel_id`、`session_id`、`timestamp`、`content` |
+
+安全与投递语义：
+
+- 配置了 `webhook_secret` 时附带签名头 `X-WeKnora-Signature: sha256=<hex(HMAC-SHA256(secret, raw_body))>`；
+- URL 必须 HTTPS，出站请求走 SSRF 安全客户端（每次重定向重新校验，最多 5 跳），超时 5 秒，User-Agent 为 `WeKnora-Embed-Webhook/1.0`；
+- 异步 best-effort 投递，失败仅记录日志、**不重试**；
+- 前端也可通过 `POST /api/v1/embed/:channel_id/sessions/:session_id/events` 显式转发事件。
+
+## 配置与接口参考
+
+### 数据模型
+
+`internal/types/embed_channel.go` 中的 `EmbedChannel` 是渠道的完整定义（表 `embed_channels`，软删除，`publish_token` 上有部分唯一索引）：
+
+```go
+type EmbedChannel struct {
+    ID                     string         // UUID 主键
+    TenantID               uint64         // 所属租户
+    AgentID                string         // 绑定的 Agent（默认 builtin-quick-answer）
+    Name                   string         // 渠道名称
+    Enabled                bool           // 是否启用
+    PublishToken           string         // 长效发布令牌，"em_" 前缀
+    AllowedOrigins         JSON           // 允许的来源 Origin 列表（JSONB）
+    WelcomeMessage         string         // 欢迎语
+    RateLimitPerMinute     int            // 单 IP 每分钟限流（默认 30）
+    RateLimitPerDay        int            // 渠道级每日限流（默认 10000）
+    PrimaryColor           string         // 主题色
+    PageTitle              string         // 页面标题
+    HeaderTitleMode        string         // "channel" | "session"
+    ShowSuggestedQuestions bool           // 推荐问题开关
+    WidgetPosition         string         // 挂件位置
+    AllowWebSearch         bool           // 允许联网搜索
+    AllowFileUpload        bool           // 允许文件/图片上传
+    DefaultLocale          string         // 默认语言
+    WebhookURL             string         // 出站 webhook（HTTPS）
+    WebhookSecret          string         // HMAC-SHA256 签名密钥
+    ...
+}
+```
+
+#### 渠道配置项
+
+创建/更新渠道时（`internal/handler/embed_channel.go` 中的 `embedChannelRequest`）可配置：
+
+| 配置项 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `name` | string | — | 渠道显示名称 |
+| `enabled` | bool | `true` | 渠道开关，关闭后所有公开接口拒绝访问 |
+| `agent_id` | string | `builtin-quick-answer` | 绑定的 Agent，决定知识库范围与对话能力 |
+| `allowed_origins` | string[] | — | **必填至少一项，填写嵌入宿主 A，不是 WeKnora 地址 B**。支持三种形式：完整 `http(s)://` Origin（不含路径、查询参数）、子域名通配 `*.example.com`（只匹配子域，不含 `example.com` 本身；未写端口时匹配任意端口）、全通配 `*`（`GIN_MODE=release` 时拒绝保存，仅供开发） |
+| `welcome_message` | string | 空 | 打开挂件时的欢迎语 |
+| `rate_limit_per_minute` | int | `30` | 单 IP 每分钟请求上限 |
+| `rate_limit_per_day` | int | `10000` | 渠道级每日请求总量上限 |
+| `primary_color` | string | — | 挂件主题色（CSS 颜色值，如 `#0052d9`） |
+| `page_title` | string | 空 | 嵌入页浏览器标题 |
+| `header_title_mode` | string | `channel` | 标题模式：`channel`（固定渠道名）/ `session`（随会话自动生成） |
+| `show_suggested_questions` | bool | `true` | 是否展示推荐问题 |
+| `widget_position` | string | `bottom-right` | `bottom-right` \| `bottom-left` \| `top-right` \| `top-left` |
+| `allow_web_search` | bool | `false` | 访客侧是否允许联网搜索开关 |
+| `allow_file_upload` | bool | `false` | 访客侧是否允许上传图片/文件 |
+| `default_locale` | string | 空（跟随浏览器） | `zh-CN` \| `en-US` \| `ko-KR` \| `ja-JP` \| `ru-RU` |
+| `webhook_url` | string | 空 | 事件回调地址，**必须为 HTTPS 且通过 SSRF 校验**（禁止内网/链路本地地址） |
+| `webhook_secret` | string | 空 | webhook 签名密钥（API 响应中永不回显） |
+
+### 管理 API（需登录鉴权）
+
+由 `RegisterEmbedChannelRoutes`（`internal/router/routes_agent.go`）注册，支持 API Key 的 `ManageChannels` 能力：
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| POST | `/api/v1/agents/:id/embed-channels` | Admin | 为 Agent 创建渠道 |
+| GET | `/api/v1/agents/:id/embed-channels` | Viewer | 列出某 Agent 的渠道 |
+| GET | `/api/v1/embed-channels` | Viewer | 列出租户全部渠道 |
+| GET | `/api/v1/embed-channels/:channel_id` | Viewer | 渠道详情（含 `publish_token`） |
+| PUT | `/api/v1/embed-channels/:channel_id` | Admin | 更新渠道配置 |
+| DELETE | `/api/v1/embed-channels/:channel_id` | Admin | 删除渠道（软删除） |
+| POST | `/api/v1/embed-channels/:channel_id/rotate-token` | Admin | 轮换 `publish_token`（旧 token 及所有已签发会话签名立即失效） |
+| POST | `/api/v1/embed-channels/:channel_id/preview-session` | Viewer | 签发预览用短效会话 token（管理台预览挂件） |
+| GET | `/api/v1/embed-channels/:channel_id/stats` | Viewer | 渠道会话统计 |
+
+### 公开 API（匿名访问，Embed 鉴权）
+
+由 `RegisterEmbedPublicRoutes` 注册在 `/api/v1/embed/:channel_id` 前缀下，全部经过 `middleware.EmbedAuth` 中间件（token 校验 + Origin 校验 + 限流）：
+
+```go
+embed := r.Group("/api/v1/embed/:channel_id", middleware.EmbedAuth(embedService, tenantService, redisClient))
+{
+    embed.POST("/exchange", embedHandler.ExchangeEmbedSession)
+    embed.GET("/config", embedHandler.GetEmbedConfig)
+    embed.GET("/suggested-questions", embedHandler.GetEmbedSuggestedQuestions)
+    embed.GET("/chunks/:chunk_id", embedHandler.GetEmbedChunk)
+    embed.POST("/sessions", embedHandler.CreateEmbedSession)
+    embed.POST("/knowledge-chat/:session_id", embedHandler.EmbedKnowledgeChat)
+    embed.POST("/agent-chat/:session_id", embedHandler.EmbedAgentChat)
+    embed.GET("/messages/:session_id/load", embedHandler.EmbedLoadMessages)
+    embed.POST("/sessions/:session_id/stop", embedHandler.EmbedStopSession)
+    embed.POST("/sessions/:session_id/events", embedHandler.EmbedRelayWebhookEvent)
+    // 消息推荐问题、MCP OAuth、工具审批、文件服务等路由略
+    embed.GET("/files", newFileServeHandler(...))
+}
+```
+
+#### 公开配置下发
+
+`GET /api/v1/embed/:channel_id/config` 返回 `EmbedChannelPublicConfig`（`internal/types/embed_channel.go`）——只包含渲染挂件所需的展示与能力信息：
+
+- 下发：`channel_id`、`name`、`display_title`（服务端按 `PageTitle → Name → AgentName → "AI Assistant"` 顺序解析）、`agent_id/agent_name/agent_avatar`、`knowledge_base_ids`、`welcome_message`、`primary_color`、`header_title_mode`、`show_suggested_questions`、`widget_position`、`allow_web_search`、`allow_file_upload`、`agent_web_search_enabled`、`agent_image_upload_enabled`、`default_locale` 等；
+- **永不下发**：`publish_token`、`webhook_url`、`webhook_secret`。
+
+### 端到端时序
 
 ```mermaid
 sequenceDiagram
@@ -300,7 +475,8 @@ sequenceDiagram
 | 匿名会话/Token | `internal/application/service/embed_session.go` |
 | Webhook 分发 | `internal/application/service/embed_webhook.go` |
 | 鉴权中间件 | `internal/middleware/embed_auth.go` |
-| 路由注册 | `internal/router/router.go`（`RegisterEmbedPublicRoutes` / `RegisterEmbedChannelRoutes`） |
+| 路由注册 | `internal/router/routes_agent.go`（`RegisterEmbedPublicRoutes` / `RegisterEmbedChannelRoutes` / 嵌入页 CSP 策略） |
+| 宿主来源规则 | `internal/embedpolicy/origin.go` |
 | 挂件加载器（SDK） | `frontend/public/weknora-widget.js` |
 | 嵌入页 SPA 入口 | `frontend/src/embed-main.ts`、`frontend/src/composables/useEmbedBridge.ts`、`useEmbedChatSession.ts` |
 | 数据库迁移 | `migrations/versioned/000060_embed_channels.up.sql` |

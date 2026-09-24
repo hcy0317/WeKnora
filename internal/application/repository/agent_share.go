@@ -210,6 +210,16 @@ func (r *agentShareRepository) GetShareByAgentIDForTenant(ctx context.Context, t
 	return &share, nil
 }
 
+// DeleteByOrganizationAndSourceTenant removes shares created by a tenant that
+// is leaving the organization, preserving shares from other member tenants.
+func (r *agentShareRepository) DeleteByOrganizationAndSourceTenant(
+	ctx context.Context, orgID string, sourceTenantID uint64,
+) error {
+	return r.db.WithContext(ctx).
+		Where("organization_id = ? AND source_tenant_id = ?", orgID, sourceTenantID).
+		Delete(&types.AgentShare{}).Error
+}
+
 // GetShareByAgentIDAndSourceForTenant validates an exact source selector
 // against organization membership. This avoids loading every shared agent and
 // makes same-ID builtins from multiple workspaces deterministic.

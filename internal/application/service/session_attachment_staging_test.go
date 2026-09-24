@@ -101,6 +101,16 @@ func (m *stagingSandboxManager) WriteSessionInputFile(_ context.Context, _ strin
 func (m *stagingSandboxManager) WriteSessionWorkspaceFile(ctx context.Context, sessionID, filePath string, content []byte) error {
 	return m.WriteSessionInputFile(ctx, sessionID, filePath, content)
 }
+func (m *stagingSandboxManager) WriteSessionWorkspaceFiles(
+	ctx context.Context, sessionID string, files []sandbox.SessionWorkspaceFile,
+) error {
+	for _, file := range files {
+		if err := m.WriteSessionWorkspaceFile(ctx, sessionID, file.Path, file.Content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func (m *stagingSandboxManager) RemoveSessionInputPath(_ context.Context, _ string, targetPath string) error {
 	for filePath := range m.files {
 		if filePath == targetPath || strings.HasPrefix(filePath, targetPath+"/") {

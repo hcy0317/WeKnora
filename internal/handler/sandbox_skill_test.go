@@ -186,7 +186,7 @@ func (f *fakeSandboxSkillService) ReadSkillFile(
 }
 
 func (f *fakeSandboxSkillService) InstallSkill(
-	_ context.Context, tenantID uint64, configID string, archive []byte,
+	_ context.Context, tenantID uint64, configID string, archive []byte, _ ...string,
 ) (string, error) {
 	f.installTenant, f.installConfig, f.installBytes = tenantID, configID, archive
 	return f.installID, f.installErr
@@ -201,7 +201,7 @@ func (f *fakeSandboxSkillService) InstallSkillFromSource(
 }
 
 func (f *fakeSandboxSkillService) ReinstallSkill(
-	_ context.Context, tenantID uint64, configID, skillID string,
+	_ context.Context, tenantID uint64, configID, skillID string, _ ...string,
 ) (string, error) {
 	f.reinstallTenant, f.reinstallConfig, f.reinstallSkill = tenantID, configID, skillID
 	return f.installID, f.reinstallErr
@@ -256,6 +256,24 @@ func (f *fakeSandboxSkillService) SubscribeProgress(
 		}
 	}()
 	return out, closer, nil
+}
+
+func (f *fakeSandboxSkillService) InstallGuidance(
+	context.Context, uint64, string, string,
+) (*service.SkillInstallGuidanceState, error) {
+	return &service.SkillInstallGuidanceState{}, nil
+}
+
+func (f *fakeSandboxSkillService) SteerInstall(
+	context.Context, uint64, string, string, string, string, string,
+) error {
+	return nil
+}
+
+func (f *fakeSandboxSkillService) StopSkill(
+	context.Context, uint64, string, string,
+) (*types.TenantSkillEntity, error) {
+	return nil, nil
 }
 
 func (f *fakeSandboxSkillService) subscriptionClosed() bool {
@@ -741,24 +759,39 @@ func TestSandboxSkillInstallEventsSynthesizesTerminalWhenRowDisappears(t *testin
 	require.Equal(t, "removed", final["status"])
 }
 
-// Without Redis there is no live progress at all. One event describing the
-// durable state is honest; holding the connection open is not.
-func TestSandboxSkillInstallEventsWithoutRedisSendsStateAndCloses(t *testing.T) {
+// Without Redis nothing publishes live percentages. Closing immediately with
+// done=true makes the client treat an in-progress install as finished and
+// reconnect in a tight loop. The stream stays up and ends once the row does.
+func TestSandboxSkillInstallEventsWithoutRedisPollsUntilFinished(t *testing.T) {
 	svc := &fakeSandboxSkillService{
 		skills: map[string]*types.TenantSkillEntity{
 			"skill-1": {ID: "skill-1", SandboxConfigID: "cfg-a", Status: types.SkillStatusInstalling},
 		},
 	}
-	router := newSkillTestRouter(NewSandboxSkillHandler(svc, nil))
+	svc.onGet = func(calls int) {
+		if calls < 2 {
+			return
+		}
+		svc.skills["skill-1"].Status = types.SkillStatusReady
+	}
+	h := NewSandboxSkillHandler(svc, nil)
+	h.pollInterval = 10 * time.Millisecond
+	h.maxDuration = 2 * time.Second
+	router := newSkillTestRouter(h)
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet,
 		"/sandbox-configs/cfg-a/skills/skill-1/install-events", nil))
 
 	events := decodeSSEEvents(t, w.Body.String())
-	require.Len(t, events, 1)
-	require.Equal(t, true, events[0]["done"])
-	require.Equal(t, types.SkillStatusInstalling, events[0]["status"])
+	require.NotEmpty(t, events)
+	for _, event := range events[:len(events)-1] {
+		require.NotEqual(t, true, event["done"])
+	}
+	final := events[len(events)-1]
+	require.Equal(t, true, final["done"])
+	require.Equal(t, types.SkillStatusReady, final["status"])
+	require.NotEqual(t, types.SkillStatusInstalling, final["stage"])
 	require.True(t, svc.subscriptionClosed())
 }
 
@@ -879,6 +912,33 @@ func (m *transcriptStreamManager) GetEvents(
 	out := append([]interfaces.StreamEvent(nil), m.events[from:]...)
 	return out, len(m.events), nil
 }
+
+func (m *transcriptStreamManager) AppendSteerEvents(context.Context, string, string, []interfaces.StreamEvent) error {
+	return nil
+}
+func (m *transcriptStreamManager) GetSteerEvents(
+	_ context.Context, _, _ string, from int,
+) ([]interfaces.StreamEvent, int, error) {
+	return nil, from, nil
+}
+func (m *transcriptStreamManager) UpdateSteerEventData(
+	context.Context, string, string, string, map[string]interface{},
+) (bool, error) {
+	return false, nil
+}
+func (m *transcriptStreamManager) DeleteSteerEvent(context.Context, string, string, string) (bool, error) {
+	return false, nil
+}
+func (m *transcriptStreamManager) SetLiveRun(context.Context, string, string, string) error {
+	return nil
+}
+func (m *transcriptStreamManager) ClaimLiveRun(context.Context, string, string, string) error {
+	return nil
+}
+func (m *transcriptStreamManager) GetLiveRun(context.Context, string) (string, string, error) {
+	return "", "", nil
+}
+func (m *transcriptStreamManager) ClearLiveRun(context.Context, string, string) error { return nil }
 
 func (m *transcriptStreamManager) readKey() string {
 	m.mu.Lock()

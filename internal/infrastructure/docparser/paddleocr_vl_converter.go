@@ -105,7 +105,7 @@ func (c *PaddleOCRVLReader) Read(ctx context.Context, req *types.ReadRequest) (*
 	// wastes tokens and defeats the chunker's table-protection logic. Convert
 	// them to Markdown tables (or strip layout attributes when conversion is
 	// not possible) before downstream processing.
-	mdContent = normalizeHTMLTables(mdContent)
+	mdContent = NormalizeHTMLTables(mdContent)
 
 	imageRefs, mdContent := c.processImages(ctx, mdContent, imagesB64)
 	mdContent, imageRefs = ensureOriginalImageRef(req, mdContent, imageRefs)

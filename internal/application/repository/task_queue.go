@@ -86,6 +86,10 @@ func (r *taskPendingOpsRepository) EnqueueIfKnowledgeBaseActive(
 			}
 			return err
 		}
+		active, err := tenantActiveWithinTx(tx, op.TenantID)
+		if err != nil || !active {
+			return err
+		}
 		if err := tx.Omit("ClaimedAt", "ClaimToken", "ClaimedByTaskID", "ClaimHeartbeatAt").Create(op).Error; err != nil {
 			return err
 		}
@@ -93,6 +97,36 @@ func (r *taskPendingOpsRepository) EnqueueIfKnowledgeBaseActive(
 		return nil
 	})
 	return accepted, err
+}
+
+// tenantActiveWithinTx reports whether a tenant exists and has not been
+// soft-deleted. A PostgreSQL share lock serializes guarded queue writes with
+// tenant deletion; on other supported dialects the enclosing transaction
+// provides the best available ordering.
+func tenantActiveWithinTx(tx *gorm.DB, tenantID uint64) (bool, error) {
+	if tenantID == 0 {
+		return false, nil
+	}
+	query := tx.Model(&types.Tenant{}).Select("id").Where("id = ?", tenantID)
+	if tx.Dialector.Name() == "postgres" {
+		query = query.Clauses(clause.Locking{Strength: "SHARE"})
+	}
+	var tenant types.Tenant
+	err := query.Take(&tenant).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// HasActiveTenant reports whether a tenant exists and has not been
+// soft-deleted. Wiki task consumers check this before starting model-backed
+// work; EnqueueIfKnowledgeBaseActive repeats the check in its write transaction.
+func (r *taskPendingOpsRepository) HasActiveTenant(ctx context.Context, tenantID uint64) (bool, error) {
+	return tenantActiveWithinTx(r.db.WithContext(ctx), tenantID)
 }
 
 // SeedKnowledgeFinalizingWithPendingOp commits the finalizing counter and the
@@ -160,7 +194,7 @@ func (r *taskPendingOpsRepository) SeedKnowledgeFinalizingWithPendingOp(
 }
 
 // PeekBatch returns up to `limit` rows for the (task_type, scope, scope_id)
-// tuple ordered by id ASC. Rows are not removed; callers must
+// tuple ordered least-failed first, oldest first within a retry count. Rows are not removed; callers must
 // DeleteByIDs once they have been consumed (or IncrFailCount and leave
 // them for the next pass). `limit` <= 0 falls back to 1; we clamp the
 // upper bound generously so callers can pull large windows when they
@@ -179,7 +213,7 @@ func (r *taskPendingOpsRepository) PeekBatch(
 	var ops []*types.TaskPendingOp
 	if err := r.db.WithContext(ctx).
 		Where("task_type = ? AND scope = ? AND scope_id = ?", taskType, scope, scopeID).
-		Order("id ASC").
+		Order("fail_count ASC, id ASC").
 		Limit(limit).
 		Find(&ops).Error; err != nil {
 		return nil, err
@@ -263,7 +297,9 @@ func (r *taskPendingOpsRepository) claimBatch(
 	owned := owner != nil
 	var claimed []*types.TaskPendingOp
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 1. Pick up to `limit` distinct dedup_keys to claim, oldest first.
+		// 1. Pick up to `limit` distinct dedup_keys to claim: least-failed
+		//    first, then oldest within the same retry count. This prevents a
+		//    repeatedly retried head row from starving never-attempted work.
 		//    Keys with a fresh claim are excluded WHOLESALE so a late sibling
 		//    of an in-flight document never gets claimed on its own.
 		var keys []string
@@ -276,7 +312,8 @@ func (r *taskPendingOpsRepository) claimBatch(
 SELECT dedup_key FROM task_pending_ops
 WHERE id IN (
 	SELECT id FROM (
-		SELECT id, ROW_NUMBER() OVER (PARTITION BY dedup_key ORDER BY id) AS rn
+				SELECT id, fail_count,
+					ROW_NUMBER() OVER (PARTITION BY dedup_key ORDER BY fail_count ASC, id ASC) AS rn
 		FROM task_pending_ops
 		WHERE task_type = ? AND scope = ? AND scope_id = ?
 			AND (claimed_at IS NULL OR claimed_at < ?)
@@ -288,7 +325,7 @@ WHERE id IN (
 			)
 	) anchors WHERE anchors.rn = 1
 )
-ORDER BY id ASC
+ORDER BY fail_count ASC, id ASC
 LIMIT ?
 FOR UPDATE SKIP LOCKED`
 			if err := tx.Raw(anchorSQL,
@@ -309,7 +346,7 @@ FOR UPDATE SKIP LOCKED`
 				Where("(? OR claim_token IS NULL)", owned).
 				Where("dedup_key NOT IN (?)", freshKeys).
 				Group("dedup_key").
-				Order("MIN(id) ASC").
+				Order("MIN(fail_count) ASC, MIN(id) ASC").
 				Limit(limit).
 				Pluck("dedup_key", &keys).Error; err != nil {
 				return err
@@ -531,6 +568,74 @@ func (r *taskPendingOpsRepository) DeleteByScope(ctx context.Context, scope, sco
 	return r.db.WithContext(ctx).
 		Where("scope = ? AND scope_id = ?", scope, scopeID).
 		Delete(&types.TaskPendingOp{}).Error
+}
+
+// DrainUnclaimedAndRelease deletes unclaimed or stale operations for one lane
+// and releases one pending-subtask slot per dedup key in the same transaction.
+// Completion itself remains owned by processing-span settlement. A freshly
+// heartbeating claim on any operation for the key keeps that key out of the
+// drain, so its live owner remains responsible for settlement.
+func (r *taskPendingOpsRepository) DrainUnclaimedAndRelease(
+	ctx context.Context, taskType, scope, scopeID, op string, staleBefore time.Time,
+) ([]string, error) {
+	if taskType == "" || scope == "" || scopeID == "" || op == "" {
+		return nil, errors.New("task pending ops: task_type, scope, scope_id and op are required")
+	}
+	var keys []string
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var removed []string
+		if err := tx.Raw(
+			`DELETE FROM task_pending_ops
+			WHERE task_type = ? AND scope = ? AND scope_id = ? AND op = ?
+				AND (claimed_at IS NULL OR COALESCE(claim_heartbeat_at, claimed_at) < ?)
+				AND dedup_key NOT IN (
+					SELECT dedup_key FROM task_pending_ops
+					WHERE task_type = ? AND scope = ? AND scope_id = ?
+						AND claimed_at IS NOT NULL
+						AND COALESCE(claim_heartbeat_at, claimed_at) >= ?
+				)
+			RETURNING dedup_key`,
+			taskType, scope, scopeID, op, staleBefore,
+			taskType, scope, scopeID, staleBefore,
+		).Scan(&removed).Error; err != nil {
+			return err
+		}
+		seen := make(map[string]struct{}, len(removed))
+		for _, key := range removed {
+			if key == "" {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			if err := releasePendingSubtaskSlot(tx, key); err != nil {
+				return fmt.Errorf("release finalizing slot for %s: %w", key, err)
+			}
+			keys = append(keys, key)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+// releasePendingSubtaskSlot is the transaction-aware counterpart of the
+// repository's FinalizeSubtask method. It updates only the observer counter;
+// a knowledge row is completed by processing-span settlement, never by the
+// pending queue drain.
+func releasePendingSubtaskSlot(tx *gorm.DB, knowledgeID string) error {
+	if knowledgeID == "" {
+		return nil
+	}
+	return tx.Model(&types.Knowledge{}).
+		Where("id = ? AND pending_subtasks_count > 0", knowledgeID).
+		Updates(map[string]any{
+			"pending_subtasks_count": gorm.Expr("pending_subtasks_count - 1"),
+			"updated_at":             time.Now(),
+		}).Error
 }
 
 // IncrFailCount atomically bumps fail_count for one row and returns the

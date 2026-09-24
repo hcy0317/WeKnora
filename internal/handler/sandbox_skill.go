@@ -54,11 +54,11 @@ type sandboxSkillService interface {
 		ctx context.Context, tenantID uint64, configID, skillID string,
 		update service.SkillAdminUpdate,
 	) (*types.TenantSkillEntity, error)
-	InstallSkill(ctx context.Context, tenantID uint64, configID string, archive []byte) (string, error)
+	InstallSkill(ctx context.Context, tenantID uint64, configID string, archive []byte, instructions ...string) (string, error)
 	InstallSkillFromSource(
 		ctx context.Context, tenantID uint64, configID, source string,
 	) (string, error)
-	ReinstallSkill(ctx context.Context, tenantID uint64, configID, skillID string) (string, error)
+	ReinstallSkill(ctx context.Context, tenantID uint64, configID, skillID string, instructions ...string) (string, error)
 	RemoveSkill(ctx context.Context, tenantID uint64, configID, skillID string) error
 	LastProgress(
 		ctx context.Context, tenantID uint64, configID, skillID string,
@@ -66,6 +66,13 @@ type sandboxSkillService interface {
 	SubscribeProgress(
 		ctx context.Context, tenantID uint64, configID, skillID string,
 	) (<-chan service.SkillProgress, func(), error)
+	InstallGuidance(
+		ctx context.Context, tenantID uint64, configID, skillID string,
+	) (*service.SkillInstallGuidanceState, error)
+	SteerInstall(
+		ctx context.Context, tenantID uint64, configID, skillID, expectedMessageID, steerID, content string,
+	) error
+	StopSkill(ctx context.Context, tenantID uint64, configID, skillID string) (*types.TenantSkillEntity, error)
 }
 
 // SandboxSkillHandler serves the agent-skill endpoints of one sandbox config.
@@ -614,17 +621,12 @@ func (h *SandboxSkillHandler) InstallEvents(c *gin.Context) {
 		h.emit(c, terminal)
 		return
 	}
-	if events == nil {
-		// Nothing publishes progress without Redis. One frame stating the
-		// durable status is all this connection can ever say.
-		h.emit(c, skillInstallEvent{
-			Stage:  skill.Status,
-			Status: skill.Status,
-			Log:    "live progress is unavailable; poll the skill for its status",
-			Done:   true,
-		})
-		return
-	}
+	// events is nil without Redis: nothing is ever published. A done frame
+	// here would mean the run finished, and the client would reload and
+	// subscribe again for as long as the row stays in progress. A receive on
+	// a nil channel never fires, so the poll below is what notices the row
+	// leaving installing or removing — the same fallback a dropped
+	// subscription already uses.
 
 	poll := time.NewTicker(h.pollInterval)
 	defer poll.Stop()
@@ -846,4 +848,56 @@ func setSandboxSkillSSEHeaders(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
+}
+
+// InstallGuidance exposes only the guidance for this tenant/config/skill's current run.
+func (h *SandboxSkillHandler) InstallGuidance(c *gin.Context) {
+	state, err := h.service.InstallGuidance(
+		c.Request.Context(),
+		sandboxConfigTenantID(c),
+		c.Param("id"),
+		c.Param("skillId"),
+	)
+	if err != nil {
+		respondSkillServiceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": state})
+}
+
+// SteerInstall accepts administrator guidance for the displayed installation run.
+func (h *SandboxSkillHandler) SteerInstall(c *gin.Context) {
+	var req struct {
+		ExpectedMessageID string `json:"expected_message_id" binding:"required"`
+		SteerID           string `json:"steer_id" binding:"required"`
+		Content           string `json:"content" binding:"required,max=10000"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		_ = c.Error(apperrors.NewBadRequestError("invalid install guidance"))
+		return
+	}
+	if err := h.service.SteerInstall(
+		c.Request.Context(), sandboxConfigTenantID(c), c.Param("id"), c.Param("skillId"),
+		req.ExpectedMessageID, req.SteerID, req.Content,
+	); err != nil {
+		respondSkillServiceError(c, err)
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"success": true})
+}
+
+// Stop cancels the current skill install for this sandbox configuration.
+func (h *SandboxSkillHandler) Stop(c *gin.Context) {
+	skill, err := h.service.StopSkill(
+		c.Request.Context(), sandboxConfigTenantID(c), c.Param("id"), c.Param("skillId"),
+	)
+	if err != nil {
+		respondSkillServiceError(c, err)
+		return
+	}
+	if skill == nil {
+		_ = c.Error(apperrors.NewNotFoundError("skill not found"))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": toSkillResponse(skill)})
 }

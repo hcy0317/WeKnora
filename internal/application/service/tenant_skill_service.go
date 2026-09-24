@@ -78,6 +78,10 @@ type TenantSkillService struct {
 	streams  interfaces.StreamManager
 	messages interfaces.MessageRepository
 
+	// host is Lite's OS sandbox. The zero value keeps the standard edition on
+	// the remote-config path; Desktop plus SkillsAvailable accepts "host".
+	host HostSandboxManager
+
 	now func() time.Time
 
 	// sourceHTTP pulls remote skill archives. Nil means the package SSRF-safe
@@ -108,6 +112,11 @@ type TenantSkillService struct {
 	cron    *cron.Cron
 	cronMu  sync.Mutex
 	started bool
+
+	// runCancels lets StopSkill abort the goroutine that holds this skill's
+	// install. The map is process-local; the stuck-run reaper handles restarts.
+	runCancelMu sync.Mutex
+	runCancels  map[string]*skillRunCancel
 }
 
 // NewTenantSkillService wires the repositories and runtimes the install and
@@ -126,6 +135,7 @@ func NewTenantSkillService(
 	redisClient *redis.Client,
 	streams interfaces.StreamManager,
 	messages interfaces.MessageRepository,
+	host HostSandboxManager,
 ) *TenantSkillService {
 	return &TenantSkillService{
 		skills:            skillsRepo,
@@ -140,11 +150,13 @@ func NewTenantSkillService(
 		redis:             redisClient,
 		streams:           streams,
 		messages:          messages,
+		host:              host,
 		now:               time.Now,
 		cleanupTimeout:    installCleanupTimeout,
 		snapshotRetention: skillSnapshotRetention,
 		installHeartbeat:  skillInstallHeartbeatInterval,
 		localLocks:        newKeyedMutex(),
+		runCancels:        map[string]*skillRunCancel{},
 		bundleCache:       newSkillBundleArchiveCache(),
 		cron: cron.New(cron.WithSeconds(), cron.WithChain(
 			cron.Recover(cron.DefaultLogger),
@@ -161,7 +173,10 @@ func NewTenantSkillService(
 func (s *TenantSkillService) withConfigLock(
 	ctx context.Context, tenantID uint64, configID string, fn func(context.Context) error,
 ) error {
-	key := skillImageLockKey(tenantID, configID)
+	return s.withSkillLock(ctx, skillImageLockKey(tenantID, configID), fn)
+}
+
+func (s *TenantSkillService) withSkillLock(ctx context.Context, key string, fn func(context.Context) error) error {
 	if s.redis == nil {
 		release, err := s.localLocks.lock(ctx, key)
 		if err != nil {

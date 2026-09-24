@@ -17,6 +17,7 @@ import (
 
 // ErrWikiPageNotFound is returned when a wiki page is not found
 var ErrWikiPageNotFound = errors.New("wiki page not found")
+var ErrWikiIssueNotFound = errors.New("wiki issue not found")
 
 // ErrWikiPageConflict is returned when an optimistic lock conflict is detected
 var ErrWikiPageConflict = errors.New("wiki page version conflict")
@@ -1685,6 +1686,35 @@ func deleteWikiPageAndCanonicalIdentity(tx *gorm.DB, page *types.WikiPage, enabl
 // ResolveCanonicalWikiPageSlugs atomically registers or reads the durable
 // canonical slug for every exact title identity. The unique registry key is
 // authoritative across workers, retries, Redis expiry, and process restarts.
+// deleteByTenantAndKnowledgeBase scopes KB cleanup to both tenant and KB so
+// a stale deletion task cannot erase another tenant's Wiki data.
+func (r *wikiPageRepository) deleteByTenantAndKnowledgeBase(
+	ctx context.Context, tenantID uint64, kbID string, model any,
+) error {
+	if kbID == "" {
+		return nil
+	}
+	return r.db.WithContext(ctx).
+		Where("tenant_id = ? AND knowledge_base_id = ?", tenantID, kbID).
+		Delete(model).Error
+}
+
+func (r *wikiPageRepository) DeleteByKnowledgeBaseID(ctx context.Context, tenantID uint64, kbID string) error {
+	return r.deleteByTenantAndKnowledgeBase(ctx, tenantID, kbID, &types.WikiPage{})
+}
+
+func (r *wikiPageRepository) DeleteFoldersByKnowledgeBaseID(ctx context.Context, tenantID uint64, kbID string) error {
+	return r.deleteByTenantAndKnowledgeBase(ctx, tenantID, kbID, &types.WikiFolder{})
+}
+
+func (r *wikiPageRepository) DeleteRevisionsByKnowledgeBaseID(ctx context.Context, tenantID uint64, kbID string) error {
+	return r.deleteByTenantAndKnowledgeBase(ctx, tenantID, kbID, &types.WikiPageRevision{})
+}
+
+func (r *wikiPageRepository) DeleteIssuesByKnowledgeBaseID(ctx context.Context, tenantID uint64, kbID string) error {
+	return r.deleteByTenantAndKnowledgeBase(ctx, tenantID, kbID, &types.WikiPageIssue{})
+}
+
 func (r *wikiPageRepository) ResolveCanonicalWikiPageSlugs(
 	ctx context.Context,
 	tenantID uint64,
@@ -2263,8 +2293,15 @@ func (r *wikiPageRepository) ListIssues(ctx context.Context, kbID string, slug s
 	return issues, nil
 }
 
-func (r *wikiPageRepository) UpdateIssueStatus(ctx context.Context, issueID string, status string) error {
-	return r.db.WithContext(ctx).Model(&types.WikiPageIssue{}).
-		Where("id = ?", issueID).
-		Update("status", status).Error
+func (r *wikiPageRepository) UpdateIssueStatus(ctx context.Context, kbID string, issueID string, status string) error {
+	result := r.db.WithContext(ctx).Model(&types.WikiPageIssue{}).
+		Where("id = ? AND knowledge_base_id = ?", issueID, kbID).
+		Update("status", status)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrWikiIssueNotFound
+	}
+	return nil
 }

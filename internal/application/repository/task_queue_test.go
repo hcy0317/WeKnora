@@ -475,20 +475,36 @@ func TestTaskPendingOps_DeleteByScope_RejectsMissingScope(t *testing.T) {
 
 func TestTaskPendingOps_EnqueueIfKnowledgeBaseActive(t *testing.T) {
 	db := setupTaskQueueTestDB(t)
+	require.NoError(t, db.Exec(`CREATE TABLE tenants (
+		id INTEGER PRIMARY KEY,
+		deleted_at DATETIME
+	)`).Error)
+	require.NoError(t, db.Exec(
+		"INSERT INTO tenants (id, deleted_at) VALUES (?, NULL), (?, ?)", 1, 2, time.Now(),
+	).Error)
 	require.NoError(t, db.Exec(`CREATE TABLE knowledge_bases (
 		id VARCHAR(64) PRIMARY KEY,
 		tenant_id INTEGER NOT NULL,
 		deleted_at DATETIME
 	)`).Error)
 	require.NoError(t, db.Exec(
-		"INSERT INTO knowledge_bases (id, tenant_id, deleted_at) VALUES (?, ?, NULL), (?, ?, ?)",
-		"kb-active", 1, "kb-deleted", 1, time.Now(),
+		"INSERT INTO knowledge_bases (id, tenant_id, deleted_at) VALUES (?, ?, NULL), (?, ?, ?), (?, ?, NULL)",
+		"kb-active", 1, "kb-deleted", 1, time.Now(), "kb-deleted-tenant", 2,
 	).Error)
 
 	repo := NewTaskPendingOpsRepository(db)
 	guard, ok := repo.(interfaces.TaskPendingOpsKnowledgeBaseGuard)
 	require.True(t, ok)
+	liveness, ok := repo.(interfaces.TaskPendingOpsTenantLiveness)
+	require.True(t, ok, "task pending repository must expose tenant liveness")
 	ctx := context.Background()
+
+	activeTenant, err := liveness.HasActiveTenant(ctx, 1)
+	require.NoError(t, err)
+	assert.True(t, activeTenant)
+	deletedTenant, err := liveness.HasActiveTenant(ctx, 2)
+	require.NoError(t, err)
+	assert.False(t, deletedTenant)
 
 	accepted, err := guard.EnqueueIfKnowledgeBaseActive(ctx,
 		makePendingOp(types.TypeWikiIngest, types.TaskScopeKnowledgeBase, "kb-active", "ingest", "active", nil))
@@ -515,6 +531,10 @@ func TestTaskPendingOps_EnqueueIfKnowledgeBaseActive(t *testing.T) {
 			TenantID: 2, TaskType: types.TypeWikiIngest, Scope: types.TaskScopeKnowledgeBase,
 			ScopeID: "kb-active", Op: "ingest", DedupKey: "wrong-tenant",
 		}},
+		{name: "deleted tenant with live KB", op: &types.TaskPendingOp{
+			TenantID: 2, TaskType: types.TypeWikiIngest, Scope: types.TaskScopeKnowledgeBase,
+			ScopeID: "kb-deleted-tenant", Op: "ingest", DedupKey: "deleted-tenant",
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			accepted, err := guard.EnqueueIfKnowledgeBaseActive(ctx, tc.op)
@@ -527,6 +547,87 @@ func TestTaskPendingOps_EnqueueIfKnowledgeBaseActive(t *testing.T) {
 	require.NoError(t, db.Find(&rows).Error)
 	require.Len(t, rows, 1)
 	assert.Equal(t, "active", rows[0].DedupKey)
+}
+
+func TestTaskPendingOps_DrainUnclaimedAndReleaseUsesHeartbeatAndKeepsSpanSettlement(t *testing.T) {
+	db := setupTaskQueueTestDB(t)
+	require.NoError(t, db.Exec(taskQueueKnowledgeTestDDL).Error)
+	repo := NewTaskPendingOpsRepository(db)
+	drainer, ok := repo.(interfaces.TaskPendingOpsDrainer)
+	require.True(t, ok)
+	ctx := context.Background()
+
+	for _, op := range []*types.TaskPendingOp{
+		makePendingOp(types.TypeWikiIngest, types.TaskScopeKnowledgeBase, "kb-1", "ingest", "unclaimed", nil),
+		makePendingOp(types.TypeWikiIngest, types.TaskScopeKnowledgeBase, "kb-1", "ingest", "unclaimed", nil),
+		makePendingOp(types.TypeWikiIngest, types.TaskScopeKnowledgeBase, "kb-1", "ingest", "stale", nil),
+		makePendingOp(types.TypeWikiIngest, types.TaskScopeKnowledgeBase, "kb-1", "ingest", "live", nil),
+		makePendingOp(types.TypeWikiIngest, types.TaskScopeKnowledgeBase, "kb-1", "retract", "live", nil),
+	} {
+		require.NoError(t, repo.Enqueue(ctx, op))
+	}
+	staleBefore := time.Now().Add(-time.Hour)
+	claimTime := time.Now()
+	require.NoError(t, db.Exec(
+		`UPDATE task_pending_ops SET claimed_at = ?, claim_heartbeat_at = ? WHERE dedup_key = ?`,
+		staleBefore.Add(-time.Minute), staleBefore.Add(-time.Minute), "stale",
+	).Error)
+	require.NoError(t, db.Exec(
+		`UPDATE task_pending_ops SET claimed_at = ?, claim_heartbeat_at = ? WHERE dedup_key = ?`,
+		claimTime.Add(-2*time.Hour), claimTime, "live",
+	).Error)
+	for _, row := range []struct {
+		id      string
+		pending int
+	}{
+		{id: "unclaimed", pending: 1},
+		{id: "stale", pending: 2},
+		{id: "live", pending: 1},
+	} {
+		require.NoError(t, db.Exec(
+			`INSERT INTO knowledges (id, tenant_id, knowledge_base_id, parse_status, pending_subtasks_count)
+			 VALUES (?, 1, 'kb-1', ?, ?)`, row.id, types.ParseStatusFinalizing, row.pending,
+		).Error)
+	}
+
+	keys, err := drainer.DrainUnclaimedAndRelease(
+		ctx, types.TypeWikiIngest, types.TaskScopeKnowledgeBase, "kb-1", "ingest", staleBefore,
+	)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"unclaimed", "stale"}, keys)
+
+	var liveRows int64
+	require.NoError(t, db.Model(&types.TaskPendingOp{}).Where("dedup_key = ?", "live").Count(&liveRows).Error)
+	assert.Equal(t, int64(2), liveRows)
+	var staleCount, unclaimedCount int
+	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "stale").Pluck("pending_subtasks_count", &staleCount).Error)
+	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "unclaimed").Pluck("pending_subtasks_count", &unclaimedCount).Error)
+	assert.Equal(t, 1, staleCount)
+	assert.Zero(t, unclaimedCount)
+	var unclaimedStatus string
+	require.NoError(t, db.Model(&types.Knowledge{}).Where("id = ?", "unclaimed").Pluck("parse_status", &unclaimedStatus).Error)
+	assert.Equal(t, types.ParseStatusFinalizing, unclaimedStatus, "span settlement, not queue draining, owns completion")
+}
+
+func TestTaskPendingOps_DrainUnclaimedAndReleaseRollsBackWhenSlotReleaseFails(t *testing.T) {
+	db := setupTaskQueueTestDB(t)
+	require.NoError(t, db.Exec(taskQueueKnowledgeTestDDL).Error)
+	repo := NewTaskPendingOpsRepository(db)
+	drainer, ok := repo.(interfaces.TaskPendingOpsDrainer)
+	require.True(t, ok)
+	ctx := context.Background()
+	require.NoError(t, repo.Enqueue(ctx,
+		makePendingOp(types.TypeWikiIngest, types.TaskScopeKnowledgeBase, "kb-1", "ingest", "missing-knowledge", nil)))
+	require.NoError(t, db.Exec("DROP TABLE knowledges").Error)
+
+	keys, err := drainer.DrainUnclaimedAndRelease(
+		ctx, types.TypeWikiIngest, types.TaskScopeKnowledgeBase, "kb-1", "ingest", time.Now().Add(-time.Hour),
+	)
+	require.Error(t, err)
+	assert.Empty(t, keys)
+	var pending int64
+	require.NoError(t, db.Model(&types.TaskPendingOp{}).Count(&pending).Error)
+	assert.Equal(t, int64(1), pending)
 }
 
 // TestTaskPendingOps_IncrFailCount_ReturnsNewValueAndPersists exercises

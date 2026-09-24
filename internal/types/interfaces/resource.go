@@ -30,6 +30,20 @@ type ResourceRepository interface {
 	ReleaseBindingAndMarkIfUnbound(
 		ctx context.Context, resourceID, ownerType, ownerID string,
 	) (remaining int64, deletionClaim time.Time, err error)
+	MarkDeleted(ctx context.Context, id string) error
+	CreateBinding(ctx context.Context, binding *types.ResourceBinding) error
+	DeleteBinding(ctx context.Context, resourceID, ownerType, ownerID string) error
+	CountBindings(ctx context.Context, resourceID string) (int64, error)
+	IsReferencedByKnowledgeBase(
+		ctx context.Context,
+		tenantID uint64,
+		kbID, resourceID string,
+	) (bool, error)
+	GetMessageFileBindings(
+		ctx context.Context,
+		tenantID uint64,
+		resourceID, messageID string,
+	) (*types.MessageFileBindings, error)
 	CreateGrant(ctx context.Context, grant *types.ResourceAccessGrant) error
 	GetValidGrant(ctx context.Context, tokenHash string, now time.Time) (*types.ResourceAccessGrant, error)
 	DeleteExpiredGrants(ctx context.Context, before time.Time) error
@@ -96,4 +110,20 @@ func ResourceDeletionClaimFromContext(ctx context.Context, reference string) (ti
 		return time.Time{}, false
 	}
 	return value.claim, true
+}
+
+// KBResourceLookup verifies an explicit binding to a live knowledge document.
+// Text references and common storage tenancy never establish ownership.
+type KBResourceLookup interface {
+	IsReferencedByKnowledgeBase(ctx context.Context, tenantID uint64, kbID, reference string) (bool, error)
+}
+
+// MessageFileBindingLookup resolves explicit KB and message-artifact bindings.
+// Only the catalog can turn a raw locator into a registered resource identity.
+type MessageFileBindingLookup interface {
+	GetMessageFileBindings(
+		ctx context.Context,
+		tenantID uint64,
+		reference, messageID string,
+	) (*types.MessageFileBindings, error)
 }

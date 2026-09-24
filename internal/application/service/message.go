@@ -31,6 +31,8 @@ type messageService struct {
 	suggestionRepo interfaces.MessageSuggestionRepository
 }
 
+const artifactLibraryMaxPageSize = 100
+
 // NewMessageService creates a new message service instance with the required repositories
 func NewMessageService(messageRepo interfaces.MessageRepository,
 	sessionRepo interfaces.SessionRepository,
@@ -383,7 +385,8 @@ func (s *messageService) IndexMessageToKB(ctx context.Context, userQuery string,
 	}
 
 	cfg := s.getChatHistoryConfig(ctx)
-	if cfg == nil {
+	if cfg == nil || !cfg.IsConfigured() {
+		logger.Infof(ctx, "Skipping message index for message %s: %s", messageID, describeChatHistorySkip(ctx))
 		return
 	}
 
@@ -408,6 +411,28 @@ func (s *messageService) IndexMessageToKB(ctx context.Context, userQuery string,
 	}
 
 	logger.Infof(ctx, "Message indexed to chat history KB: knowledge_id=%s, message_id=%s", knowledge.ID, messageID)
+}
+
+// describeChatHistorySkip reports the missing precondition when a completed
+// turn is not indexed into the tenant chat-history knowledge base.
+func describeChatHistorySkip(ctx context.Context) string {
+	tenant, ok := types.TenantInfoFromContext(ctx)
+	if !ok {
+		return "no tenant in context"
+	}
+	cfg := tenant.ChatHistoryConfig
+	switch {
+	case cfg == nil:
+		return "chat history config not set"
+	case !cfg.Enabled:
+		return "chat history indexing disabled"
+	case cfg.EmbeddingModelID == "":
+		return "enabled but no embedding model selected"
+	case cfg.KnowledgeBaseID == "":
+		return "enabled but chat history knowledge base not created yet"
+	default:
+		return "chat history config incomplete"
+	}
 }
 
 // DeleteMessageKnowledge deletes the Knowledge entry associated with a message from the chat history KB.
@@ -490,6 +515,59 @@ func (s *messageService) GetSessionArtifacts(
 		return types.MessageArtifacts{}, nil
 	}
 	return s.messageRepo.GetSessionArtifacts(ctx, sessionID)
+}
+
+// ListArtifactLibrary returns the latest artifact version in each live session
+// visible to the current caller.
+func (s *messageService) ListArtifactLibrary(
+	ctx context.Context, query *types.ArtifactLibraryQuery,
+) (*types.PageResult, error) {
+	if query == nil {
+		query = &types.ArtifactLibraryQuery{}
+	}
+	query.TenantID = types.MustTenantIDFromContext(ctx)
+	query.UserID = types.SessionOwnerIDFromContext(ctx)
+	pagination := &types.Pagination{Page: query.Page, PageSize: query.PageSize}
+	query.Page = pagination.GetPage()
+	query.PageSize = min(pagination.GetPageSize(), artifactLibraryMaxPageSize)
+	pagination.PageSize = query.PageSize
+	query.FileTypes = normalizeArtifactFileTypes(query.FileTypes)
+
+	items, total, err := s.messageRepo.ListArtifactLibrary(ctx, query)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"tenant_id": query.TenantID,
+			"user_id":   query.UserID,
+		})
+		return nil, err
+	}
+	for _, item := range items {
+		if handle, ok := types.ParseResourcePath(item.URL); ok {
+			item.Handle = types.BuildResourcePath(handle)
+		}
+	}
+	return types.NewPageResult(total, pagination, items), nil
+}
+
+// normalizeArtifactFileTypes canonicalizes extensions like "PDF" and ".pdf"
+// to the stored .pdf form while preserving the caller's order.
+func normalizeArtifactFileTypes(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, raw := range in {
+		ext := strings.ToLower(strings.TrimSpace(raw))
+		if ext == "" {
+			continue
+		}
+		if !strings.HasPrefix(ext, ".") {
+			ext = "." + ext
+		}
+		if !seen[ext] {
+			seen[ext] = true
+			out = append(out, ext)
+		}
+	}
+	return out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -816,8 +894,10 @@ func rrfMerge(keywordResults []*types.MessageWithSession, vectorResults []*types
 // has only one role (Q-only or A-only), fetches the partner message from DB so
 // that groupByRequestID can produce complete Q&A pairs.
 func (s *messageService) fetchPartnerMessages(ctx context.Context, items []*types.MessageSearchResultItem) []*types.MessageSearchResultItem {
-	// Collect request_ids and track which roles we already have
+	// Collect request_ids by session and track which roles we already have.
+	// Request IDs are scoped by session; lookups must never cross that boundary.
 	type roleSet struct {
+		sessionID    string
 		hasUser      bool
 		hasAssistant bool
 	}
@@ -826,13 +906,14 @@ func (s *messageService) fetchPartnerMessages(ctx context.Context, items []*type
 	for _, item := range items {
 		existingIDs[item.ID] = true
 		rid := item.RequestID
-		if rid == "" {
+		if rid == "" || item.SessionID == "" {
 			continue
 		}
-		rs, ok := seen[rid]
+		key := item.SessionID + "\x00" + rid
+		rs, ok := seen[key]
 		if !ok {
-			rs = &roleSet{}
-			seen[rid] = rs
+			rs = &roleSet{sessionID: item.SessionID}
+			seen[key] = rs
 		}
 		if item.Role == "user" {
 			rs.hasUser = true
@@ -841,35 +922,44 @@ func (s *messageService) fetchPartnerMessages(ctx context.Context, items []*type
 		}
 	}
 
-	// Find request_ids that need partner lookup
-	var needFetch []string
-	for rid, rs := range seen {
+	// Find request IDs that need partner lookup, grouped by session.
+	needFetch := make(map[string][]string)
+	for key, rs := range seen {
 		if !rs.hasUser || !rs.hasAssistant {
-			needFetch = append(needFetch, rid)
+			requestID := strings.SplitN(key, "\x00", 2)[1]
+			needFetch[rs.sessionID] = append(needFetch[rs.sessionID], requestID)
 		}
 	}
 	if len(needFetch) == 0 {
 		return items
 	}
 
-	// Fetch partner messages
-	partners, err := s.messageRepo.GetMessagesByRequestIDs(ctx, needFetch)
-	if err != nil {
-		logger.Warnf(ctx, "Failed to fetch partner messages: %v", err)
-		return items
+	// Fetch partner messages session by session. Stable ordering keeps equal-score
+	// results deterministic without allowing a request ID to bridge sessions.
+	sessionIDs := make([]string, 0, len(needFetch))
+	for sessionID := range needFetch {
+		sessionIDs = append(sessionIDs, sessionID)
 	}
-
-	// Append only messages not already in results
-	for _, p := range partners {
-		if existingIDs[p.ID] {
+	sort.Strings(sessionIDs)
+	for _, sessionID := range sessionIDs {
+		requestIDs := needFetch[sessionID]
+		sort.Strings(requestIDs)
+		partners, err := s.messageRepo.GetMessagesByRequestIDs(ctx, sessionID, requestIDs)
+		if err != nil {
+			logger.Warnf(ctx, "Failed to fetch partner messages for session %s: %v", sessionID, err)
 			continue
 		}
-		existingIDs[p.ID] = true
-		items = append(items, &types.MessageSearchResultItem{
-			MessageWithSession: *p,
-			Score:              0, // partner is not directly matched
-			MatchType:          "",
-		})
+		for _, p := range partners {
+			if existingIDs[p.ID] {
+				continue
+			}
+			existingIDs[p.ID] = true
+			items = append(items, &types.MessageSearchResultItem{
+				MessageWithSession: *p,
+				Score:              0, // partner is not directly matched
+				MatchType:          "",
+			})
+		}
 	}
 
 	return items

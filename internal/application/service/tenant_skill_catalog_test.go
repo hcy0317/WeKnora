@@ -37,7 +37,7 @@ func TestListCatalogGroupsInstallsByDefinition(t *testing.T) {
 		Name: "pdf", Status: types.SkillStatusInstalling, Enabled: true,
 	}))
 
-	svc := NewTenantSkillService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	svc := NewTenantSkillService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, HostSandboxManager{})
 	list, err := svc.ListCatalog(ctx, 7)
 	require.NoError(t, err)
 	require.Len(t, list, 1)
@@ -63,7 +63,7 @@ func TestResolveCatalogFindsLegacySkillID(t *testing.T) {
 		Status: types.SkillStatusReady, Enabled: true,
 	}).Error)
 
-	svc := NewTenantSkillService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	svc := NewTenantSkillService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, HostSandboxManager{})
 	cat, err := svc.resolveCatalog(ctx, 7, "sk-old")
 	require.NoError(t, err)
 	require.NotNil(t, cat)
@@ -95,7 +95,7 @@ func TestListCatalogShowsInstallsWhoseCatalogWasDeleted(t *testing.T) {
 	}))
 	require.NoError(t, repo.DeleteCatalog(ctx, 7, "cat-gone"))
 
-	svc := NewTenantSkillService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	svc := NewTenantSkillService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, HostSandboxManager{})
 	list, err := svc.ListCatalog(ctx, 7)
 	require.NoError(t, err)
 	require.Len(t, list, 1)
@@ -167,7 +167,7 @@ func TestDeleteCatalogRefusesWhileARemovalIsInFlight(t *testing.T) {
 		Name: "pdf", Status: types.SkillStatusRemoving, Enabled: true,
 	}))
 
-	svc := NewTenantSkillService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	svc := NewTenantSkillService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, HostSandboxManager{})
 	err := svc.DeleteCatalog(ctx, 7, "cat-pdf")
 	require.Error(t, err)
 	appErr, ok := apperrors.IsAppError(err)

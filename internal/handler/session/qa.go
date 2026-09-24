@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -17,8 +18,11 @@ import (
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/models/api"
 	"github.com/Tencent/WeKnora/internal/storageurl"
+	"github.com/Tencent/WeKnora/internal/stream"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -47,10 +51,14 @@ type qaRequestContext struct {
 	mcpServiceIDs         []string
 	skillNames            []string
 	summaryModelID        string
+	reasoningEffort       string
 	webSearchEnabled      bool
 	mentionedItems        types.MentionedItems
-	effectiveTenantID     uint64                   // when using shared agent, tenant ID for model/KB/MCP resolution; 0 = use context tenant
-	sharedAgentReadOnly   bool                     // access was granted by a read-only agent share
+	effectiveTenantID     uint64 // when using shared agent, tenant ID for model/KB/MCP resolution; 0 = use context tenant
+	sharedAgentReadOnly   bool   // access was granted by a read-only agent share
+	steerSink             *steerSink
+	skipSSE               bool
+	steerCarryOver        []interfaces.StreamEvent
 	images                []ImageAttachment        // Uploaded images with analysis text
 	userMessageID         string                   // Created user message ID (populated after createUserMessage)
 	userCreatedAt         time.Time                // Persisted user message timestamp, echoed on agent_query
@@ -79,7 +87,9 @@ func (rc *qaRequestContext) buildQARequest() *types.QARequest {
 		Query:               rc.query,
 		AssistantMessageID:  rc.assistantMessage.ID,
 		SummaryModelID:      rc.summaryModelID,
+		ReasoningEffort:     rc.reasoningEffort,
 		CustomAgent:         rc.customAgent,
+		SteerSink:           rc.steerSink,
 		SharedAgentReadOnly: rc.sharedAgentReadOnly,
 		KnowledgeBaseIDs:    rc.knowledgeBaseIDs,
 		KnowledgeIDs:        rc.knowledgeIDs,
@@ -114,6 +124,14 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 	if err := c.ShouldBindJSON(&request); err != nil {
 		logger.Error(ctx, "Failed to parse request data", err)
 		return nil, nil, errors.NewBadRequestError(err.Error())
+	}
+	request.ReasoningEffort = strings.TrimSpace(request.ReasoningEffort)
+	if request.ReasoningEffort != "" {
+		if parsed, ok := api.ParseReasoningEffort(request.ReasoningEffort); ok {
+			request.ReasoningEffort = string(parsed)
+		} else {
+			return nil, nil, errors.NewBadRequestError("invalid reasoning_effort")
+		}
 	}
 
 	// Validate query content
@@ -375,6 +393,7 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 		mcpServiceIDs:         secutils.SanitizeForLogArray(mcpServiceIDs),
 		skillNames:            secutils.SanitizeForLogArray(skillNames),
 		summaryModelID:        secutils.SanitizeForLog(request.SummaryModelID),
+		reasoningEffort:       request.ReasoningEffort,
 		webSearchEnabled:      request.WebSearchEnabled,
 		mentionedItems:        convertMentionedItems(request.MentionedItems),
 		effectiveTenantID:     effectiveTenantID,
@@ -606,24 +625,22 @@ func mergeKnowledgeTargets(requestKBIDs []string, requestKnowledgeIDs []string, 
 // sseStreamContext holds the context for SSE streaming
 type sseStreamContext struct {
 	eventBus         *event.EventBus
+	streamHandler    *AgentStreamHandler
 	asyncCtx         context.Context
 	cancel           context.CancelFunc
 	assistantMessage *types.Message
+	steerSink        *steerSink
+	liveRunFailed    bool
+	liveRunErr       error
+	releaseTurn      func()
 }
 
 // setupSSEStream sets up the SSE streaming context
-func (h *Handler) setupSSEStream(reqCtx *qaRequestContext, generateTitle bool) *sseStreamContext {
-	// Set SSE headers
-	setSSEHeaders(reqCtx.c)
-
-	// Write initial agent_query event
-	h.writeAgentQueryEvent(
-		reqCtx.ctx,
-		reqCtx.sessionID,
-		reqCtx.userMessageID,
-		reqCtx.userCreatedAt,
-		reqCtx.assistantMessage,
-	)
+func (h *Handler) setupSSEStream(reqCtx *qaRequestContext, generateTitle bool, modes ...qaMode) *sseStreamContext {
+	mode := qaModeNormal
+	if len(modes) > 0 {
+		mode = modes[0]
+	}
 
 	// Base context for async work: when using shared agent, use source tenant for model/KB/MCP resolution
 	baseCtx := reqCtx.ctx
@@ -659,6 +676,31 @@ func (h *Handler) setupSSEStream(reqCtx *qaRequestContext, generateTitle bool) *
 		cancel:           cancel,
 		assistantMessage: reqCtx.assistantMessage,
 	}
+	if mode == qaModeAgent && reqCtx.customAgent != nil {
+		streamCtx.steerSink = newSteerSink(
+			asyncCtx, reqCtx.sessionID, reqCtx.requestID, reqCtx.assistantMessage,
+			h.messageService, h.streamManager,
+		)
+		reqCtx.steerSink = streamCtx.steerSink
+		if err := h.streamManager.SetLiveRun(
+			logger.CloneContext(baseCtx), reqCtx.sessionID,
+			reqCtx.assistantMessage.ID, reqCtx.requestID,
+		); err != nil {
+			streamCtx.liveRunFailed = true
+			streamCtx.liveRunErr = err
+			return streamCtx
+		}
+	}
+	if !reqCtx.skipSSE {
+		setSSEHeaders(reqCtx.c)
+	}
+	h.writeAgentQueryEvent(
+		reqCtx.ctx,
+		reqCtx.sessionID,
+		reqCtx.userMessageID,
+		reqCtx.userCreatedAt,
+		reqCtx.assistantMessage,
+	)
 
 	// Setup stop event handler
 	h.setupStopEventHandler(eventBus, reqCtx.sessionID, reqCtx.session.TenantID, reqCtx.assistantMessage, cancel)
@@ -675,7 +717,7 @@ func (h *Handler) setupSSEStream(reqCtx *qaRequestContext, generateTitle bool) *
 	h.startStopWatcher(logger.CloneContext(baseCtx), reqCtx.sessionID, reqCtx.assistantMessage.ID, eventBus)
 
 	// Setup stream handler
-	h.setupStreamHandler(asyncCtx, reqCtx.sessionID, reqCtx.assistantMessage.ID,
+	streamCtx.streamHandler = h.setupStreamHandler(asyncCtx, reqCtx.sessionID, reqCtx.assistantMessage.ID,
 		reqCtx.requestID, reqCtx.session.TenantID, reqCtx.receivedAt, reqCtx.assistantMessage, eventBus)
 
 	// Generate title if needed
@@ -692,9 +734,69 @@ func (h *Handler) setupSSEStream(reqCtx *qaRequestContext, generateTitle bool) *
 	return streamCtx
 }
 
+// persistTurnMessages creates any missing rows for a turn. Server-created
+// follow-up runs arrive with both IDs already set, while ordinary requests
+// use the same helper to keep rollback behavior consistent.
+func (h *Handler) persistTurnMessages(ctx context.Context, reqCtx *qaRequestContext) error {
+	createdUser := false
+	if reqCtx.userMessageID == "" {
+		attachments := reqCtx.attachments
+		if len(reqCtx.attachmentMetas) > 0 {
+			attachments = append(append(types.MessageAttachments{}, reqCtx.attachments...), reqCtx.attachmentMetas...)
+		}
+		userMessage, err := h.createUserMessage(
+			ctx, reqCtx.sessionID, reqCtx.query, reqCtx.requestID, reqCtx.mentionedItems,
+			convertImageAttachments(reqCtx.images), attachments, reqCtx.channel, reqCtx.suggestionAttribution,
+		)
+		if err != nil {
+			return err
+		}
+		reqCtx.userMessageID = userMessage.ID
+		reqCtx.userCreatedAt = userMessage.CreatedAt
+		createdUser = true
+	}
+	if reqCtx.assistantMessage == nil {
+		reqCtx.assistantMessage = &types.Message{
+			SessionID: reqCtx.sessionID, Role: "assistant", IsCompleted: false,
+			RequestID: reqCtx.requestID, CreatedAt: time.Now(),
+		}
+	}
+	if reqCtx.assistantMessage.ID == "" {
+		assistant, err := h.createAssistantMessage(ctx, reqCtx.assistantMessage)
+		if err != nil {
+			h.rollbackTurnMessages(ctx, reqCtx, createdUser, false)
+			return err
+		}
+		reqCtx.assistantMessage = assistant
+	}
+	return nil
+}
+
+// rollbackTurnMessages removes only rows this request created when live-run
+// admission fails, so rejected follow-ups do not leave orphaned history.
+func (h *Handler) rollbackTurnMessages(ctx context.Context, reqCtx *qaRequestContext, user, assistant bool) {
+	if h.messageService == nil || reqCtx == nil {
+		return
+	}
+	if user && reqCtx.userMessageID != "" {
+		if err := h.messageService.DeleteMessage(ctx, reqCtx.sessionID, reqCtx.userMessageID); err != nil {
+			logger.Warnf(ctx, "turn rollback failed for user message %s: %v", reqCtx.userMessageID, err)
+		} else {
+			reqCtx.userMessageID = ""
+		}
+	}
+	if assistant && reqCtx.assistantMessage != nil && reqCtx.assistantMessage.ID != "" {
+		if err := h.messageService.DeleteMessage(ctx, reqCtx.sessionID, reqCtx.assistantMessage.ID); err != nil {
+			logger.Warnf(ctx, "turn rollback failed for assistant message %s: %v", reqCtx.assistantMessage.ID, err)
+		} else {
+			reqCtx.assistantMessage.ID = ""
+		}
+	}
+}
+
 // SearchKnowledge godoc
 // @Summary      知识搜索
-// @Description  在知识库中搜索（不使用LLM总结）
+// @Description  在知识库中搜索（不使用LLM总结）。与产品内问答使用同一检索流程（召回、rerank、合并），外部检索首选；可覆盖召回参数与 rerank
 // @Tags         问答
 // @Accept       json
 // @Produce      json
@@ -767,6 +869,11 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 		c.Error(err)
 		return
 	}
+	opts, err := knowledgeSearchOptions(&request)
+	if err != nil {
+		_ = c.Error(errors.NewBadRequestError(err.Error()))
+		return
+	}
 
 	logger.Infof(
 		ctx,
@@ -778,18 +885,48 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 	)
 
 	// Directly call knowledge retrieval service without LLM summarization
-	searchResults, err := h.sessionService.SearchKnowledge(ctx, knowledgeBaseIDs, request.KnowledgeIDs, tagScopes, request.Query)
+	retrieval, err := h.sessionService.SearchKnowledge(
+		ctx, knowledgeBaseIDs, request.KnowledgeIDs, tagScopes, request.Query, opts,
+	)
 	if err != nil {
+		// Typed AppErrors (e.g. an unknown rerank model_id) keep their code.
+		if appErr, ok := errors.IsAppError(err); ok {
+			_ = c.Error(appErr)
+			return
+		}
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(errors.NewInternalServerError(err.Error()))
 		return
 	}
 
-	logger.Infof(ctx, "Knowledge search completed, found %d results", len(searchResults))
+	logger.Infof(ctx, "Knowledge search completed, found %d results", len(retrieval.Results))
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    rewriter.CopyReferences(ctx, searchResults),
+		"data":    rewriter.CopyReferences(ctx, retrieval.Results),
+		"meta":    retrieval.Meta,
 	})
+}
+
+// knowledgeSearchOptions validates the retrieval overrides of a
+// knowledge-search request.
+func knowledgeSearchOptions(request *SearchKnowledgeRequest) (*types.KnowledgeSearchOptions, error) {
+	if request.MatchCount < 0 {
+		return nil, fmt.Errorf("match_count must not be negative")
+	}
+	if request.DisableVectorMatch && request.DisableKeywordsMatch {
+		return nil, fmt.Errorf("disable_vector_match and disable_keywords_match cannot both be true")
+	}
+	if err := request.Rerank.Validate(); err != nil {
+		return nil, err
+	}
+	return &types.KnowledgeSearchOptions{
+		VectorThreshold:      request.VectorThreshold,
+		KeywordThreshold:     request.KeywordThreshold,
+		MatchCount:           request.MatchCount,
+		DisableKeywordsMatch: request.DisableKeywordsMatch,
+		DisableVectorMatch:   request.DisableVectorMatch,
+		Rerank:               request.Rerank,
+	}, nil
 }
 
 // KnowledgeQA godoc
@@ -915,27 +1052,16 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 		}
 	}
 
-	// Create user message. Include pre-uploaded document metadata so history
-	// reload shows the attachments even though their content is selected later.
-	userMessageAttachments := reqCtx.attachments
-	if len(reqCtx.attachmentMetas) > 0 {
-		userMessageAttachments = append(append(types.MessageAttachments{}, reqCtx.attachments...), reqCtx.attachmentMetas...)
-	}
-	userMsg, err := h.createUserMessage(ctx, sessionID, reqCtx.query, reqCtx.requestID, reqCtx.mentionedItems, convertImageAttachments(reqCtx.images), userMessageAttachments, reqCtx.channel, reqCtx.suggestionAttribution)
-	if err != nil {
-		reqCtx.c.Error(errors.NewInternalServerError(err.Error()))
+	createdUser := reqCtx.userMessageID == ""
+	createdAssistant := reqCtx.assistantMessage == nil || reqCtx.assistantMessage.ID == ""
+	if err := h.persistTurnMessages(ctx, reqCtx); err != nil {
+		if reqCtx.c != nil && !reqCtx.skipSSE {
+			_ = reqCtx.c.Error(errors.NewInternalServerError(err.Error()))
+		} else {
+			logger.ErrorWithFields(ctx, err, map[string]interface{}{"session_id": sessionID})
+		}
 		return
 	}
-	reqCtx.userMessageID = userMsg.ID
-	reqCtx.userCreatedAt = userMsg.CreatedAt
-
-	// Create assistant message
-	assistantMessagePtr, err := h.createAssistantMessage(ctx, reqCtx.assistantMessage)
-	if err != nil {
-		reqCtx.c.Error(errors.NewInternalServerError(err.Error()))
-		return
-	}
-	reqCtx.assistantMessage = assistantMessagePtr
 
 	if mode == qaModeNormal {
 		logger.Infof(ctx, "Using knowledge bases: %v", reqCtx.knowledgeBaseIDs)
@@ -943,8 +1069,32 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 		logger.Infof(ctx, "Calling agent QA service, session ID: %s", sessionID)
 	}
 
-	// Setup SSE stream
-	streamCtx := h.setupSSEStream(reqCtx, generateTitle)
+	if len(reqCtx.steerCarryOver) > 0 && reqCtx.assistantMessage != nil {
+		if err := h.streamManager.AppendSteerEvents(
+			ctx, sessionID, reqCtx.assistantMessage.ID, reqCtx.steerCarryOver,
+		); err != nil {
+			logger.Warnf(ctx, "steer carry-over append failed for session %s: %v", sessionID, err)
+		}
+	}
+
+	// Setup SSE stream after creating the authenticated live-run marker.
+	streamCtx := h.setupSSEStream(reqCtx, generateTitle, mode)
+	if streamCtx.liveRunFailed {
+		if streamCtx.cancel != nil {
+			streamCtx.cancel()
+		}
+		h.rollbackTurnMessages(ctx, reqCtx, createdUser, createdAssistant)
+		if reqCtx.c != nil && !reqCtx.skipSSE {
+			if stderrors.Is(streamCtx.liveRunErr, stream.ErrLiveRunExists) {
+				_ = reqCtx.c.Error(errors.NewConflictError("another turn is already running in this session"))
+			} else {
+				_ = reqCtx.c.Error(errors.NewServiceUnavailableError("Failed to publish running turn"))
+			}
+		} else {
+			logger.ErrorWithFields(ctx, streamCtx.liveRunErr, map[string]interface{}{"session_id": sessionID})
+		}
+		return
+	}
 
 	// Normal mode: register completion handler on EventAgentFinalAnswer
 	// (Agent mode handles completion in the defer block instead)
@@ -986,7 +1136,7 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 
 				logger.Infof(streamCtx.asyncCtx, "Knowledge QA service completed for session: %s", sessionID)
 				updateCtx := context.WithValue(streamCtx.asyncCtx, types.TenantIDContextKey, reqCtx.session.TenantID)
-				h.completeAssistantMessage(updateCtx, streamCtx.assistantMessage, reqCtx.query, reqCtx.userMessageID)
+				h.completeQuickAnswerTurn(updateCtx, streamCtx, reqCtx.query, reqCtx.userMessageID)
 				streamCtx.eventBus.Emit(streamCtx.asyncCtx, event.Event{
 					Type:      event.EventAgentComplete,
 					SessionID: sessionID,
@@ -998,7 +1148,9 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 	}
 
 	// Execute QA asynchronously
+	asyncDone := make(chan struct{})
 	go func() {
+		defer close(asyncDone)
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 10240)
@@ -1022,7 +1174,26 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 					context.WithoutCancel(streamCtx.asyncCtx),
 					types.TenantIDContextKey, reqCtx.session.TenantID,
 				)
-				h.completeAssistantMessage(updateCtx, streamCtx.assistantMessage, reqCtx.query, reqCtx.userMessageID)
+				if streamCtx.steerSink != nil {
+					if streamCtx.asyncCtx.Err() != nil {
+						h.discardSteerBacklog(
+							updateCtx, sessionID, streamCtx.assistantMessage.ID,
+							streamCtx.steerSink.InjectedIDs(),
+						)
+						h.completeStreamAssistantMessage(updateCtx, streamCtx, reqCtx.query, reqCtx.userMessageID)
+					} else {
+						kicked := h.kickNextRunFromSteerBacklog(updateCtx, reqCtx, streamCtx)
+						h.completeStreamAssistantMessage(updateCtx, streamCtx, reqCtx.query, reqCtx.userMessageID)
+						if !kicked {
+							h.kickNextRunFromSteerBacklog(updateCtx, reqCtx, streamCtx)
+						}
+					}
+					if err := h.streamManager.ClearLiveRun(updateCtx, sessionID, streamCtx.assistantMessage.ID); err != nil {
+						logger.Warnf(updateCtx, "live run cleanup failed for session %s: %v", sessionID, err)
+					}
+				} else {
+					h.completeAssistantMessage(updateCtx, streamCtx.assistantMessage, reqCtx.query, reqCtx.userMessageID)
+				}
 				logger.Infof(streamCtx.asyncCtx, "Agent QA service completed for session: %s", sessionID)
 			}
 		}()
@@ -1068,6 +1239,11 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 			}
 		}
 	}()
+
+	if reqCtx.skipSSE {
+		<-asyncDone
+		return
+	}
 
 	// Handle SSE events (blocking)
 	shouldWaitForTitle := generateTitle && reqCtx.session.Title == ""
@@ -1402,6 +1578,7 @@ func (h *Handler) persistLastRequestState(parentCtx context.Context, reqCtx *qaR
 		AgentID:          reqCtx.reqAgentID,
 		AgentEnabled:     agentEnabled,
 		ModelID:          reqCtx.summaryModelID,
+		ReasoningEffort:  reqCtx.reasoningEffort,
 		KnowledgeBaseIDs: reqCtx.knowledgeBaseIDs,
 		KnowledgeIDs:     reqCtx.knowledgeIDs,
 		TagIDs:           reqCtx.tagIDs,
@@ -1425,19 +1602,81 @@ func appendQuickAnswerReasoning(msg *types.Message, content string) {
 	ensureQuickAnswerStep(msg).ReasoningContent += content
 }
 
+// completeQuickAnswerTurn persists a completed KnowledgeQA turn before its
+// stream handler publishes the completion event used to fetch artifacts.
+func (h *Handler) completeQuickAnswerTurn(
+	ctx context.Context, streamCtx *sseStreamContext, query, userMessageID string,
+) {
+	if streamCtx == nil || streamCtx.assistantMessage == nil {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	if streamCtx.eventBus != nil {
+		_ = streamCtx.eventBus.Emit(ctx, event.Event{
+			Type: event.EventAgentComplete, SessionID: streamCtx.assistantMessage.SessionID,
+			Data: event.AgentCompleteData{MessageID: streamCtx.assistantMessage.ID},
+		})
+	}
+	h.completeStreamAssistantMessage(ctx, streamCtx, query, userMessageID)
+	if streamCtx.releaseTurn != nil {
+		streamCtx.releaseTurn()
+	}
+}
+
+func (h *Handler) sessionTenantInfoContext(ctx context.Context) (context.Context, bool) {
+	tenantID, _ := types.TenantIDFromContext(ctx)
+	if info, ok := types.TenantInfoFromContext(ctx); ok && info != nil && info.ID == tenantID {
+		return ctx, true
+	}
+	if tenantID == 0 || h.tenantService == nil {
+		return ctx, false
+	}
+	tenant, err := h.tenantService.GetTenantByID(ctx, tenantID)
+	if err != nil || tenant == nil {
+		logger.Warnf(ctx, "Skipping chat history index: session tenant %d unavailable: %v", tenantID, err)
+		return ctx, false
+	}
+	return context.WithValue(ctx, types.TenantInfoContextKey, tenant), true
+}
+
+func (h *Handler) completeStreamAssistantMessage(
+	ctx context.Context, streamCtx *sseStreamContext, query, userMessageID string,
+) {
+	if err := h.completeAssistantMessage(ctx, streamCtx.assistantMessage, query, userMessageID); err != nil {
+		if streamCtx.streamHandler != nil {
+			_ = streamCtx.streamHandler.handleError(ctx, event.Event{
+				ID: uuid.New().String(), Type: event.EventError,
+				SessionID: streamCtx.assistantMessage.SessionID,
+				Data:      event.ErrorData{Stage: "message_persistence", Error: "Failed to save assistant message"},
+			})
+		}
+		return
+	}
+	if streamCtx.streamHandler != nil {
+		if err := streamCtx.streamHandler.publishCompletion(ctx); err != nil {
+			logger.Errorf(ctx, "Append persisted message completion failed: %v", err)
+		}
+	}
+}
+
 // completeAssistantMessage marks an assistant message as complete, updates it,
-// and asynchronously indexes the Q&A pair into the chat history knowledge base.
+// and asynchronously indexes the Q&A pair into the session owner's chat history.
 func (h *Handler) completeAssistantMessage(
 	ctx context.Context, assistantMessage *types.Message, userQuery, userMessageID string,
-) {
+) error {
 	assistantMessage.UpdatedAt = time.Now()
 	assistantMessage.IsCompleted = true
-	_ = h.messageService.UpdateMessage(ctx, assistantMessage)
+	if err := h.messageService.UpdateMessage(ctx, assistantMessage); err != nil {
+		logger.Errorf(ctx, "Failed to persist assistant message %s: %v", assistantMessage.ID, err)
+		return err
+	}
 
 	// Asynchronously index the Q&A pair into the chat history knowledge base for vector search.
 	// Use WithoutCancel so the goroutine survives after the HTTP request context is done.
 	bgCtx := context.WithoutCancel(ctx)
-	go h.messageService.IndexMessageToKB(bgCtx, userQuery, assistantMessage.Content, assistantMessage.ID, assistantMessage.SessionID)
+	if indexCtx, ok := h.sessionTenantInfoContext(bgCtx); ok {
+		go h.messageService.IndexMessageToKB(indexCtx, userQuery, assistantMessage.Content, assistantMessage.ID, assistantMessage.SessionID)
+	}
 	if userQuery != "" && h.suggestionService != nil {
 		go func() {
 			if _, err := h.suggestionService.EnsureFollowUps(
@@ -1450,6 +1689,7 @@ func (h *Handler) completeAssistantMessage(
 	if userQuery != "" {
 		go h.recordTurnMemory(bgCtx, assistantMessage, userQuery, userMessageID)
 	}
+	return nil
 }
 
 // recordTurnMemory runs the long-term memory write path for a finished turn.

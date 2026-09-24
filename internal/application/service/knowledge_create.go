@@ -1460,6 +1460,7 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 	// released the previous run's claims, so a republished document keeps the
 	// files its new body still references.
 	s.bindContentResources(ctx, knowledge.TenantID, knowledge.ID, clean)
+	s.bindStoredImages(ctx, knowledge, resolvedImages)
 
 	// Keep manually entered CRLF text aligned with the LF values sent by the
 	// chunking preview endpoint.

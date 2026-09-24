@@ -15,16 +15,16 @@ import (
 // as the reference oracle for the incremental implementation.
 func (t *KnowledgeSearchTool) applyMMRNaive(
 	ctx context.Context,
-	results []*searchResultWithMeta,
+	results []*legacySearchResultWithMeta,
 	k int,
 	lambda float64,
-) []*searchResultWithMeta {
+) []*legacySearchResultWithMeta {
 	if k <= 0 || len(results) == 0 {
 		return nil
 	}
 
-	selected := make([]*searchResultWithMeta, 0, k)
-	candidates := make([]*searchResultWithMeta, len(results))
+	selected := make([]*legacySearchResultWithMeta, 0, k)
+	candidates := make([]*legacySearchResultWithMeta, len(results))
 	copy(candidates, results)
 
 	tokenSets := make([]map[string]struct{}, len(candidates))
@@ -58,17 +58,17 @@ func (t *KnowledgeSearchTool) applyMMRNaive(
 	return selected
 }
 
-// mmrTestCorpus builds a deterministic candidate set whose passages share
+// legacyKnowledgeSearchMMRTestCorpus builds a deterministic candidate set whose passages share
 // vocabulary in overlapping bands, so redundancy actually drives selection
 // instead of the score alone.
-func mmrTestCorpus(n int) []*searchResultWithMeta {
+func legacyKnowledgeSearchMMRTestCorpus(n int) []*legacySearchResultWithMeta {
 	vocab := []string{
 		"insurance", "policy", "claim", "premium", "deductible", "liability",
 		"coverage", "endorsement", "underwriting", "reinsurance", "subrogation",
 		"indemnity", "exclusion", "rider", "annuity",
 	}
 
-	results := make([]*searchResultWithMeta, 0, n)
+	results := make([]*legacySearchResultWithMeta, 0, n)
 	// Simple LCG so the corpus is identical on every run and every platform.
 	state := uint64(42)
 	next := func(mod int) int {
@@ -83,7 +83,7 @@ func mmrTestCorpus(n int) []*searchResultWithMeta {
 			words = append(words, ' ')
 		}
 		content := fmt.Sprintf("chunk %d %s", i, string(words))
-		results = append(results, &searchResultWithMeta{
+		results = append(results, &legacySearchResultWithMeta{
 			SearchResult: &types.SearchResult{
 				ID:          fmt.Sprintf("chunk-%03d", i),
 				Content:     content,
@@ -99,12 +99,12 @@ func mmrTestCorpus(n int) []*searchResultWithMeta {
 	return results
 }
 
-func TestApplyMMR_matchesNaiveSelection(t *testing.T) {
+func TestLegacyKnowledgeSearchApplyMMR_matchesNaiveSelection(t *testing.T) {
 	t.Parallel()
 
 	tool := &KnowledgeSearchTool{}
 	ctx := context.Background()
-	results := mmrTestCorpus(40)
+	results := legacyKnowledgeSearchMMRTestCorpus(40)
 
 	for _, tc := range []struct {
 		k      int
@@ -133,13 +133,13 @@ func TestApplyMMR_matchesNaiveSelection(t *testing.T) {
 	}
 }
 
-func TestApplyMMR_emptyAndNonPositiveK(t *testing.T) {
+func TestLegacyKnowledgeSearchApplyMMR_emptyAndNonPositiveK(t *testing.T) {
 	t.Parallel()
 
 	tool := &KnowledgeSearchTool{}
 	ctx := context.Background()
 
-	if got := tool.applyMMR(ctx, mmrTestCorpus(3), 0, 0.7); got != nil {
+	if got := tool.applyMMR(ctx, legacyKnowledgeSearchMMRTestCorpus(3), 0, 0.7); got != nil {
 		t.Fatalf("expected nil for k=0, got %d results", len(got))
 	}
 	if got := tool.applyMMR(ctx, nil, 5, 0.7); got != nil {
@@ -147,10 +147,10 @@ func TestApplyMMR_emptyAndNonPositiveK(t *testing.T) {
 	}
 }
 
-func BenchmarkApplyMMR(b *testing.B) {
+func BenchmarkLegacyKnowledgeSearchApplyMMR(b *testing.B) {
 	tool := &KnowledgeSearchTool{}
 	ctx := context.Background()
-	results := mmrTestCorpus(250)
+	results := legacyKnowledgeSearchMMRTestCorpus(250)
 
 	b.Run("incremental", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {

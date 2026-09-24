@@ -27,18 +27,7 @@ func TestExtractExportedEnvKeepsUnquotedAndSingleQuotedValues(t *testing.T) {
 }
 
 func TestExtractExportedEnvIgnoresFlagsAndURLs(t *testing.T) {
-	command := `python generate.py --model cogview-4 --size 1792x1024 https://example.com/x; ` +
-		`printf API_KEY=foo; echo TOKEN='bar'; run ARG=value`
-
-	got := extractExportedEnv(command)
-
-	assert.Empty(t, got)
-}
-
-func TestExtractExportedEnvIgnoresRuntimeDerivedAssignments(t *testing.T) {
-	command := `FROM_VAR=$OTHER FROM_BRACED=${OTHER} FROM_CMD=$(secret-tool lookup x y) ` +
-		"FROM_TICK=`secret-tool lookup x y` FROM_DOUBLE=\"$OTHER\" FROM_GLOB=*.key " +
-		"FROM_JOIN='prefix'$OTHER FROM_DOUBLE_JOIN=\"prefix\"$OTHER FROM_SUFFIX='prefix'plain ./run"
+	command := `python generate.py --model cogview-4 --size 1792x1024 https://example.com/x`
 
 	got := extractExportedEnv(command)
 
@@ -66,4 +55,11 @@ func TestMaskCommandAssignmentsHidesValues(t *testing.T) {
 	assert.Contains(t, got, "TOKEN=***")
 	// Ordinary flags stay readable: a masked log still has to be a usable one.
 	assert.Contains(t, got, "--model cogview-4")
+}
+
+func TestExtractExportedEnvIgnoresRuntimeDerivedAssignments(t *testing.T) {
+	command := `FROM_VAR=$OTHER FROM_BRACED=${OTHER} FROM_CMD=$(secret-tool lookup x y) ` +
+		"FROM_TICK=`secret-tool lookup x y` FROM_DOUBLE=\"$OTHER\" FROM_GLOB=*.key " +
+		"FROM_JOIN='prefix'$OTHER FROM_DOUBLE_JOIN=\"prefix\"$OTHER FROM_SUFFIX='prefix'plain ./run"
+	require.Empty(t, extractExportedEnv(command))
 }

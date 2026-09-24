@@ -99,9 +99,10 @@ func reloadKnowledgeErrorMessage(t *testing.T, db *gorm.DB, id string) string {
 	return msg
 }
 
-func insertKnowledgeWithStatus(t *testing.T, db *gorm.DB, status string, deleted bool) string {
+func insertKnowledgeWithStatus(t *testing.T, db *gorm.DB, status string, deleted bool) (string, string) {
 	t.Helper()
 	id := uuid.New().String()
+	kbID := uuid.New().String()
 	deletedAt := interface{}(nil)
 	if deleted {
 		deletedAt = "2026-06-16 12:00:00"
@@ -109,8 +110,8 @@ func insertKnowledgeWithStatus(t *testing.T, db *gorm.DB, status string, deleted
 	require.NoError(t, db.Exec(`
 		INSERT INTO knowledges (id, tenant_id, knowledge_base_id, type, title, source, parse_status, deleted_at)
 		VALUES (?, 1, ?, 'document', 'delete-test', 'manual', ?, ?)
-	`, id, uuid.New().String(), status, deletedAt).Error)
-	return id
+	`, id, kbID, status, deletedAt).Error)
+	return id, kbID
 }
 
 // TestFinalizeSubtask_Concurrent_RemainsBarrierOnly verifies that the legacy
@@ -360,24 +361,24 @@ func TestUpdateActiveDeletingKnowledgeColumns_GuardsStateAndSoftDelete(t *testin
 	repo := NewKnowledgeRepository(db).(*knowledgeRepository)
 	ctx := context.Background()
 
-	activeDeletingID := insertKnowledgeWithStatus(t, db, types.ParseStatusDeleting, false)
-	activeCompletedID := insertKnowledgeWithStatus(t, db, types.ParseStatusCompleted, false)
-	deletedDeletingID := insertKnowledgeWithStatus(t, db, types.ParseStatusDeleting, true)
+	activeDeletingID, activeDeletingKBID := insertKnowledgeWithStatus(t, db, types.ParseStatusDeleting, false)
+	activeCompletedID, activeCompletedKBID := insertKnowledgeWithStatus(t, db, types.ParseStatusCompleted, false)
+	deletedDeletingID, deletedDeletingKBID := insertKnowledgeWithStatus(t, db, types.ParseStatusDeleting, true)
 
-	updated, err := repo.UpdateActiveDeletingKnowledgeColumns(ctx, activeDeletingID, map[string]interface{}{
+	updated, err := repo.UpdateActiveDeletingKnowledgeColumns(ctx, 1, activeDeletingKBID, activeDeletingID, map[string]interface{}{
 		"parse_status":  types.ParseStatusFailed,
 		"error_message": "delete task exhausted retries",
 	})
 	require.NoError(t, err)
 	assert.True(t, updated)
 
-	updated, err = repo.UpdateActiveDeletingKnowledgeColumns(ctx, activeCompletedID, map[string]interface{}{
+	updated, err = repo.UpdateActiveDeletingKnowledgeColumns(ctx, 1, activeCompletedKBID, activeCompletedID, map[string]interface{}{
 		"parse_status": types.ParseStatusFailed,
 	})
 	require.NoError(t, err)
 	assert.False(t, updated)
 
-	updated, err = repo.UpdateActiveDeletingKnowledgeColumns(ctx, deletedDeletingID, map[string]interface{}{
+	updated, err = repo.UpdateActiveDeletingKnowledgeColumns(ctx, 1, deletedDeletingKBID, deletedDeletingID, map[string]interface{}{
 		"parse_status": types.ParseStatusFailed,
 	})
 	require.NoError(t, err)

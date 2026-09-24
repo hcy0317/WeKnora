@@ -106,23 +106,25 @@ type ConversationConfig struct {
 	Summary              *SummaryConfig `yaml:"summary"                          json:"summary"`
 
 	// Prompt template ID fields — resolved to text by backfillConversationDefaults
-	FallbackPromptID             string `yaml:"fallback_prompt_id"                json:"fallback_prompt_id"`
-	RewritePromptID              string `yaml:"rewrite_prompt_id"                 json:"rewrite_prompt_id"`
-	GenerateSessionTitlePromptID string `yaml:"generate_session_title_prompt_id"  json:"generate_session_title_prompt_id"`
-	GenerateSummaryPromptID      string `yaml:"generate_summary_prompt_id"        json:"generate_summary_prompt_id"`
-	ExtractEntitiesPromptID      string `yaml:"extract_entities_prompt_id"        json:"extract_entities_prompt_id"`
-	ExtractRelationshipsPromptID string `yaml:"extract_relationships_prompt_id"   json:"extract_relationships_prompt_id"`
-	GenerateQuestionsPromptID    string `yaml:"generate_questions_prompt_id"      json:"generate_questions_prompt_id"`
+	FallbackPromptID              string `yaml:"fallback_prompt_id"                json:"fallback_prompt_id"`
+	RewritePromptID               string `yaml:"rewrite_prompt_id"                 json:"rewrite_prompt_id"`
+	GenerateSessionTitlePromptID  string `yaml:"generate_session_title_prompt_id"  json:"generate_session_title_prompt_id"`
+	GenerateSummaryPromptID       string `yaml:"generate_summary_prompt_id"        json:"generate_summary_prompt_id"`
+	ExtractEntitiesPromptID       string `yaml:"extract_entities_prompt_id"        json:"extract_entities_prompt_id"`
+	ExtractRelationshipsPromptID  string `yaml:"extract_relationships_prompt_id"   json:"extract_relationships_prompt_id"`
+	GenerateQuestionsPromptID     string `yaml:"generate_questions_prompt_id"      json:"generate_questions_prompt_id"`
+	GenerateKBDescriptionPromptID string `yaml:"generate_kb_description_prompt_id" json:"generate_kb_description_prompt_id"` //nolint:lll // one-line struct tag
 
 	// Resolved prompt text fields (populated by backfill, not from YAML)
-	FallbackPrompt             string `yaml:"-" json:"fallback_prompt"`
-	RewritePromptSystem        string `yaml:"-" json:"rewrite_prompt_system"`
-	RewritePromptUser          string `yaml:"-" json:"rewrite_prompt_user"`
-	GenerateSessionTitlePrompt string `yaml:"-" json:"generate_session_title_prompt"`
-	GenerateSummaryPrompt      string `yaml:"-" json:"generate_summary_prompt"`
-	ExtractEntitiesPrompt      string `yaml:"-" json:"extract_entities_prompt"`
-	ExtractRelationshipsPrompt string `yaml:"-" json:"extract_relationships_prompt"`
-	GenerateQuestionsPrompt    string `yaml:"-" json:"generate_questions_prompt"`
+	FallbackPrompt              string `yaml:"-" json:"fallback_prompt"`
+	RewritePromptSystem         string `yaml:"-" json:"rewrite_prompt_system"`
+	RewritePromptUser           string `yaml:"-" json:"rewrite_prompt_user"`
+	GenerateSessionTitlePrompt  string `yaml:"-" json:"generate_session_title_prompt"`
+	GenerateSummaryPrompt       string `yaml:"-" json:"generate_summary_prompt"`
+	ExtractEntitiesPrompt       string `yaml:"-" json:"extract_entities_prompt"`
+	ExtractRelationshipsPrompt  string `yaml:"-" json:"extract_relationships_prompt"`
+	GenerateQuestionsPrompt     string `yaml:"-" json:"generate_questions_prompt"`
+	GenerateKBDescriptionPrompt string `yaml:"-" json:"generate_kb_description_prompt"`
 
 	// IntentSystemPrompts maps intent values (e.g. "greeting", "chitchat") to
 	// system prompt text. Populated by backfill from IntentPrompts templates.
@@ -279,7 +281,8 @@ type AuthConfig struct {
 	// create_personal preserves the historical one-user-one-workspace default;
 	// tenantless creates only the identity and waits for an invitation or an
 	// explicit self-service tenant creation.
-	DefaultTenantMode string `yaml:"default_tenant_mode" json:"default_tenant_mode"`
+	DefaultTenantMode      string `yaml:"default_tenant_mode" json:"default_tenant_mode"`
+	ComplexPasswordEnabled bool   `yaml:"complex_password_enabled" json:"complex_password_enabled"`
 }
 
 // AuthRegistrationMode constants used by handlers and middleware.
@@ -316,6 +319,7 @@ type OIDCAuthConfig struct {
 	AuthorizationEndpoint string               `yaml:"authorization_endpoint" json:"authorization_endpoint"`
 	TokenEndpoint         string               `yaml:"token_endpoint"         json:"token_endpoint"`
 	UserInfoEndpoint      string               `yaml:"user_info_endpoint"     json:"user_info_endpoint"`
+	JwksURI               string               `yaml:"jwks_uri"               json:"jwks_uri"`
 	Scopes                []string             `yaml:"scopes"                 json:"scopes"`
 	UserInfoMapping       *OIDCUserInfoMapping `yaml:"user_info_mapping"      json:"user_info_mapping"`
 }
@@ -718,6 +722,9 @@ func applyOIDCEnvOverrides(cfg *Config) {
 	if value := strings.TrimSpace(os.Getenv("OIDC_AUTH_USER_INFO_ENDPOINT")); value != "" {
 		cfg.OIDCAuth.UserInfoEndpoint = value
 	}
+	if value := strings.TrimSpace(os.Getenv("OIDC_AUTH_JWKS_URI")); value != "" {
+		cfg.OIDCAuth.JwksURI = value
+	}
 	if value := strings.TrimSpace(os.Getenv("OIDC_AUTH_SCOPES")); value != "" {
 		cfg.OIDCAuth.Scopes = strings.Fields(strings.ReplaceAll(value, ",", " "))
 	}
@@ -843,6 +850,11 @@ func applyAuthAndTenantDefaults(cfg *Config) {
 
 	if strings.TrimSpace(cfg.Auth.RegistrationMode) == "" {
 		cfg.Auth.RegistrationMode = AuthRegistrationModeSelfServe
+	}
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_COMPLEX_PASSWORD_ENABLED")); value != "" {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			cfg.Auth.ComplexPasswordEnabled = parsed
+		}
 	}
 	if value := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_DEFAULT_TENANT_MODE")); value != "" {
 		cfg.Auth.DefaultTenantMode = value
@@ -985,6 +997,13 @@ func backfillConversationDefaults(cfg *Config) {
 			conv.GenerateQuestionsPrompt = t.Content
 		} else {
 			fmt.Printf("Warning: generate_questions_prompt_id %q not found\n", conv.GenerateQuestionsPromptID)
+		}
+	}
+	if conv.GenerateKBDescriptionPromptID != "" {
+		if t := FindTemplateByID(pt, conv.GenerateKBDescriptionPromptID); t != nil {
+			conv.GenerateKBDescriptionPrompt = t.Content
+		} else {
+			fmt.Printf("Warning: generate_kb_description_prompt_id %q not found\n", conv.GenerateKBDescriptionPromptID)
 		}
 	}
 	if conv.Summary != nil {

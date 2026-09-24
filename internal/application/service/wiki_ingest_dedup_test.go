@@ -751,3 +751,45 @@ func TestDeduplicateExtractedBatchKeepsDeterministicCrossTypeFallback(t *testing
 		t.Fatalf("fresh deterministic fallback was lost: entities=%#v concepts=%#v", entities, concepts)
 	}
 }
+
+func TestExactIdentityTargetPrefersSameType(t *testing.T) {
+	item := extractedItem{Name: "孔子", Slug: "entity/kong-zi"}
+	pages := map[string]*types.WikiPageLite{
+		"entity/confucius": {
+			Slug: "entity/confucius", Title: "孔 子", PageType: types.WikiPageTypeEntity,
+		},
+		"concept/confucius": {
+			Slug: "concept/confucius", Title: "孔子", PageType: types.WikiPageTypeConcept,
+		},
+	}
+	candidates := map[string]bool{"entity/confucius": true, "concept/confucius": true}
+	if got := exactIdentityTarget(item, types.WikiPageTypeEntity, candidates, pages); got != "entity/confucius" {
+		t.Fatalf("exactIdentityTarget = %q, want entity/confucius", got)
+	}
+}
+
+func TestExactIdentityTargetCrossTypeFallback(t *testing.T) {
+	item := extractedItem{Name: "孔子", Slug: "entity/kong-zi"}
+	pages := map[string]*types.WikiPageLite{
+		"concept/confucius": {
+			Slug: "concept/confucius", Title: "孔子", PageType: types.WikiPageTypeConcept,
+		},
+	}
+	candidates := map[string]bool{"concept/confucius": true}
+	if got := exactIdentityTarget(item, types.WikiPageTypeEntity, candidates, pages); got != "concept/confucius" {
+		t.Fatalf("exactIdentityTarget = %q, want concept/confucius", got)
+	}
+
+	pages["entity/confucius"] = &types.WikiPageLite{
+		Slug: "entity/confucius", Title: "孔 子", PageType: types.WikiPageTypeEntity,
+	}
+	candidates["entity/confucius"] = true
+	if got := exactIdentityTarget(item, types.WikiPageTypeEntity, candidates, pages); got != "entity/confucius" {
+		t.Fatalf("exactIdentityTarget = %q, want same-type entity/confucius", got)
+	}
+
+	other := extractedItem{Name: "孟子", Slug: "entity/mencius"}
+	if got := exactIdentityTarget(other, types.WikiPageTypeEntity, candidates, pages); got != "" {
+		t.Fatalf("exactIdentityTarget = %q, want empty for unrelated title", got)
+	}
+}

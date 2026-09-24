@@ -8,9 +8,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestWriteKnowledgeMetadataHeaderDeduplicatesByKnowledge(t *testing.T) {
+func TestLegacyKnowledgeSearchMetadataHeaderDeduplicatesByKnowledge(t *testing.T) {
 	t.Parallel()
-	results := []*searchResultWithMeta{
+	results := []*legacySearchResultWithMeta{
 		{
 			SearchResult: &types.SearchResult{
 				KnowledgeID: "knowledge-1", KnowledgeTitle: "Document <One>",
@@ -41,7 +41,7 @@ func TestWriteKnowledgeMetadataHeaderDeduplicatesByKnowledge(t *testing.T) {
 	}
 
 	var output strings.Builder
-	writeKnowledgeMetadataHeader(&output, results)
+	writeLegacyKnowledgeMetadataHeader(&output, results)
 	text := output.String()
 
 	require.Equal(t, 1, strings.Count(text, `knowledge_id="knowledge-1"`))
@@ -52,10 +52,10 @@ func TestWriteKnowledgeMetadataHeaderDeduplicatesByKnowledge(t *testing.T) {
 	require.Contains(t, text, "Shanghai &amp; Suzhou")
 }
 
-func TestWriteKnowledgeMetadataHeaderOmitsEmptySection(t *testing.T) {
+func TestLegacyKnowledgeSearchMetadataHeaderOmitsEmptySection(t *testing.T) {
 	t.Parallel()
 	var output strings.Builder
-	writeKnowledgeMetadataHeader(&output, []*searchResultWithMeta{{
+	writeLegacyKnowledgeMetadataHeader(&output, []*legacySearchResultWithMeta{{
 		SearchResult: &types.SearchResult{KnowledgeID: "knowledge-1"},
 	}})
 	require.Empty(t, output.String())

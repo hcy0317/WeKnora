@@ -1625,17 +1625,18 @@ func (h *InitializationHandler) buildConfigResponse(ctx context.Context, models 
 // 所有 provider/model 通用字段都在这里集中声明；若未来新增字段（比如现在的
 // custom_headers），只需改一处，生产路径和测试路径会同时生效。
 type ModelTestRequest struct {
-	ModelType                 string            `json:"modelType,omitempty"`
-	Source                    string            `json:"source"` // 为空时按需默认为 "remote"
-	ModelName                 string            `json:"modelName" binding:"required"`
-	BaseURL                   string            `json:"baseUrl"`
-	APIKey                    string            `json:"apiKey"`
-	Provider                  string            `json:"provider"`
-	InterfaceType             string            `json:"interfaceType,omitempty"`
-	Dimension                 int               `json:"dimension,omitempty"`
-	SupportsDimensionOverride bool              `json:"supportsDimensionOverride,omitempty"`
-	CustomHeaders             map[string]string `json:"customHeaders,omitempty"`
-	ExtraConfig               map[string]string `json:"extraConfig,omitempty"`
+	ModelType                 string                   `json:"modelType,omitempty"`
+	Source                    string                   `json:"source"` // 为空时按需默认为 "remote"
+	ModelName                 string                   `json:"modelName" binding:"required"`
+	BaseURL                   string                   `json:"baseUrl"`
+	APIKey                    string                   `json:"apiKey"`
+	Provider                  string                   `json:"provider"`
+	InterfaceType             string                   `json:"interfaceType,omitempty"`
+	Dimension                 int                      `json:"dimension,omitempty"`
+	SupportsDimensionOverride bool                     `json:"supportsDimensionOverride,omitempty"`
+	CustomHeaders             map[string]string        `json:"customHeaders,omitempty"`
+	ExtraConfig               map[string]string        `json:"extraConfig,omitempty"`
+	Spec                      *types.ModelSpecOverride `json:"spec,omitempty"`
 	// AppSecret 用于 LKEAP / Volcengine Rerank 等需要第二段密钥的场景（对应模型 Parameters.AppSecret）。
 	AppSecret string `json:"appSecret,omitempty"`
 	// ModelID, when set, instructs the handler to substitute any missing

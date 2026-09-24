@@ -11,20 +11,37 @@ import (
 
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
 // SkillCatalogInstallView is one installation of a catalog skill onto a sandbox.
 type SkillCatalogInstallView struct {
-	SkillID           string    `json:"skill_id,omitempty"`
-	SandboxConfigID   string    `json:"sandbox_config_id"`
-	SandboxConfigName string    `json:"sandbox_config_name,omitempty"`
-	SandboxType       string    `json:"sandbox_type,omitempty"`
-	Status            string    `json:"status"`
-	Enabled           bool      `json:"enabled"`
-	Error             string    `json:"error,omitempty"`
-	BundleSHA256      string    `json:"bundle_sha256,omitempty"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	SkillID           string           `json:"skill_id,omitempty"`
+	SandboxConfigID   string           `json:"sandbox_config_id"`
+	SandboxConfigName string           `json:"sandbox_config_name,omitempty"`
+	SandboxType       string           `json:"sandbox_type,omitempty"`
+	Status            string           `json:"status"`
+	Enabled           bool             `json:"enabled"`
+	Error             string           `json:"error,omitempty"`
+	BundleSHA256      string           `json:"bundle_sha256,omitempty"`
+	Served            *SkillServedInfo `json:"served,omitempty"`
+	UpdatedAt         time.Time        `json:"updated_at"`
+}
+
+type SkillServedInfo struct {
+	Version string `json:"version,omitempty"`
+}
+
+func ServedInfoOf(row *types.TenantSkillEntity) *SkillServedInfo {
+	if row == nil || row.Status == types.SkillStatusReady {
+		return nil
+	}
+	view := row.ServedView()
+	if view == nil {
+		return nil
+	}
+	return &SkillServedInfo{Version: view.Version}
 }
 
 // SkillCatalogView is a tenant skill definition plus its sandbox installations.
@@ -72,6 +89,9 @@ func (s *TenantSkillService) ListCatalog(
 	unattached := make([]*types.TenantSkillEntity, 0)
 	for _, row := range installs {
 		if row == nil {
+			continue
+		}
+		if s.host.Desktop && !sandbox.IsHostSkillTarget(row.SandboxConfigID) {
 			continue
 		}
 		if row.CatalogID != "" {
@@ -179,7 +199,13 @@ func installView(
 		Enabled:         row.Enabled,
 		Error:           row.Error,
 		BundleSHA256:    row.BundleSHA256,
+		Served:          ServedInfoOf(row),
 		UpdatedAt:       row.UpdatedAt,
+	}
+	if sandbox.IsHostSkillTarget(row.SandboxConfigID) {
+		v.SandboxConfigName = hostSkillTargetName
+		v.SandboxType = string(sandbox.SandboxTypeHost)
+		return v
 	}
 	if cfg := configByID[row.SandboxConfigID]; cfg != nil {
 		v.SandboxConfigName = cfg.Name

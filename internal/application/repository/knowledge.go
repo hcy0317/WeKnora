@@ -910,15 +910,18 @@ func (r *knowledgeRepository) UpdateKnowledgeColumns(
 // to normal queries and have not moved out of the transient deleting state.
 func (r *knowledgeRepository) UpdateActiveDeletingKnowledgeColumns(
 	ctx context.Context,
+	tenantID uint64,
+	kbID string,
 	id string,
 	values map[string]interface{},
 ) (bool, error) {
-	if len(values) == 0 {
+	if tenantID == 0 || kbID == "" || len(values) == 0 {
 		return false, nil
 	}
 	result := r.db.WithContext(ctx).
 		Model(&types.Knowledge{}).
-		Where("id = ? AND parse_status = ?", id, types.ParseStatusDeleting).
+		Where("tenant_id = ? AND knowledge_base_id = ? AND id = ? AND parse_status = ?",
+			tenantID, kbID, id, types.ParseStatusDeleting).
 		Updates(values)
 	if result.Error != nil {
 		return false, result.Error
@@ -1016,6 +1019,42 @@ func (r *knowledgeRepository) FinalizeSubtaskForAttempt(
 		return nil
 	})
 	return newCount, false, err
+}
+
+// CompleteProcessingWithoutSubtasks atomically completes a processing row
+// when the post-process phase has no asynchronous work to enqueue.
+func (r *knowledgeRepository) CompleteProcessingWithoutSubtasks(
+	ctx context.Context, id string,
+) (bool, error) {
+	now := time.Now()
+	res := r.db.WithContext(ctx).Model(&types.Knowledge{}).
+		Where("id = ? AND parse_status = ?", id, types.ParseStatusProcessing).
+		Updates(map[string]interface{}{
+			"parse_status":           types.ParseStatusCompleted,
+			"summary_status":         types.SummaryStatusNone,
+			"pending_subtasks_count": 0,
+			"error_message":          "",
+			"processed_at":           now,
+			"updated_at":             now,
+		})
+	return res.RowsAffected > 0, res.Error
+}
+
+func (r *knowledgeRepository) ListKnowledgeProfileRows(
+	ctx context.Context, tenantID uint64, kbID string,
+) ([]*types.KnowledgeProfileRow, error) {
+	var rows []*types.KnowledgeProfileRow
+	err := r.db.WithContext(ctx).Model(&types.Knowledge{}).
+		Select("id", "title", "file_name", "file_type", "folder_path", "created_at", "profile").
+		Where("tenant_id = ? AND knowledge_base_id = ?", tenantID, kbID).
+		Where("parse_status IN ?", []string{types.ParseStatusCompleted, types.ParseStatusFinalizing}).
+		Where("enable_status = ?", "enabled").
+		Order("created_at ASC").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 // SetFinalizing atomically transitions a row from 'processing' to

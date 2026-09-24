@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/Tencent/WeKnora/internal/models/api"
 	"github.com/Tencent/WeKnora/internal/models/provider"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/stretchr/testify/assert"
@@ -268,13 +269,16 @@ data: {"type":"message_stop"}
 }
 
 func TestNewRemoteChat_AnthropicProvider(t *testing.T) {
-	chat, err := NewRemoteChat(&ChatConfig{
+	config := &ChatConfig{
 		Source:    types.ModelSourceRemote,
 		ModelName: "claude-sonnet-4-5",
 		APIKey:    "test-key",
 		Provider:  string(provider.ProviderAnthropic),
-	})
+	}
+	client, err := NewRemoteChat(config)
 	require.NoError(t, err)
-	_, ok := chat.(*AnthropicChat)
-	assert.True(t, ok)
+	assert.Equal(t, config.ModelName, client.GetModelName())
+	resolved, err := Resolve(config)
+	require.NoError(t, err)
+	assert.Equal(t, api.APIAnthropicMessages, resolved.API)
 }

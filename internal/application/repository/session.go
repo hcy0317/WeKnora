@@ -17,6 +17,20 @@ type sessionRepository struct {
 	db *gorm.DB
 }
 
+// webSessionPredicate selects the user's web-chat bucket. It excludes IM and
+// embed sessions plus API-key sessions while keeping legacy tenant-level rows.
+// Queries using it alias sessions as s and left-join im_channel_sessions as ics.
+const webSessionPredicate = "ics.id IS NULL AND (s.description = '' OR s.description NOT LIKE ?) " +
+	"AND (s.user_id IS NULL OR (s.user_id NOT LIKE ? AND s.user_id NOT LIKE ?))"
+
+func webSessionPredicateArgs() []any {
+	return []any{
+		types.EmbedSessionMarkerPrefix + "%",
+		types.SessionOwnerAPITenantKeyPrefix + "%",
+		types.SessionOwnerAPIExternalUserPrefix + "%",
+	}
+}
+
 func applySessionUserScope(db *gorm.DB, userID string) *gorm.DB {
 	if userID == "" {
 		return db
@@ -39,6 +53,37 @@ func (r *sessionRepository) Create(ctx context.Context, session *types.Session) 
 	}
 	// Return the session with generated ID
 	return session, nil
+}
+
+// CreateForked persists the forked session, copied message history and its
+// artifact-index rows in one transaction. SkipHooks preserves the IDs that the
+// fork service has already written into cross-referenced rows.
+func (r *sessionRepository) CreateForked(
+	ctx context.Context, session *types.Session, messages []*types.Message,
+) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		now := time.Now()
+		session.CreatedAt = now
+		session.UpdatedAt = now
+		if err := tx.Session(&gorm.Session{SkipHooks: true}).Create(session).Error; err != nil {
+			return err
+		}
+		if len(messages) == 0 {
+			return nil
+		}
+		if err := tx.Session(&gorm.Session{SkipHooks: true}).CreateInBatches(messages, 100).Error; err != nil {
+			return err
+		}
+		return insertMessageArtifacts(tx, messages)
+	})
+}
+
+func (r *sessionRepository) UpdateForkBootstrap(
+	ctx context.Context, sessionID string, bootstrap *types.ForkBootstrap,
+) error {
+	return r.db.WithContext(ctx).Unscoped().Model(&types.Session{}).
+		Where("id = ?", sessionID).
+		Update("fork_bootstrap", bootstrap).Error
 }
 
 // Get retrieves a session by ID
@@ -390,4 +435,119 @@ func (r *sessionRepository) DeleteAllByTenantID(ctx context.Context, tenantID ui
 		userID,
 	).Delete(&types.Session{})
 	return res.RowsAffected, res.Error
+}
+
+func (r *sessionRepository) CreateForkSnapshotLease(
+	ctx context.Context, lease *types.ForkSnapshotLease,
+) error {
+	if lease == nil || strings.TrimSpace(lease.SnapshotID) == "" {
+		return nil
+	}
+	if lease.CreatedAt.IsZero() {
+		lease.CreatedAt = time.Now().UTC()
+	}
+	return r.db.WithContext(ctx).Create(lease).Error
+}
+
+func (r *sessionRepository) DeleteForkSnapshotLease(ctx context.Context, snapshotID string) error {
+	snapshotID = strings.TrimSpace(snapshotID)
+	if snapshotID == "" {
+		return nil
+	}
+	return r.db.WithContext(ctx).
+		Where("snapshot_id = ?", snapshotID).
+		Delete(&types.ForkSnapshotLease{}).Error
+}
+
+func (r *sessionRepository) ListStaleForkSnapshotLeases(
+	ctx context.Context, olderThan time.Time,
+) ([]*types.ForkSnapshotLease, error) {
+	var leases []*types.ForkSnapshotLease
+	if err := r.db.WithContext(ctx).
+		Where("created_at <= ?", olderThan).
+		Find(&leases).Error; err != nil {
+		return nil, err
+	}
+	return leases, nil
+}
+
+// ListUnconsumedForks returns fork bootstraps the snapshot reaper should try
+// to retire: unopened forks older than the cutoff and consumed forks that
+// still name a snapshot. Soft-deleted sessions remain visible to this sweep.
+func (r *sessionRepository) ListUnconsumedForks(
+	ctx context.Context, olderThan time.Time,
+) ([]*types.Session, error) {
+	var sessions []*types.Session
+	if err := r.db.WithContext(ctx).Unscoped().
+		Model(&types.Session{}).
+		Select("id", "tenant_id", "sandbox_config_id", "fork_bootstrap", "deleted_at").
+		Where("fork_bootstrap IS NOT NULL").
+		Find(&sessions).Error; err != nil {
+		return nil, err
+	}
+	pending := make([]*types.Session, 0, len(sessions))
+	for _, session := range sessions {
+		if session == nil || session.ForkBootstrap == nil || strings.TrimSpace(session.ForkBootstrap.SnapshotID) == "" {
+			continue
+		}
+		if session.ForkBootstrap.Consumed() || !session.ForkBootstrap.CreatedAt.After(olderThan) {
+			pending = append(pending, session)
+		}
+	}
+	return pending, nil
+}
+
+func forkBootstrapJSONText(db *gorm.DB, key string) string {
+	if db.Name() == "postgres" {
+		return "fork_bootstrap ->> '" + key + "'"
+	}
+	return "json_extract(fork_bootstrap, '$." + key + "')"
+}
+
+func (r *sessionRepository) unconsumedForkSnapshotQuery(ctx context.Context, snapshotID string) *gorm.DB {
+	snapshotExpr := forkBootstrapJSONText(r.db, "snapshot_id")
+	consumedExpr := forkBootstrapJSONText(r.db, "consumed_at")
+	return r.db.WithContext(ctx).
+		Model(&types.Session{}).
+		Where("fork_bootstrap IS NOT NULL").
+		Where(snapshotExpr+" = ?", snapshotID).
+		Where(consumedExpr + " IS NULL")
+}
+
+func (r *sessionRepository) unconsumedForkSnapshotHolders(
+	ctx context.Context, snapshotID string,
+) ([]string, error) {
+	snapshotID = strings.TrimSpace(snapshotID)
+	if snapshotID == "" {
+		return nil, nil
+	}
+	var ids []string
+	if err := r.unconsumedForkSnapshotQuery(ctx, snapshotID).Pluck("id", &ids).Error; err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func (r *sessionRepository) HasOtherUnconsumedForkSnapshot(
+	ctx context.Context, snapshotID, excludeSessionID string,
+) (bool, error) {
+	snapshotID = strings.TrimSpace(snapshotID)
+	if snapshotID == "" {
+		return false, nil
+	}
+	query := r.unconsumedForkSnapshotQuery(ctx, snapshotID)
+	if excludeSessionID != "" {
+		query = query.Where("id <> ?", excludeSessionID)
+	}
+	var ids []string
+	if err := query.Limit(1).Pluck("id", &ids).Error; err != nil {
+		return false, err
+	}
+	return len(ids) > 0, nil
+}
+
+func (r *sessionRepository) UnconsumedForkSnapshotHolders(
+	ctx context.Context, snapshotID string,
+) ([]string, error) {
+	return r.unconsumedForkSnapshotHolders(ctx, snapshotID)
 }

@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/im"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/models/api"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -35,6 +37,7 @@ type CustomAgentHandler struct {
 	// sandboxConfigs validates an agent's sandbox backend selection. Optional —
 	// nil in partially-wired unit tests, where the selection is left unchecked.
 	sandboxConfigs sandboxConfigLookup
+	desktop        bool
 }
 
 // NewCustomAgentHandler creates a new custom agent handler instance
@@ -44,6 +47,7 @@ func NewCustomAgentHandler(
 	disabledRepo interfaces.TenantDisabledSharedAgentRepository,
 	userService interfaces.UserService,
 	sandboxConfigs *service.TenantSandboxConfigService,
+	host service.HostSandboxManager,
 ) *CustomAgentHandler {
 	return &CustomAgentHandler{
 		service:        service,
@@ -51,6 +55,7 @@ func NewCustomAgentHandler(
 		disabledRepo:   disabledRepo,
 		userService:    userService,
 		sandboxConfigs: sandboxConfigs,
+		desktop:        host.Desktop,
 	}
 }
 
@@ -66,7 +71,7 @@ type CreateAgentRequest struct {
 type UpdateAgentRequest struct {
 	Name        string                  `json:"name"`
 	Description string                  `json:"description"`
-	Avatar      string                  `json:"avatar"`
+	Avatar      *string                 `json:"avatar"`
 	Config      types.CustomAgentConfig `json:"config"`
 }
 
@@ -102,6 +107,10 @@ func (h *CustomAgentHandler) CreateAgent(c *gin.Context) {
 		c.Error(err)
 		return
 	}
+	if err := normalizeAgentReasoningEffort(&req.Config); err != nil {
+		_ = c.Error(err)
+		return
+	}
 
 	// Build agent object
 	agent := &types.CustomAgent{
@@ -111,6 +120,10 @@ func (h *CustomAgentHandler) CreateAgent(c *gin.Context) {
 		Config:      req.Config,
 	}
 	agent.EnsureDefaults()
+	if err := agent.ValidateAvatar(); err != nil {
+		_ = c.Error(errors.NewBadRequestError(err.Error()))
+		return
+	}
 	if err := agent.Config.QuestionSuggestions.Validate(); err != nil {
 		c.Error(errors.NewBadRequestError(err.Error()))
 		return
@@ -349,13 +362,23 @@ func (h *CustomAgentHandler) UpdateAgent(c *gin.Context) {
 		c.Error(err)
 		return
 	}
+	if err := normalizeAgentReasoningEffort(&req.Config); err != nil {
+		_ = c.Error(err)
+		return
+	}
+	if req.Avatar != nil {
+		if err := (&types.CustomAgent{Avatar: *req.Avatar}).ValidateAvatar(); err != nil {
+			logger.Error(ctx, "Invalid avatar", err)
+			_ = c.Error(errors.NewBadRequestError(err.Error()))
+			return
+		}
+	}
 
-	// Build agent object
+	// Keep avatar field presence separate from the agent config payload.
 	agent := &types.CustomAgent{
 		ID:          id,
 		Name:        req.Name,
 		Description: req.Description,
-		Avatar:      req.Avatar,
 		Config:      req.Config,
 	}
 	agent.EnsureDefaults()
@@ -368,7 +391,7 @@ func (h *CustomAgentHandler) UpdateAgent(c *gin.Context) {
 		secutils.SanitizeForLog(id), secutils.SanitizeForLog(req.Name))
 
 	// Update the agent
-	updatedAgent, err := h.service.UpdateAgent(ctx, agent)
+	updatedAgent, err := h.service.UpdateAgent(ctx, agent, req.Avatar)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"agent_id": id,
@@ -380,8 +403,10 @@ func (h *CustomAgentHandler) UpdateAgent(c *gin.Context) {
 			c.Error(errors.NewForbiddenError("Cannot modify built-in agent"))
 		case service.ErrAgentNameRequired:
 			c.Error(errors.NewBadRequestError(err.Error()))
+		case service.ErrAgentKBScopeNotShareable:
+			_ = c.Error(errors.NewForbiddenError(err.Error()))
 		default:
-			c.Error(errors.NewInternalServerError(err.Error()))
+			_ = c.Error(errors.NewInternalServerError("Failed to update agent"))
 		}
 		return
 	}
@@ -391,6 +416,20 @@ func (h *CustomAgentHandler) UpdateAgent(c *gin.Context) {
 		"success": true,
 		"data":    updatedAgent,
 	})
+}
+
+// normalizeAgentReasoningEffort validates and canonicalizes the stored value.
+func normalizeAgentReasoningEffort(cfg *types.CustomAgentConfig) error {
+	if cfg == nil || cfg.ReasoningEffort == "" {
+		return nil
+	}
+	level, ok := api.ParseReasoningEffort(cfg.ReasoningEffort)
+	if !ok {
+		return errors.NewBadRequestError(
+			fmt.Sprintf("reasoning_effort must be one of %v", api.AllReasoningEfforts))
+	}
+	cfg.ReasoningEffort = string(level)
+	return nil
 }
 
 // DeleteAgent godoc
@@ -675,6 +714,12 @@ func (h *CustomAgentHandler) validateAgentSandboxConfig(
 	ctx context.Context, cfg types.CustomAgentConfig,
 ) error {
 	configID := strings.TrimSpace(cfg.SandboxConfigID)
+	if h.desktop {
+		if configID != "" {
+			return errors.NewBadRequestError("Lite 不支持为智能体绑定沙箱配置")
+		}
+		return nil
+	}
 	if configID == "" || h.sandboxConfigs == nil {
 		// Empty means the deployment-wide default, which always exists.
 		return nil

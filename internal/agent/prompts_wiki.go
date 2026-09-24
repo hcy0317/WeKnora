@@ -402,6 +402,18 @@ The <new_information> block above is assembled from VERBATIM source chunks alrea
 
 Output the SUMMARY line first, then the updated Markdown content. Do not include any other preamble.`
 
+// WikiPageModifyContinuationPrompt resumes a page rewrite that the provider cut
+// off at the completion budget. The partial page is replayed as an assistant
+// turn, and this prompt requests only the remaining text.
+const WikiPageModifyContinuationPrompt = `Your previous message was cut off because it reached the output length limit, so the page is incomplete.
+
+Continue the SAME message from exactly where it stopped:
+1. Do NOT repeat anything you already wrote — not the SUMMARY line, headings, rows, or the opening of the row you were in the middle of.
+2. Your reply is appended verbatim to what you already wrote. Its first characters must continue exactly after the last character of your previous message. If you stopped in the middle of a Markdown table row, finish that row first.
+3. Keep the same structure, formatting, ordering, and language as the part you already wrote.
+4. Output the continuation ONLY: no preamble, apology, explanation, or closing code fence.
+5. If the page was already complete, reply with exactly: (complete)`
+
 // WikiIndexIntroPrompt generates the introduction for a NEW index page (first time only).
 const WikiIndexIntroPrompt = `You are a wiki editor. Write a brief introduction for a wiki knowledge base index page.
 

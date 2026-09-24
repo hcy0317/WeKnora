@@ -94,6 +94,15 @@ func RegisterSessionRoutes(
 		sessions.GET("/:id/artifacts", handler.ListSessionArtifacts)
 		sessions.GET("/:id/messages/:message_id/artifacts", handler.ListMessageArtifacts)
 		sessions.GET("/:id/messages/:message_id/artifacts/:index/download", handler.DownloadMessageArtifact)
+		// Deletion is owner-only inside the handler: shared-session read access
+		// must never grant permission to remove another tenant's stored file.
+		sessions.DELETE("/:id/messages/:message_id/artifacts/:index", handler.DeleteMessageArtifact)
+	}
+
+	artifacts := g.apiKeyGroup(r.Group("/artifacts", g.Viewer()), apiKeyChat(apiKeyFullAccess()))
+	{
+		artifacts.GET("", handler.ListArtifactLibrary)
+		artifacts.DELETE("", handler.DeleteLibraryArtifact)
 	}
 }
 
@@ -119,4 +128,15 @@ func RegisterChatRoutes(r *gin.RouterGroup, handler *session.Handler, g *rbacGua
 	{
 		knowledgeSearch.POST("", handler.SearchKnowledge)
 	}
+}
+
+// RegisterSandboxTerminalRoutes is registered before the global auth
+// middleware because browser WebSocket handshakes carry a session-bound ticket.
+func RegisterSandboxTerminalRoutes(r *gin.Engine, sessionHandler *session.Handler) {
+	r.GET("/api/v1/sessions/:id/sandbox/terminal", sessionHandler.SandboxTerminalWS)
+}
+
+// RegisterSandboxDesktopRoutes mounts the ticket-authenticated desktop relay.
+func RegisterSandboxDesktopRoutes(r *gin.Engine, sessionHandler *session.Handler) {
+	r.GET("/api/v1/sessions/:id/sandbox/desktop", sessionHandler.SandboxDesktopWS)
 }

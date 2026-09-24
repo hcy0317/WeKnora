@@ -19,8 +19,17 @@ var versionedSQLiteTables = []string{
 	"task_pending_ops",
 	"task_dead_letters",
 	"system_settings",
+	"model_catalog_configs",
 	"knowledge_processing_spans",
 	"knowledge_tag_relations",
+	"browser_devices",
+	"browser_pairings",
+	"browser_task_interruptions",
+	"memory_extraction_sessions",
+	"fork_snapshot_leases",
+	"mcp_endpoints",
+	"mcp_tool_approvals",
+	"message_artifacts",
 	"tenant_skills",
 	"tenant_skill_snapshots",
 	"tenant_user_env_vars",
@@ -28,21 +37,35 @@ var versionedSQLiteTables = []string{
 	"tenant_skill_bundle_ref_claims",
 }
 
-// versionedSQLiteColumns maps each existing table to the columns that the
-// versioned migrations add and the SQLite baseline was missing.
 var versionedSQLiteColumns = map[string][]string{
-	"tenants":                {"api_principal_config"},           // 000064
-	"users":                  {"is_system_admin"},                // 000053
-	"knowledges":             {"pending_subtasks_count"},         // 000056
-	"messages":               {"attachments", "usage"},           // 000034, 000092
-	"tenant_invitations":     {"token", "accepted_count"},        // 000054
-	"embed_channels":         {"allow_memory"},                   // 000060
-	"mcp_oauth_tokens":       {"principal_type", "principal_id"}, // 000064
-	"tenant_skills":          {"install_session_id", "install_message_id", "envs", "catalog_id"},
+	"model_catalog_configs": {"version", "overlay", "history", "updated_by", "updated_at"},
+	"memory_subjects":       {"extraction_state"},
+	"memory_items":          {"replaces_id"},
+	"tenants":               {"api_principal_config"},
+	"users":                 {"is_system_admin"},
+	"knowledges":            {"pending_subtasks_count", "profile"},
+	"knowledge_bases":       {"profile_config", "generated_profile"},
+	"messages":              {"attachments", "usage", "sandbox_checkpoint", "context_checkpoint"},
+	"sessions": {
+		"parent_session_id", "forked_from_message_id", "fork_bootstrap",
+		"sandbox_config_tenant_id", "host_workspace_dir",
+	},
+	"im_channels":        {"locale"},
+	"tenant_invitations": {"token", "accepted_count"},
+	"embed_channels":     {"allow_memory"},
+	"mcp_oauth_tokens":   {"principal_type", "principal_id"},
+	"mcp_tool_approvals": {"enabled"},
+	"message_artifacts":  {"deleted_at"},
+	"tenant_skills": {
+		"install_session_id", "install_message_id", "envs", "catalog_id", "served",
+	},
 	"tenant_skill_snapshots": {"planned_name"},
+	"tenant_user_env_vars": {
+		"principal_type", "principal_id", "sandbox_config_id", "skill_id", "name", "value",
+	},
 }
 
-const expectedSQLiteMigrationVersion = 24
+const expectedSQLiteMigrationVersion = 46
 
 func TestSQLiteMigrationsCreateVersionedSchema(t *testing.T) {
 	repoRoot := sqliteRepoRoot(t)
@@ -70,6 +93,17 @@ func TestSQLiteMigrationsCreateVersionedSchema(t *testing.T) {
 			)
 		}
 	}
+
+	require.True(t, sqliteIndexExists(t, db, "idx_messages_session_created_id"),
+		"SQLite migrations must add the session/created_at index") // 000106
+	assertSQLiteAgentHistoryQueriesUseTheIndex(t, db)
+
+	var catalogVersion int
+	var catalogOverlay string
+	catalogRow := db.QueryRow("SELECT version, overlay FROM model_catalog_configs WHERE id = 1")
+	require.NoError(t, catalogRow.Scan(&catalogVersion, &catalogOverlay))
+	require.Zero(t, catalogVersion)
+	require.JSONEq(t, `{"providers":{}}`, catalogOverlay)
 
 	assertSQLiteShareLinkInvitationsWork(t, db)
 	assertSQLiteMCPOAuthPrincipalUpsertWorks(t, db)
@@ -233,6 +267,83 @@ func TestSQLiteTencentVersion12ReplaysForkMigrations(t *testing.T) {
 		"knowledge_completion_outbox",
 	} {
 		require.Truef(t, sqliteTestTableExists(t, db, table), "compatibility replay must create %s", table)
+	}
+}
+
+func TestSQLiteUpstreamVersions12To30AdvanceTo45(t *testing.T) {
+	repoRoot := sqliteRepoRoot(t)
+	for upstreamVersion := 12; upstreamVersion <= 30; upstreamVersion++ {
+		t.Run(fmt.Sprintf("v%d", upstreamVersion), func(t *testing.T) {
+			upstreamRoot := copySQLiteMigrationsThrough(t, repoRoot, 11)
+			chdirAndRestore(t, upstreamRoot)
+
+			dbPath := filepath.Join(t.TempDir(), fmt.Sprintf("upstream-v%d.db", upstreamVersion))
+			require.NoError(t, RunMigrationsWithOptions(
+				"sqlite3://unused", MigrationOptions{SQLiteDBPath: dbPath},
+			))
+			db := openSQLiteDB(t, dbPath)
+			for version := 12; version <= upstreamVersion; version++ {
+				matches, globErr := filepath.Glob(filepath.Join(
+					repoRoot, "internal", "database", "testdata", "upstream", "sqlite",
+					fmt.Sprintf("%06d_*.up.sql", version),
+				))
+				require.NoError(t, globErr)
+				require.Lenf(t, matches, 1, "expected one upstream migration fixture for v%d", version)
+				contents, readErr := os.ReadFile(matches[0])
+				require.NoError(t, readErr)
+				_, execErr := db.Exec(string(contents))
+				require.NoError(t, execErr, "apply upstream migration %d", version)
+			}
+			if upstreamVersion >= 28 {
+				_, err := db.Exec(`INSERT INTO tenant_skills
+					(id, tenant_id, sandbox_config_id, name, status, updated_at)
+					VALUES
+					('skill-original', 7, 'sandbox-a', 'shared-skill', 'ready', '2026-09-01'),
+					('skill-later', 7, 'sandbox-b', 'shared-skill', 'ready', '2026-09-02')`)
+				require.NoError(t, err)
+			}
+			_, err := db.Exec("UPDATE schema_migrations SET version = ?, dirty = 0", upstreamVersion)
+			require.NoError(t, err)
+			require.NoError(t, db.Close())
+
+			chdirAndRestore(t, repoRoot)
+			require.NoError(t, RunMigrationsWithOptions(
+				"sqlite3://unused", MigrationOptions{SQLiteDBPath: dbPath},
+			))
+
+			db = openSQLiteDB(t, dbPath)
+			version, dirty := sqliteMigrationState(t, db)
+			require.Equal(t, expectedSQLiteMigrationVersion, version)
+			require.False(t, dirty)
+			require.True(t, sqliteColumnExists(t, db, "messages", "usage"))
+			require.True(t, sqliteColumnExists(t, db, "messages", "context_checkpoint"))
+			require.True(t, sqliteColumnExists(t, db, "tenant_skills", "served"))
+			require.True(t, sqliteColumnExists(t, db, "sessions", "host_workspace_dir"))
+			require.True(t, sqliteColumnExists(t, db, "im_channels", "locale"))
+			for _, table := range []string{
+				"browser_devices", "memory_extraction_sessions", "fork_snapshot_leases",
+				"mcp_endpoints", "message_artifacts", "tenant_skill_catalog",
+				"tenant_skill_bundle_ref_claims",
+			} {
+				require.Truef(t, sqliteTestTableExists(t, db, table), "missing upstream-compatible table %s", table)
+			}
+			if upstreamVersion >= 28 {
+				var skills, catalogRows, linked int
+				require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM tenant_skills WHERE name = 'shared-skill'").Scan(&skills))
+				require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM tenant_skill_catalog WHERE name = 'shared-skill'").Scan(&catalogRows))
+				require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM tenant_skills
+					WHERE name = 'shared-skill' AND catalog_id IS NOT NULL`).Scan(&linked))
+				require.Equal(t, 2, skills)
+				require.Equal(t, 1, catalogRows)
+				require.Equal(t, 2, linked)
+			}
+			if upstreamVersion == 30 {
+				require.NoError(t, RunMigrationsWithOptions(
+					"sqlite3://unused", MigrationOptions{SQLiteDBPath: dbPath},
+				), "rerunning the merged migration chain must be idempotent")
+			}
+			require.NoError(t, db.Close())
+		})
 	}
 }
 

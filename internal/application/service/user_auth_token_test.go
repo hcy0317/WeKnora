@@ -30,6 +30,14 @@ func (s *stubAuthTokenRepo) GetTokenByValue(_ context.Context, tokenValue string
 	}
 	return token, nil
 }
+func (s *stubAuthTokenRepo) GetTokenByID(_ context.Context, id string) (*types.AuthToken, error) {
+	for _, token := range s.tokens {
+		if token != nil && token.ID == id {
+			return token, nil
+		}
+	}
+	return nil, errors.New("token not found")
+}
 func (s *stubAuthTokenRepo) GetTokensByUserID(context.Context, string) ([]*types.AuthToken, error) {
 	return nil, nil
 }

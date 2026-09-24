@@ -8,7 +8,8 @@ func TestCustomAgentConfigResolveChatParserEngine(t *testing.T) {
 		{FileTypes: []string{"png", "jpg"}, Engine: "paddleocr_vl"},
 	}}
 	for input, expected := range map[string]string{
-		"PDF": "mineru", ".pptx": "mineru", "png": "paddleocr_vl", "txt": "",
+		"PDF": "mineru", ".pptx": "mineru", "png": "paddleocr_vl",
+		"txt": "", "ppt": "markitdown",
 	} {
 		if actual := config.ResolveChatParserEngine(input); actual != expected {
 			t.Fatalf("ResolveChatParserEngine(%q) = %q, want %q", input, actual, expected)
@@ -17,6 +18,9 @@ func TestCustomAgentConfigResolveChatParserEngine(t *testing.T) {
 	var nilConfig *CustomAgentConfig
 	if actual := nilConfig.ResolveChatParserEngine("pdf"); actual != "" {
 		t.Fatalf("nil config resolved %q", actual)
+	}
+	if actual := nilConfig.ResolveChatParserEngine("pptx"); actual != "markitdown" {
+		t.Fatalf("nil config pptx resolved %q, want markitdown", actual)
 	}
 }
 
@@ -63,6 +67,28 @@ func TestEnsureDefaults_MaxCompletionTokensByMode(t *testing.T) {
 	if explicit.Config.MaxCompletionTokens != 64000 {
 		t.Fatalf("EnsureDefaults must preserve explicit MaxCompletionTokens, got %d",
 			explicit.Config.MaxCompletionTokens)
+	}
+}
+
+func TestEnsureDefaults_MaxIterationsUnlimited(t *testing.T) {
+	unset := &CustomAgent{Config: CustomAgentConfig{}}
+	unset.EnsureDefaults()
+	if unset.Config.MaxIterations != 10 {
+		t.Fatalf("unset max_iterations should default to 10, got %d", unset.Config.MaxIterations)
+	}
+
+	unlimited := &CustomAgent{Config: CustomAgentConfig{MaxIterations: -1}}
+	unlimited.EnsureDefaults()
+	if unlimited.Config.MaxIterations != UnlimitedMaxIterations {
+		t.Fatalf("EnsureDefaults must preserve unlimited max_iterations, got %d",
+			unlimited.Config.MaxIterations)
+	}
+
+	oddNegative := &CustomAgent{Config: CustomAgentConfig{MaxIterations: -7}}
+	oddNegative.EnsureDefaults()
+	if oddNegative.Config.MaxIterations != UnlimitedMaxIterations {
+		t.Fatalf("any negative max_iterations should normalize to %d, got %d",
+			UnlimitedMaxIterations, oddNegative.Config.MaxIterations)
 	}
 }
 

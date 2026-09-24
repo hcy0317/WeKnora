@@ -38,6 +38,7 @@ type KnowledgeSpanRepository interface {
 	OpenAttempt(ctx context.Context, root *types.KnowledgeProcessingSpan) (int, error)
 	UpdateInput(ctx context.Context, knowledgeID string, attempt int, spanID string, input types.JSONMap) error
 	LatestAttempt(ctx context.Context, knowledgeID string) (int, error)
+	LastActivity(ctx context.Context, knowledgeIDs []string) (map[string]time.Time, error)
 	ListByAttempt(ctx context.Context, knowledgeID string, attempt int) ([]types.KnowledgeProcessingSpan, error)
 	GetSpan(ctx context.Context, knowledgeID string, attempt int, spanID string) (*types.KnowledgeProcessingSpan, error)
 	InspectSpanRetryTarget(ctx context.Context, request types.KnowledgeSpanRetryRequest) (*types.KnowledgeSpanRetryTargetSnapshot, error)
@@ -564,6 +565,54 @@ func (r *knowledgeSpanRepository) LatestAttempt(ctx context.Context, knowledgeID
 		Select("COALESCE(MAX(attempt), 0)").
 		Row().Scan(&max)
 	return max, err
+}
+
+func (r *knowledgeSpanRepository) LastActivity(
+	ctx context.Context, knowledgeIDs []string,
+) (map[string]time.Time, error) {
+	out := make(map[string]time.Time, len(knowledgeIDs))
+	if len(knowledgeIDs) == 0 {
+		return out, nil
+	}
+	var rows []struct {
+		KnowledgeID string `gorm:"column:knowledge_id"`
+		LastSeen    string `gorm:"column:last_seen"`
+	}
+	if err := r.db.WithContext(ctx).
+		Model(&types.KnowledgeProcessingSpan{}).
+		Select("knowledge_id, MAX(updated_at) AS last_seen").
+		Where("knowledge_id IN ?", knowledgeIDs).
+		Group("knowledge_id").
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if seen, ok := ParseAggregateTime(row.LastSeen); ok {
+			out[row.KnowledgeID] = seen
+		}
+	}
+	return out, nil
+}
+
+// ParseAggregateTime parses timestamps returned by MAX(updated_at) across the
+// PostgreSQL and SQLite drivers.
+func ParseAggregateTime(value string) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05",
+	} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func (r *knowledgeSpanRepository) ListByAttempt(ctx context.Context, knowledgeID string, attempt int) ([]types.KnowledgeProcessingSpan, error) {

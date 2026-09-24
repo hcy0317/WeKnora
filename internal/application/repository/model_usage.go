@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"github.com/Tencent/WeKnora/internal/types"
 	"gorm.io/gorm"
 )
 
@@ -13,8 +14,8 @@ func scopeKnowledgeBasesByModelID(db *gorm.DB, modelID string) *gorm.DB {
 				"image_processing_config->>'model_id' = ? OR "+
 				"vlm_config->>'model_id' = ? OR "+
 				"asr_config->>'model_id' = ? OR "+
-				"wiki_config->>'synthesis_model_id' = ?",
-			modelID, modelID, modelID, modelID, modelID, modelID,
+				"wiki_config->>'synthesis_model_id' = ? OR auto_tag_config->>'model_id' = ?",
+			modelID, modelID, modelID, modelID, modelID, modelID, modelID,
 		)
 	}
 	return db.Where(
@@ -22,8 +23,9 @@ func scopeKnowledgeBasesByModelID(db *gorm.DB, modelID string) *gorm.DB {
 			"json_extract(image_processing_config, '$.model_id') = ? OR "+
 			"json_extract(vlm_config, '$.model_id') = ? OR "+
 			"json_extract(asr_config, '$.model_id') = ? OR "+
-			"json_extract(wiki_config, '$.synthesis_model_id') = ?",
-		modelID, modelID, modelID, modelID, modelID, modelID,
+			"json_extract(wiki_config, '$.synthesis_model_id') = ? OR "+
+			"json_extract(auto_tag_config, '$.model_id') = ?",
+		modelID, modelID, modelID, modelID, modelID, modelID, modelID,
 	)
 }
 
@@ -55,4 +57,54 @@ func scopeCustomAgentsBySandboxConfigID(db *gorm.DB, configID string) *gorm.DB {
 		return db.Where("config->>'sandbox_config_id' = ?", configID)
 	}
 	return db.Where("json_extract(config, '$.sandbox_config_id') = ?", configID)
+}
+
+func knowledgeBaseModelUsageBindings(kb *types.KnowledgeBase, modelID string) []types.ModelUsageBinding {
+	bindings := make([]types.ModelUsageBinding, 0, 7)
+	if kb.EmbeddingModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingEmbeddingModel)
+	}
+	if kb.SummaryModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingSummaryModel)
+	}
+	if kb.ImageProcessingConfig.ModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingImageProcessingModel)
+	}
+	if kb.VLMConfig.ModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingVLMModel)
+	}
+	if kb.ASRConfig.ModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingASRModel)
+	}
+	if kb.WikiConfig != nil && kb.WikiConfig.SynthesisModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingWikiSynthesisModel)
+	}
+	if kb.AutoTagConfig != nil && kb.AutoTagConfig.ModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingAutoTagModel)
+	}
+	return bindings
+}
+
+func customAgentModelUsageBindings(agent *types.CustomAgent, modelID string) []types.ModelUsageBinding {
+	bindings := make([]types.ModelUsageBinding, 0, 6)
+	if agent.Config.ModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingChatModel)
+	}
+	if agent.Config.RerankModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingRerankModel)
+	}
+	if agent.Config.VLMModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingVLMModel)
+	}
+	if agent.Config.ASRModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingASRModel)
+	}
+	if agent.Config.QueryUnderstandModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingQueryUnderstandModel)
+	}
+	if agent.Config.QuestionSuggestions != nil &&
+		agent.Config.QuestionSuggestions.FollowUps.ModelID == modelID {
+		bindings = append(bindings, types.ModelUsageBindingFollowUpModel)
+	}
+	return bindings
 }

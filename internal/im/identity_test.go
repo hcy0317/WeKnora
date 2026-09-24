@@ -10,7 +10,7 @@ import (
 func TestWithIMIdentity(t *testing.T) {
 	const tenantID uint64 = 42
 	msg := &IncomingMessage{Platform: PlatformFeishu, UserID: "open-id-1"}
-	ctx := withIMIdentity(context.Background(), tenantID, "channel-1", msg)
+	ctx := withIMIdentity(context.Background(), &IMChannel{ID: "channel-1", TenantID: tenantID}, msg)
 
 	gotTenant, ok := types.TenantIDFromContext(ctx)
 	if !ok || gotTenant != tenantID {

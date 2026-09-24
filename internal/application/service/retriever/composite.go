@@ -298,6 +298,38 @@ func (c *CompositeRetrieveEngine) DeleteByKnowledgeIDList(ctx context.Context,
 	})
 }
 
+// ValidateKnowledgeIndexMove checks every backend before the first mutation.
+func (c *CompositeRetrieveEngine) ValidateKnowledgeIndexMove(ctx context.Context) error {
+	for _, info := range c.engineInfos {
+		if _, ok := info.retrieveEngine.(interfaces.KnowledgeIndexMover); !ok {
+			return fmt.Errorf("retriever %s does not support moving indices", info.retrieveEngine.EngineType())
+		}
+		if validator, ok := info.retrieveEngine.(interface{ ValidateKnowledgeIndexMove(context.Context) error }); ok {
+			if err := validator.ValidateKnowledgeIndexMove(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (c *CompositeRetrieveEngine) MoveKnowledgeIndices(
+	ctx context.Context,
+	sourceKB, targetKB, knowledgeID string,
+	chunkIDs []string,
+	dimension int,
+	knowledgeType string,
+) error {
+	if err := c.ValidateKnowledgeIndexMove(ctx); err != nil {
+		return err
+	}
+	return c.concurrentExecWithError(ctx, func(ctx context.Context, info *engineInfo) error {
+		return info.retrieveEngine.(interfaces.KnowledgeIndexMover).MoveKnowledgeIndices(
+			ctx, sourceKB, targetKB, knowledgeID, chunkIDs, dimension, knowledgeType,
+		)
+	})
+}
+
 // EstimateStorageSize estimates the storage size required for the provided index information
 func (c *CompositeRetrieveEngine) EstimateStorageSize(ctx context.Context,
 	embedder embedding.Embedder, indexInfoList []*types.IndexInfo,

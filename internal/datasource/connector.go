@@ -93,6 +93,30 @@ type StreamingConnector interface {
 	) (*types.SyncCursor, error)
 }
 
+// FullStreamingConnector adds cursor-aware full-sync support to a streaming
+// connector. It lets ForceFull reconcile deletions without buffering the whole
+// resource tree in memory.
+type FullStreamingConnector interface {
+	StreamingConnector
+
+	FetchFullStream(
+		ctx context.Context, config *types.DataSourceConfig,
+		cursor *types.SyncCursor, h StreamHandler,
+	) (*types.SyncCursor, error)
+}
+
+// FullSyncWithCursor is an optional batch capability for connectors that can
+// re-fetch every document while retaining a previous cursor for deletion
+// reconciliation.
+type FullSyncWithCursor interface {
+	FetchAllFromCursor(
+		ctx context.Context,
+		config *types.DataSourceConfig,
+		resourceIDs []string,
+		cursor *types.SyncCursor,
+	) ([]types.FetchedItem, *types.SyncCursor, error)
+}
+
 // ConnectorRegistry manages the registration and lookup of available connectors
 type ConnectorRegistry struct {
 	connectors map[string]Connector

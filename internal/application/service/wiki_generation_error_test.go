@@ -49,3 +49,19 @@ func TestWikiGenerationErrorClassificationHonorsParentCancellation(t *testing.T)
 		t.Fatalf("cancelled parent class = %q", wikiGenerationErrorClassOf(err))
 	}
 }
+
+func TestWikiGenerationErrorClassificationTreatsRateLimit403AsTransient(t *testing.T) {
+	rateLimited := openaiapi.NewProtocolHTTPError(
+		openaiapi.ProtocolResponses, http.StatusForbidden, "gateway qpm exceeded; retry later",
+	)
+	if class := wikiGenerationErrorClassOf(classifyWikiGenerationError(context.Background(), rateLimited)); class != WikiGenerationErrorTransientTransport {
+		t.Fatalf("rate-limited 403 class = %q, want transient transport", class)
+	}
+
+	forbidden := openaiapi.NewProtocolHTTPError(
+		openaiapi.ProtocolResponses, http.StatusForbidden, "invalid API key",
+	)
+	if class := wikiGenerationErrorClassOf(classifyWikiGenerationError(context.Background(), forbidden)); class != WikiGenerationErrorDeterministicOutput {
+		t.Fatalf("plain 403 class = %q, want deterministic output", class)
+	}
+}

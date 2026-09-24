@@ -49,12 +49,13 @@ const (
 	EventAgentComplete EventType = "agent.complete" // Agent 完成
 
 	// Agent streaming events (for real-time feedback)
-	EventAgentThought     EventType = "thought"      // Agent 思考过程
-	EventAgentToolCall    EventType = "tool_call"    // 工具调用通知
-	EventAgentToolResult  EventType = "tool_result"  // 工具结果
-	EventAgentReflection  EventType = "reflection"   // Agent 反思
-	EventAgentReferences  EventType = "references"   // 知识引用
-	EventAgentFinalAnswer EventType = "final_answer" // 最终答案
+	EventAgentThought       EventType = "thought"        // Agent 思考过程
+	EventAgentCommandOutput EventType = "command_output" // bounded command output
+	EventAgentToolCall      EventType = "tool_call"      // 工具调用通知
+	EventAgentToolResult    EventType = "tool_result"    // 工具结果
+	EventAgentReflection    EventType = "reflection"     // Agent 反思
+	EventAgentReferences    EventType = "references"     // 知识引用
+	EventAgentFinalAnswer   EventType = "final_answer"   // 最终答案
 
 	// MCP tool human approval (issue #1173)
 	EventToolApprovalRequired EventType = "tool_approval_required"
@@ -72,7 +73,9 @@ const (
 
 	// Long-term memory recalled for this turn. Emitted once, before the answer
 	// streams, so the UI can show which memories the answer saw.
-	EventMemoryRecalled EventType = "memory_recalled"
+	EventMemoryRecalled      EventType = "memory_recalled"
+	EventContextCompacted    EventType = "context_compacted"
+	EventUserMessageInjected EventType = "user_message_injected"
 
 	// Session events
 	EventSessionTitle EventType = "session_title" // 会话标题更新

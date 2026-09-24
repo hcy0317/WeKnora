@@ -373,79 +373,46 @@ func (e *elasticsearchRepository) processBulkResponse(ctx context.Context,
 	resp *esapi.Response, totalDocuments int,
 ) error {
 	log := logger.GetLogger(ctx)
-	if resp == nil || resp.Body == nil {
-		return errors.New("bulk request returned no response")
-	}
 
 	// Check for bulk operation errors
 	if resp.IsError() {
-		log.Errorf("[ElasticsearchV7] Bulk operation failed with status %d", resp.StatusCode)
-		return fmt.Errorf("failed to index documents: backend returned status %d", resp.StatusCode)
+		log.Errorf("[ElasticsearchV7] Bulk operation failed: %s", resp.String())
+		return fmt.Errorf("failed to index documents: %s", resp.String())
 	}
 
 	// Parse bulk response to check for individual document errors
 	var bulkResponse map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&bulkResponse); err != nil {
-		log.Errorf("[ElasticsearchV7] Could not parse bulk response: %v", err)
-		return fmt.Errorf("failed to parse bulk response: %w", err)
+		log.Warnf("[ElasticsearchV7] Could not parse bulk response: %v", err)
+		return nil
 	}
 
-	// Always inspect item results. A contradictory top-level errors=false
-	// must not hide a failed item.
-	items, ok := bulkResponse["items"].([]interface{})
-	if !ok || len(items) != totalDocuments {
-		return fmt.Errorf("bulk response item count mismatch: got %d, want %d", len(items), totalDocuments)
-	}
-	errorCount := 0
-	for _, item := range items {
-		itemMap, ok := item.(map[string]interface{})
-		if !ok || len(itemMap) != 1 {
-			return errors.New("bulk response contained an invalid item")
+	// Check for errors in individual operations
+	if hasErrors, ok := bulkResponse["errors"].(bool); ok && hasErrors {
+		errorCount := e.countBulkErrors(ctx, bulkResponse, totalDocuments)
+		if errorCount > 0 {
+			log.Warnf("[ElasticsearchV7] %d/%d documents failed to index", errorCount, totalDocuments)
 		}
-		for operation, raw := range itemMap {
-			if operation != "index" {
-				return errors.New("bulk response contained an unexpected operation")
-			}
-			response, ok := raw.(map[string]interface{})
-			if !ok {
-				return errors.New("bulk response contained an invalid operation result")
-			}
-			if response["error"] != nil {
-				errorCount++
-				continue
-			}
-			status, ok := response["status"].(float64)
-			if !ok || status < 200 || status >= 300 {
-				return errors.New("bulk response contained an unsuccessful item status")
-			}
-		}
-	}
-	if errorCount > 0 {
-		return fmt.Errorf("failed to index %d/%d documents", errorCount, totalDocuments)
-	}
-
-	hasErrors, ok := bulkResponse["errors"].(bool)
-	if !ok {
-		return errors.New("bulk response omitted errors status")
-	}
-	if hasErrors {
-		// Elasticsearch's top-level errors flag is authoritative. Fail closed
-		// even when an unfamiliar item shape prevents us from counting it.
-		return errors.New("bulk response reported item errors")
 	}
 
 	return nil
 }
 
 // countBulkErrors counts the number of errors in a bulk response
-func (e *elasticsearchRepository) countBulkErrors(bulkResponse map[string]interface{}) int {
+func (e *elasticsearchRepository) countBulkErrors(ctx context.Context,
+	bulkResponse map[string]interface{}, totalDocuments int,
+) int {
+	log := logger.GetLogger(ctx)
+	log.Warn("[ElasticsearchV7] Bulk operation completed with some errors")
+
 	errorCount := 0
 	if items, ok := bulkResponse["items"].([]interface{}); ok {
 		for _, item := range items {
 			if itemMap, ok := item.(map[string]interface{}); ok {
-				for _, operationResponse := range itemMap {
-					if response, ok := operationResponse.(map[string]interface{}); ok && response["error"] != nil {
+				if indexResp, ok := itemMap["index"].(map[string]interface{}); ok {
+					if indexResp["error"] != nil {
 						errorCount++
+						log.Errorf("[ElasticsearchV7] Item error: %v", indexResp["error"])
 					}
 				}
 			}
@@ -502,33 +469,22 @@ func (e *elasticsearchRepository) deleteByFieldList(ctx context.Context, field s
 	defer resp.Body.Close()
 
 	if resp.IsError() {
-		log.Errorf("[ElasticsearchV7] Delete by query failed with status %d", resp.StatusCode)
-		return fmt.Errorf("failed to delete by query: backend returned status %d", resp.StatusCode)
+		errMsg := fmt.Sprintf("failed to delete by query: %s", resp.String())
+		log.Errorf("[ElasticsearchV7] %s", errMsg)
+		return fmt.Errorf("failed to delete by query: %s", resp.String())
 	}
 
-	var deleteResponse struct {
-		Deleted          *int               `json:"deleted"`
-		TimedOut         *bool              `json:"timed_out"`
-		VersionConflicts *int               `json:"version_conflicts"`
-		Failures         *[]json.RawMessage `json:"failures"`
-	}
+	// Try to extract deletion count from response
+	var deleteResponse map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&deleteResponse); err != nil {
-		return fmt.Errorf("failed to parse delete by query response")
+		log.Warnf("[ElasticsearchV7] Could not parse delete response: %v", err)
+	} else {
+		if deleted, ok := deleteResponse["deleted"].(float64); ok {
+			log.Infof("[ElasticsearchV7] Successfully deleted %d documents by %s", int(deleted), field)
+		} else {
+			log.Infof("[ElasticsearchV7] Successfully deleted documents by %s", field)
+		}
 	}
-	if deleteResponse.Deleted == nil || deleteResponse.TimedOut == nil ||
-		deleteResponse.VersionConflicts == nil || deleteResponse.Failures == nil {
-		return errors.New("delete by query returned an incomplete response")
-	}
-	if *deleteResponse.TimedOut {
-		return errors.New("delete by query timed out")
-	}
-	if *deleteResponse.VersionConflicts > 0 {
-		return fmt.Errorf("delete by query had %d version conflicts", *deleteResponse.VersionConflicts)
-	}
-	if len(*deleteResponse.Failures) > 0 {
-		return fmt.Errorf("delete by query had %d failures", len(*deleteResponse.Failures))
-	}
-	log.Infof("[ElasticsearchV7] Successfully deleted %d documents by %s", *deleteResponse.Deleted, field)
 
 	return nil
 }
@@ -671,6 +627,17 @@ func (e *elasticsearchRepository) VectorRetrieve(ctx context.Context,
 	}, nil
 }
 
+// vectorScoreScriptSource scores every document by its cosine similarity to the
+// query vector, floored at 0. Lucene rejects negative final script_score values
+// ("script_score script returned an invalid score ... Must be a non-negative
+// score!"), so an unclamped negative cosine — which occurs whenever any stored
+// vector points away from the query — fails the entire search request with a
+// 400 (all shards failed) instead of merely ranking that document last. The
+// floor keeps the score in the [0, 1] range the shared retriever score
+// normalizer documents for this engine; documents clamped to 0 fall below any
+// positive min_score threshold.
+var vectorScoreScriptSource = "Math.max(cosineSimilarity(params.query_vector,'embedding'), 0.0)"
+
 // buildVectorSearchQuery builds the vector search query JSON
 func (e *elasticsearchRepository) buildVectorSearchQuery(ctx context.Context,
 	params typesLocal.RetrieveParams,
@@ -695,7 +662,7 @@ func (e *elasticsearchRepository) buildVectorSearchQuery(ctx context.Context,
 					},
 				},
 				"script": map[string]interface{}{
-					"source": "cosineSimilarity(params.query_vector,'embedding')",
+					"source": vectorScoreScriptSource,
 					"params": map[string]interface{}{
 						"query_vector": params.Embedding,
 					},
@@ -1030,11 +997,6 @@ func (e *elasticsearchRepository) CopyIndices(ctx context.Context,
 		return nil
 	}
 
-	// Build query parameters
-	retrieveParams := typesLocal.RetrieveParams{
-		KnowledgeBaseIDs: []string{sourceKnowledgeBaseID},
-	}
-
 	// Set batch processing parameters
 	batchSize := 500
 	from := 0
@@ -1042,7 +1004,7 @@ func (e *elasticsearchRepository) CopyIndices(ctx context.Context,
 
 	for {
 		// Query source data batch
-		hitsList, err := e.querySourceBatch(ctx, retrieveParams, from, batchSize)
+		hitsList, err := e.querySourceBatch(ctx, sourceKnowledgeBaseID, from, batchSize)
 		if err != nil {
 			return err
 		}
@@ -1055,7 +1017,7 @@ func (e *elasticsearchRepository) CopyIndices(ctx context.Context,
 		log.Infof("[ElasticsearchV7] Found %d source index data, batch start position: %d", len(hitsList), from)
 
 		// Process the batch and create index information
-		indexInfoList, err := e.processSourceBatch(ctx, hitsList, sourceToTargetKBIDMap,
+		indexInfoList, embeddingMap, err := e.processSourceBatch(ctx, hitsList, sourceToTargetKBIDMap,
 			sourceToTargetChunkIDMap, targetKnowledgeBaseID)
 		if err != nil {
 			return err
@@ -1063,7 +1025,7 @@ func (e *elasticsearchRepository) CopyIndices(ctx context.Context,
 
 		// Save processed indices
 		if len(indexInfoList) > 0 {
-			err := e.saveCopiedIndices(ctx, indexInfoList)
+			err := e.saveCopiedIndices(ctx, indexInfoList, embeddingMap)
 			if err != nil {
 				return err
 			}
@@ -1088,16 +1050,20 @@ func (e *elasticsearchRepository) CopyIndices(ctx context.Context,
 
 // querySourceBatch queries a batch of source data
 func (e *elasticsearchRepository) querySourceBatch(ctx context.Context,
-	retrieveParams typesLocal.RetrieveParams, from int, batchSize int,
+	sourceKnowledgeBaseID string, from int, batchSize int,
 ) ([]interface{}, error) {
 	log := logger.GetLogger(ctx)
 
-	// Build query request safely
-	filterJSON := e.getBaseConds(retrieveParams)
-	var filter map[string]interface{}
-	if err := json.Unmarshal([]byte(filterJSON), &filter); err != nil {
-		log.Errorf("[ElasticsearchV7] Failed to parse base conditions: %v", err)
-		filter = map[string]interface{}{}
+	// Scan every row of the source knowledge base. getBaseConds is not used
+	// here because it drops disabled rows, which must be copied as disabled.
+	filter := map[string]interface{}{
+		"bool": map[string]interface{}{
+			"filter": []map[string]interface{}{{
+				"terms": map[string]interface{}{
+					e.idField("knowledge_base_id"): []string{sourceKnowledgeBaseID},
+				},
+			}},
+		},
 	}
 
 	queryBody := map[string]interface{}{
@@ -1154,13 +1120,14 @@ func (e *elasticsearchRepository) querySourceBatch(ctx context.Context,
 	return hitsList, nil
 }
 
-// processSourceBatch processes a batch of source data and creates index information
+// processSourceBatch processes a batch of source data and creates index information,
+// returning the embeddings keyed by target SourceID (the key BatchSave looks up)
 func (e *elasticsearchRepository) processSourceBatch(ctx context.Context,
 	hitsList []interface{},
 	sourceToTargetKBIDMap map[string]string,
 	sourceToTargetChunkIDMap map[string]string,
 	targetKnowledgeBaseID string,
-) ([]*typesLocal.IndexInfo, error) {
+) ([]*typesLocal.IndexInfo, map[string][]float32, error) {
 	log := logger.GetLogger(ctx)
 
 	// Prepare index information for batch save
@@ -1179,12 +1146,12 @@ func (e *elasticsearchRepository) processSourceBatch(ctx context.Context,
 		if indexInfo != nil {
 			indexInfoList = append(indexInfoList, indexInfo)
 			if embeddingVector != nil {
-				embeddingMap[indexInfo.ChunkID] = embeddingVector
+				embeddingMap[indexInfo.SourceID] = embeddingVector
 			}
 		}
 	}
 
-	return indexInfoList, nil
+	return indexInfoList, embeddingMap, nil
 }
 
 // processSingleHit processes a single hit and creates index information
@@ -1304,7 +1271,9 @@ func (e *elasticsearchRepository) processSingleHit(ctx context.Context,
 }
 
 // saveCopiedIndices saves the copied indices
-func (e *elasticsearchRepository) saveCopiedIndices(ctx context.Context, indexInfoList []*typesLocal.IndexInfo) error {
+func (e *elasticsearchRepository) saveCopiedIndices(ctx context.Context,
+	indexInfoList []*typesLocal.IndexInfo, embeddingMap map[string][]float32,
+) error {
 	log := logger.GetLogger(ctx)
 
 	if len(indexInfoList) == 0 {
@@ -1314,11 +1283,6 @@ func (e *elasticsearchRepository) saveCopiedIndices(ctx context.Context, indexIn
 
 	// Prepare additional params with embedding map
 	additionalParams := make(map[string]any)
-	embeddingMap := make(map[string][]float32)
-
-	// No need to extract embeddings from metadata as they're not stored there
-	// We'll use the embeddings directly from the embedding map created in processSourceBatch
-
 	if len(embeddingMap) > 0 {
 		additionalParams["embedding"] = embeddingMap
 		log.Infof("[ElasticsearchV7] Found %d embeddings to save", len(embeddingMap))

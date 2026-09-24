@@ -14,6 +14,8 @@ import (
 	"gorm.io/gorm"
 )
 
+const updateByIDsBatchSize = 5000
+
 var ErrChunkRevisionConflict = errors.New("chunk revision conflict")
 
 // ErrChunkNotFound is returned when a chunk lookup finds no row. A typed
@@ -116,6 +118,102 @@ func (r *chunkRepository) ListChunksByID(
 		return nil, err
 	}
 	return chunks, nil
+}
+
+// ListAllChunksByKnowledgeID returns every chunk row for a document, including
+// non-text and non-indexed rows needed by document-scoped diagnostics.
+func (r *chunkRepository) ListAllChunksByKnowledgeID(
+	ctx context.Context,
+	tenantID uint64,
+	knowledgeID string,
+) ([]*types.Chunk, error) {
+	var chunks []*types.Chunk
+	err := r.db.WithContext(ctx).
+		Where("tenant_id = ? AND knowledge_id = ?", tenantID, knowledgeID).
+		Order("id ASC").
+		Find(&chunks).Error
+	return chunks, err
+}
+
+func (r *chunkRepository) ListChunkNeighbors(
+	ctx context.Context,
+	tenantID uint64,
+	knowledgeID string,
+	chunkIndex int,
+	before int,
+	after int,
+	chunkTypes []types.ChunkType,
+) ([]*types.Chunk, error) {
+	base := func() *gorm.DB {
+		return r.db.WithContext(ctx).
+			Where("tenant_id = ? AND knowledge_id = ? AND chunk_type IN (?) AND status IN (?) AND is_enabled = ?",
+				tenantID, knowledgeID, chunkTypes,
+				[]int{int(types.ChunkStatusIndexed), int(types.ChunkStatusDefault)}, true)
+	}
+	var preceding, following []*types.Chunk
+	if before > 0 {
+		if err := base().Where("chunk_index < ?", chunkIndex).
+			Order("chunk_index DESC").Limit(before).Find(&preceding).Error; err != nil {
+			return nil, err
+		}
+	}
+	if after > 0 {
+		if err := base().Where("chunk_index > ?", chunkIndex).
+			Order("chunk_index ASC").Limit(after).Find(&following).Error; err != nil {
+			return nil, err
+		}
+	}
+	out := make([]*types.Chunk, 0, len(preceding)+len(following))
+	for i := len(preceding) - 1; i >= 0; i-- {
+		out = append(out, preceding[i])
+	}
+	return append(out, following...), nil
+}
+
+func (r *chunkRepository) ListChunksByParentIDsOnly(
+	ctx context.Context, parentIDs []string,
+) ([]*types.Chunk, error) {
+	if len(parentIDs) == 0 {
+		return nil, nil
+	}
+	var chunks []*types.Chunk
+	if err := r.db.WithContext(ctx).
+		Where("parent_chunk_id IN ?", parentIDs).
+		Find(&chunks).Error; err != nil {
+		return nil, err
+	}
+	return chunks, nil
+}
+
+// UpdateChunkFieldsByIDs applies uniform columns in bounded ID batches so a
+// large document cannot exceed a database driver's placeholder limit.
+func (r *chunkRepository) UpdateChunkFieldsByIDs(
+	ctx context.Context, tenantID uint64, ids []string, fields map[string]interface{},
+) error {
+	if len(ids) == 0 || len(fields) == 0 {
+		return nil
+	}
+	updates := make(map[string]interface{}, len(fields)+1)
+	for column, value := range fields {
+		updates[column] = value
+	}
+	if _, exists := updates["updated_at"]; !exists {
+		updates["updated_at"] = time.Now()
+	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for start := 0; start < len(ids); start += updateByIDsBatchSize {
+			end := start + updateByIDsBatchSize
+			if end > len(ids) {
+				end = len(ids)
+			}
+			if err := tx.Model(&types.Chunk{}).
+				Where("tenant_id = ? AND id IN ?", tenantID, ids[start:end]).
+				Updates(updates).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // ListChunksByIDOnly retrieves multiple chunks by their IDs without tenant filter (for shared KB resolution).

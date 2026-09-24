@@ -64,7 +64,21 @@
     </div>
 
     <t-loading :loading="loading" size="small" class="sandbox-list-loading">
-      <div v-if="!loading" class="sandbox-grid">
+      <t-alert
+        v-if="!loading && dockerTabDisabled && filteredRecords.length > 0"
+        theme="warning"
+        class="sandbox-docker-banner"
+        :message="$t('settings.sandbox.dockerDisabledAlert')"
+      >
+        <template #description>
+          <p>{{ $t('settings.sandbox.dockerDisabledHint') }}</p>
+        </template>
+      </t-alert>
+      <div v-if="!loading && dockerTabDisabled && filteredRecords.length === 0" class="sandbox-docker-disabled">
+        <t-empty :description="$t('settings.sandbox.dockerDisabledAlert')" />
+        <p class="sandbox-empty-hint">{{ $t('settings.sandbox.dockerDisabledHint') }}</p>
+      </div>
+      <div v-else-if="!loading" class="sandbox-grid">
         <div v-for="record in filteredRecords" :key="record.id" class="sandbox-card"
           :class="[`sandbox-card--${record.sandbox_type}`, { 'sandbox-card--clickable': !isLegacyRecord(record) }]"
           :role="isLegacyRecord(record) ? undefined : 'button'"
@@ -109,18 +123,18 @@
             </ul>
           </div>
         </div>
-        <button type="button" class="sandbox-card sandbox-card--add" @click="openCreate">
+        <button v-if="canCreateOnTab" type="button" class="sandbox-card sandbox-card--add" @click="openCreate">
           <span class="sandbox-card--add__icon" aria-hidden="true"><t-icon name="add" /></span>
           <span class="sandbox-card--add__label">{{ $t('settings.sandbox.addConfig') }}</span>
         </button>
       </div>
-      <p v-if="!loading && records.length === 0" class="sandbox-empty-hint">
+      <p v-if="!loading && !dockerTabDisabled && records.length === 0" class="sandbox-empty-hint">
         {{ $t('settings.sandbox.noConfigs') }}
       </p>
     </t-loading>
 
     <SandboxConfigEditorDrawer v-model:visible="showEditor" :record="editingRecord"
-      :preset-type="activeType === 'all' ? '' : activeType"
+      :preset-type="createPresetType"
       @saved="load" />
 
     <!--
@@ -203,6 +217,8 @@ import SandboxBackendBadge from '@/components/settings/SandboxBackendBadge.vue'
 import SettingDrawer from '@/components/settings/SettingDrawer.vue'
 import { useConfirmDelete } from '@/components/settings/useConfirmDelete'
 import { getSession } from '@/api/chat/index'
+import { useDeploymentCapabilitiesStore } from '@/stores/deploymentCapabilities'
+import { docsUrl } from '@/utils/docsUrl'
 import {
   deleteSandboxConfig,
   getSandboxConfigInventory,
@@ -218,10 +234,26 @@ import {
 const { t } = useI18n()
 const router = useRouter()
 const confirmDelete = useConfirmDelete()
+const deploymentCapabilities = useDeploymentCapabilitiesStore()
+const dockerBackendEnabled = computed(() =>
+  deploymentCapabilities.isSupported('settings.sandbox.docker'),
+)
 
-const sandboxGuideUrl = 'https://github.com/Tencent/WeKnora/blob/main/docs/sandbox-cluster.md'
+const sandboxGuideUrl = docsUrl('sandboxDeployment')
 
-const backendTypes = NAMED_SANDBOX_BACKEND_TYPES
+const backendTypes = [...NAMED_SANDBOX_BACKEND_TYPES]
+
+const dockerTabDisabled = computed(() =>
+  activeType.value === 'docker' && !dockerBackendEnabled.value,
+)
+
+const canCreateOnTab = computed(() => !dockerTabDisabled.value)
+
+const createPresetType = computed(() => {
+  if (activeType.value === 'all') return ''
+  if (dockerTabDisabled.value) return ''
+  return activeType.value
+})
 
 const loading = ref(false)
 const policySaving = ref(false)
@@ -350,6 +382,7 @@ async function onDeleteConfirmOpen(visible: boolean, record: SandboxConfigRecord
 }
 
 function openCreate() {
+  if (!canCreateOnTab.value) return
   editingRecord.value = null
   showEditor.value = true
 }
@@ -410,6 +443,12 @@ function buildCardWarnings(record: SandboxConfigRecord): CardWarning[] {
         text: t('settings.sandbox.cardCredentialMissing'),
       })
     }
+  }
+  if (record.sandbox_type === 'docker' && !dockerBackendEnabled.value) {
+    warnings.push({
+      key: 'docker-disabled',
+      text: t('settings.sandbox.dockerDisabledCard'),
+    })
   }
   if (record.sandbox_type === 'docker' && !config.docker?.image?.trim()) {
     warnings.push({
@@ -531,37 +570,23 @@ async function forceRemove(record: SandboxConfigRecord) {
   await removeRecord(record, true)
 }
 
-onMounted(load)
+onMounted(async () => {
+  await deploymentCapabilities.ensureLoaded()
+  load()
+})
 </script>
 
 <style lang="less" scoped>
+@import (reference) '@/components/css/provider-card.less';
+
+@import (reference) '@/components/css/settings-section.less';
+
 .sandbox-settings {
   width: 100%;
 }
 
 .section-header {
-  margin-bottom: 20px;
-
-  h2 {
-    margin: 0 0 8px;
-    font-size: 20px;
-    font-weight: 600;
-    color: var(--td-text-color-primary);
-  }
-}
-
-.section-description {
-  margin: 0;
-  color: var(--td-text-color-secondary);
-  font-size: 14px;
-  line-height: 1.6;
-}
-
-.section-header__top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 20px;
+  .settings-section-header();
 }
 
 .defaults-trigger {
@@ -584,7 +609,7 @@ onMounted(load)
   align-items: center;
   gap: 5px;
   color: var(--td-brand-color);
-  font-size: 14px;
+  font-size: var(--app-text-base);
   font-weight: 600;
   text-decoration: none;
 
@@ -609,7 +634,7 @@ onMounted(load)
   justify-content: center;
   padding: 2px;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   background: transparent;
   color: var(--td-text-color-placeholder);
   cursor: help;
@@ -631,14 +656,14 @@ onMounted(load)
 .hint-popover__title {
   margin: 0;
   color: var(--td-text-color-primary);
-  font-size: 13px;
+  font-size: var(--app-text-md);
   font-weight: 600;
 }
 
 .hint-popover__text {
   margin: 0;
   color: var(--td-text-color-secondary);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.55;
 }
 
@@ -647,39 +672,16 @@ onMounted(load)
 }
 
 .setting-row {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
+  .setting-row();
   gap: 24px;
-  padding: 0 0 16px;
-  margin-bottom: 8px;
-  border-bottom: 1px solid var(--td-component-stroke);
 }
 
 .setting-info {
-  flex: 1;
-  min-width: 0;
-
-  label {
-    display: block;
-    margin-bottom: 4px;
-    color: var(--td-text-color-primary);
-    font-size: 14px;
-    font-weight: 500;
-  }
-
-  .desc {
-    margin: 0;
-    color: var(--td-text-color-secondary);
-    font-size: 13px;
-    line-height: 1.5;
-  }
+  .setting-info();
 }
 
 .setting-control {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
+  .setting-control();
 }
 
 .sandbox-tabs-row {
@@ -695,7 +697,7 @@ onMounted(load)
   margin-bottom: 0;
 
   :deep(.t-tabs__nav-item) {
-    font-size: 13px;
+    font-size: var(--app-text-md);
   }
 
   :deep(.t-tabs__nav-item-wrapper) {
@@ -733,29 +735,12 @@ onMounted(load)
 }
 
 .sandbox-card {
-  position: relative;
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 14px 14px 14px 12px;
-  border: 1px solid var(--td-component-stroke);
-  border-radius: 10px;
-  background: var(--td-bg-color-container);
-  transition: border-color 0.18s ease, box-shadow 0.18s ease;
-  min-width: 0;
+  .provider-card();
 
   &--clickable {
-    cursor: pointer;
+    .provider-card-interactive();
 
-    &:hover {
-      border-color: var(--td-brand-color-3, var(--td-brand-color));
-      box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06);
-    }
 
-    &:focus-visible {
-      outline: 2px solid var(--td-brand-color);
-      outline-offset: 2px;
-    }
   }
 
   &--add {
@@ -778,10 +763,7 @@ onMounted(load)
       box-shadow: none;
     }
 
-    &:focus-visible {
-      outline: 2px solid var(--td-brand-color);
-      outline-offset: 2px;
-    }
+
 
     &__icon {
       display: flex;
@@ -789,14 +771,14 @@ onMounted(load)
       justify-content: center;
       width: 32px;
       height: 32px;
-      border-radius: 8px;
+      border-radius: var(--app-radius-md);
       background: color-mix(in srgb, var(--td-brand-color) 10%, transparent);
       color: var(--td-brand-color);
-      font-size: 18px;
+      font-size: var(--app-text-2xl);
     }
 
     &__label {
-      font-size: 13px;
+      font-size: var(--app-text-md);
       font-weight: 500;
       line-height: 1.4;
     }
@@ -804,42 +786,19 @@ onMounted(load)
 }
 
 .sandbox-card__body {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  .provider-card-body();
 }
 
 .sandbox-card__header {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
+  .provider-card-header();
 }
 
 .sandbox-card__title {
-  flex: 1;
-  min-width: 0;
-  margin: 0;
-  font-size: 14px;
-  font-weight: 600;
-  line-height: 1.4;
-  color: var(--td-text-color-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  .provider-card-title();
 }
 
 .sandbox-card__subtitle {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 4px;
-  font-size: 12px;
-  line-height: 1.4;
-  color: var(--td-text-color-secondary);
-  min-width: 0;
+  .provider-card-subtitle();
 }
 
 .sandbox-card__type {
@@ -859,7 +818,7 @@ onMounted(load)
 
 .sandbox-card__url {
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   line-height: 1.4;
   color: var(--td-text-color-placeholder);
   white-space: nowrap;
@@ -880,8 +839,8 @@ onMounted(load)
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    color: var(--td-warning-color-7, var(--td-warning-color));
-    font-size: 12px;
+    color: var(--td-warning-color-7);
+    font-size: var(--app-text-sm);
     line-height: 1.4;
   }
 }
@@ -891,17 +850,7 @@ onMounted(load)
 }
 
 .sandbox-card__more {
-  flex-shrink: 0;
-  padding: 2px;
-  color: var(--td-text-color-placeholder);
-  opacity: 0;
-  transition: opacity 0.15s ease, color 0.15s ease, background-color 0.15s ease;
-
-  &:hover,
-  &:focus-visible {
-    color: var(--td-text-color-primary);
-    background: var(--td-bg-color-secondarycontainer);
-  }
+  .provider-card-more();
 }
 
 .sandbox-card:hover .sandbox-card__more,
@@ -910,10 +859,23 @@ onMounted(load)
   opacity: 1;
 }
 
+.sandbox-docker-banner {
+  margin-bottom: 12px;
+}
+
+.sandbox-docker-disabled {
+  padding: 48px 16px 24px;
+  text-align: center;
+}
+
 .sandbox-empty-hint {
   margin: 16px 0 0;
-  font-size: 13px;
+  font-size: var(--app-text-md);
   color: var(--td-text-color-placeholder);
+}
+
+.sandbox-docker-disabled .sandbox-empty-hint {
+  margin-top: 8px;
 }
 
 .inventory-banner {
@@ -934,7 +896,7 @@ onMounted(load)
   margin: 0;
   padding: 6px 8px;
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: transparent;
   color: inherit;
   font: inherit;
@@ -965,13 +927,13 @@ onMounted(load)
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--td-text-color-primary);
-  font-size: 13px;
+  font-size: var(--app-text-md);
   line-height: 1.4;
 }
 
 .inventory-row__meta {
   color: var(--td-text-color-secondary);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.4;
 }
 
@@ -984,7 +946,7 @@ onMounted(load)
 .inventory-agents {
   margin: 0;
   color: var(--td-text-color-secondary);
-  font-size: 13px;
+  font-size: var(--app-text-md);
   line-height: 1.5;
 }
 </style>

@@ -50,6 +50,7 @@ type CreateKnowledgeQARequest struct {
 	AgentSourceTenantID   uint64                       `json:"agent_source_tenant_id,omitempty"`      // Optional disambiguator; backend still verifies the share relation
 	WebSearchEnabled      bool                         `json:"web_search_enabled"`                    // Whether web search is enabled for this request
 	SummaryModelID        string                       `json:"summary_model_id"`                      // Optional summary model ID for this request (overrides session default)
+	ReasoningEffort       string                       `json:"reasoning_effort,omitempty"`            // Optional per-request reasoning level
 	MCPServiceIDs         []string                     `json:"mcp_service_ids"`                       // Per-request MCP services selected via @mention
 	SkillNames            []string                     `json:"skill_names"`                           // Per-request Skills selected via @mention
 	TagIDs                []string                     `json:"tag_ids"`                               // @mentioned tag IDs (display/debug; scoped via MentionedItems)
@@ -77,6 +78,14 @@ type SearchKnowledgeRequest struct {
 	KnowledgeIDs     []string               `json:"knowledge_ids"`                         // IDs of specific knowledge (files) to search
 	TagIDs           []string               `json:"tag_ids"`                               // Tag IDs for filtering within a single KB
 	MentionedItems   []MentionedItemRequest `json:"mentioned_items"`                       // Optional scoped tag mentions
+
+	// Optional overrides of the tenant retrieval config. Omitted fields keep it.
+	VectorThreshold      *float64             `json:"vector_threshold,omitempty"`       // Minimum vector similarity
+	KeywordThreshold     *float64             `json:"keyword_threshold,omitempty"`      // Minimum keyword score
+	MatchCount           int                  `json:"match_count,omitempty"`            // Number of results to return
+	DisableKeywordsMatch bool                 `json:"disable_keywords_match,omitempty"` // Vector recall only
+	DisableVectorMatch   bool                 `json:"disable_vector_match,omitempty"`   // Keyword recall only
+	Rerank               *types.RerankOptions `json:"rerank,omitempty"`                 // Rerank override
 }
 
 // StopSessionRequest represents the stop session request

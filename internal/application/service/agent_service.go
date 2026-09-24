@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/Tencent/WeKnora/internal/agent"
 	"github.com/Tencent/WeKnora/internal/agent/approval"
 	"github.com/Tencent/WeKnora/internal/agent/skills"
 	"github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/application/repository"
+	"github.com/Tencent/WeKnora/internal/browserskill"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -91,6 +93,8 @@ func knowledgeBaseScopesForPrompt(config *types.AgentConfig) ([]string, map[stri
 
 // agentService implements agent-related business logic
 type agentService struct {
+	browserSkill          *browserskill.Manager
+	userRepo              interfaces.UserRepository
 	cfg                   *config.Config
 	modelService          interfaces.ModelService
 	mcpServiceService     interfaces.MCPServiceService
@@ -114,6 +118,11 @@ type agentService struct {
 	sandboxResolver       sandbox.TenantSandboxResolver
 	sandboxPinner         *SessionSandboxPinner
 	sandboxPolicy         WorkspaceSandboxPolicy
+	hostSandbox           sandbox.Manager
+	hostDesktop           bool
+	hostSkillInstaller    sandbox.Manager
+	hostSkillsRoot        string
+	hostSkillVersionsRoot string
 }
 
 // NewAgentService creates a new agent service
@@ -141,8 +150,13 @@ func NewAgentService(
 	sandboxResolver sandbox.TenantSandboxResolver,
 	sandboxPinner *SessionSandboxPinner,
 	sandboxPolicy WorkspaceSandboxPolicy,
+	hostSandbox HostSandboxManager,
+	browserSkill *browserskill.Manager,
+	userRepo interfaces.UserRepository,
 ) interfaces.AgentService {
-	return &agentService{
+	svc := &agentService{
+		browserSkill:          browserSkill,
+		userRepo:              userRepo,
 		cfg:                   cfg,
 		modelService:          modelService,
 		knowledgeBaseService:  knowledgeBaseService,
@@ -166,7 +180,15 @@ func NewAgentService(
 		sandboxResolver:       sandboxResolver,
 		sandboxPinner:         sandboxPinner,
 		sandboxPolicy:         sandboxPolicy,
+		hostSandbox:           hostSandbox.Manager,
+		hostDesktop:           hostSandbox.Desktop,
 	}
+	if hostSandbox.SkillsAvailable() {
+		svc.hostSkillInstaller = hostSandbox.SkillInstaller
+		svc.hostSkillsRoot = hostSandbox.SkillTree.Root()
+		svc.hostSkillVersionsRoot = hostSandbox.SkillTree.VersionsRoot()
+	}
+	return svc
 }
 
 // CreateAgentEngine creates an agent engine with the given configuration and EventBus.
@@ -189,6 +211,9 @@ func (s *agentService) CreateAgentEngine(
 	if chatModel == nil {
 		return nil, fmt.Errorf("chat model is nil after initialization")
 	}
+	if config.LocalBrowserEnabled && (s.browserSkill == nil || !s.browserSkill.Enabled() || config.SkillInstallMode()) {
+		return nil, fmt.Errorf("local browser is unavailable for this turn; enable the browser integration or update the input-bar selection")
+	}
 
 	// 2. Build tool registry
 	toolRegistry := tools.NewToolRegistry()
@@ -198,16 +223,14 @@ func (s *agentService) CreateAgentEngine(
 	if err := s.registerTools(ctx, toolRegistry, config, rerankModel, chatModel, sessionID); err != nil {
 		return nil, fmt.Errorf("failed to register tools: %w", err)
 	}
-	s.registerMCPTools(ctx, toolRegistry, config, eventBus, sessionID, assistantMessageID)
+	s.registerMCPTools(ctx, toolRegistry, config)
 
-	// File tools are a pure sandbox capability independent of the
-	// skill switch: register them whenever the workspace sandbox supports a
-	// session filesystem, even when skills are disabled.
-	s.registerSandboxFileTools(ctx, toolRegistry, sessionID, config)
-	// shell_exec follows SkillsEnabled (or install mode), not the presence
-	// of a ready skill. Register it independently of the skills manager so a
-	// fresh or still-installing sandbox still has a shell.
+	// Register shell first so file listing is only exposed as a fallback when
+	// the selected sandbox cannot provide shell execution.
 	s.registerSandboxShellIfAllowed(ctx, toolRegistry, sessionID, config)
+	s.registerSandboxFileTools(ctx, toolRegistry, sessionID, config)
+	s.registerWebPageFiles(ctx, toolRegistry, config, sessionID, assistantMessageID)
+	toolRegistry.PrepareMCPTools(ctx)
 
 	// 3. Resolve knowledge base and selected document metadata
 	kbInfos, selectedDocs := s.resolveKBAndDocInfos(ctx, config)
@@ -231,6 +254,7 @@ func (s *agentService) CreateAgentEngine(
 		pinnedMCP,
 		s.resolvePinnedSkillInfos(config),
 	)
+	engine.SetQuestionOrigin(s.resolveQuestionOriginInfo(ctx, config.QuestionOrigin, config.SearchTargets, kbInfos))
 
 	// Set VLM image describer for MCP tool result image analysis.
 	// When an MCP tool returns images, the engine uses VLM to generate text descriptions
@@ -272,7 +296,57 @@ func (s *agentService) CreateAgentEngine(
 		}
 	}
 
+	// Browser operations are native BrowserSkill RPCs, independent of shell and sandbox setup.
+	if config.LocalBrowserEnabled && s.browserSkill != nil && s.browserSkill.Enabled() && !config.SkillInstallMode() {
+		scope := tools.BrowserSkillScope(ctx)
+		instructions, err := s.browserSearchInstructions(ctx)
+		if err != nil {
+			return nil, err
+		}
+		toolRegistry.RegisterTool(tools.NewBrowserSkillTool(
+			s.browserSkill, scope, sessionID, instructions,
+		))
+	}
+
+	toolRegistry.BindSession(sessionID)
+	engine.SetWorkspaceLayout(s.lookupSessionWorkspaceLayout(ctx, sessionID, config))
+
 	return engine, nil
+}
+
+// resolveQuestionOriginInfo revalidates the suggested question's source for
+// this turn and attaches only a document that belongs to the selected base.
+func (s *agentService) resolveQuestionOriginInfo(
+	ctx context.Context, origin *types.QuestionOrigin, targets types.SearchTargets,
+	kbInfos []*agent.KnowledgeBaseInfo,
+) *agent.QuestionOriginInfo {
+	if origin == nil || origin.KnowledgeBaseID == "" || !targets.ContainsKB(origin.KnowledgeBaseID) {
+		return nil
+	}
+	info := &agent.QuestionOriginInfo{KnowledgeBaseID: origin.KnowledgeBaseID}
+	for _, kb := range kbInfos {
+		if kb != nil && kb.ID == origin.KnowledgeBaseID {
+			info.KnowledgeBaseName = kb.Name
+			break
+		}
+	}
+	if info.KnowledgeBaseName == "" && s.knowledgeBaseService != nil {
+		kb, err := s.knowledgeBaseService.GetKnowledgeBaseByID(ctx, origin.KnowledgeBaseID)
+		if err == nil && kb != nil {
+			info.KnowledgeBaseName = kb.Name
+		}
+	}
+	if origin.KnowledgeID == "" {
+		return info
+	}
+	docs, err := s.getSelectedDocumentInfos(ctx, []string{origin.KnowledgeID})
+	if err != nil || len(docs) != 1 || docs[0].KnowledgeBaseID != origin.KnowledgeBaseID {
+		logger.Infof(ctx, "Question origin document %s dropped: not found in knowledge base %s",
+			secutils.SanitizeForLog(origin.KnowledgeID), secutils.SanitizeForLog(origin.KnowledgeBaseID))
+		return info
+	}
+	info.Document = docs[0]
+	return info
 }
 
 // registerMCPTools registers MCP tools from enabled services for this tenant.
@@ -280,8 +354,6 @@ func (s *agentService) registerMCPTools(
 	ctx context.Context,
 	toolRegistry *tools.ToolRegistry,
 	config *types.AgentConfig,
-	eventBus *event.EventBus,
-	sessionID, assistantMessageID string,
 ) {
 	tenantID := uint64(0)
 	if tid, ok := types.TenantIDFromContext(ctx); ok {
@@ -329,18 +401,15 @@ func (s *agentService) registerMCPTools(
 		}
 	}
 	if len(enabledServices) > 0 {
-		var regCtx *tools.MCPOAuthSession
-		if eventBus != nil && sessionID != "" && assistantMessageID != "" {
-			regCtx = &tools.MCPOAuthSession{
-				EventBus:               eventBus,
-				SessionID:              sessionID,
-				AssistantMessageID:     assistantMessageID,
-				ApprovalCtx:            ctx,
-				AuthWaitTimeoutSeconds: config.MCPAuthWaitTimeout,
-			}
+		metadataService, ok := s.mcpServiceService.(interfaces.MCPMetadataService)
+		if !ok {
+			logger.Warnf(ctx, "MCP metadata storage is unavailable")
+			return
 		}
 		registered, err := tools.RegisterMCPTools(
-			ctx, toolRegistry, enabledServices, s.mcpManager, s.toolApprovalGate, regCtx,
+			ctx, toolRegistry, enabledServices, s.mcpManager, s.toolApprovalGate,
+			config.MCPAuthWaitTimeout, s.mcpServiceService.GetMCPServiceByID,
+			&tools.MCPMetadataIO{Get: metadataService.GetMCPMetadata, Put: metadataService.PersistMCPMetadata},
 		)
 		if err != nil {
 			logger.Warnf(ctx, "Failed to register MCP tools: %v", err)
@@ -381,7 +450,7 @@ func (s *agentService) resolveKBAndDocInfos(
 	return kbInfos, selectedDocs
 }
 
-// registerSandboxFileTools registers list_sandbox_files / read_sandbox_file /
+// registerSandboxFileTools registers list_sandbox_files / read_file /
 // write_sandbox_file / edit_sandbox_file.
 //
 // These expose per-session filesystem access and are a pure sandbox
@@ -392,12 +461,8 @@ func (s *agentService) resolveKBAndDocInfos(
 // read-only). Registration only requires a non-disabled sandbox whose
 // manager advertises a SessionFileStore.
 //
-// The skill installer is the exception: write_sandbox_file only accepts
-// /workspace, the installer must write .weknora/requirements.json under
-// /opt/weknora/tenant/skills, and its prompt forbids touching /workspace
-// (that tree is wiped before the snapshot). Offering the file tools made
-// the first write of every install fail, then fall back to a shell heredoc.
-// Install mode uses shell_exec alone.
+// The skill installer writes under its image skill directory rather than
+// /workspace, so install mode receives the separately scoped skill file tools.
 func (s *agentService) registerSandboxFileTools(
 	ctx context.Context,
 	toolRegistry *tools.ToolRegistry,
@@ -406,6 +471,7 @@ func (s *agentService) registerSandboxFileTools(
 ) {
 	if config != nil && config.SkillInstallMode() {
 		logger.Infof(ctx, "Skipping session file tools in skill install mode")
+		s.registerSkillFileTools(ctx, toolRegistry, sessionID, config)
 		return
 	}
 	sandboxMgr, err := s.resolveWorkspaceSandbox(ctx, sessionID, config)
@@ -417,15 +483,80 @@ func (s *agentService) registerSandboxFileTools(
 		return
 	}
 	if store := sessionSandboxFileStore(sandboxMgr); store != nil {
-		toolRegistry.RegisterTool(tools.NewListSandboxFilesTool(store))
-		toolRegistry.RegisterTool(tools.NewReadSandboxFileTool(store))
-		toolRegistry.RegisterTool(tools.NewWriteSandboxFileTool(store))
+		if _, err := toolRegistry.GetTool(tools.ToolShellExec); err != nil {
+			toolRegistry.RegisterTool(tools.NewListSandboxFilesTool(store))
+		}
+		toolRegistry.RegisterTool(tools.NewReadFileTool(store))
+		completionTokens := 0
+		if config != nil {
+			completionTokens = types.AgentRoundMaxCompletionTokensFor(config.MaxCompletionTokens, config.SandboxConfigID)
+		}
+		toolRegistry.RegisterTool(tools.NewWriteSandboxFileTool(store, completionTokens))
 		toolRegistry.RegisterTool(tools.NewEditSandboxFileTool(store))
-		logger.Infof(ctx, "Registered list_sandbox_files, read_sandbox_file, write_sandbox_file, and edit_sandbox_file tools")
+		logger.Infof(ctx, "Registered session file tools")
 	} else {
 		logger.Infof(ctx, "Sandbox backend does not advertise session filesystem capability; "+
-			"list_sandbox_files/read_sandbox_file/write_sandbox_file/edit_sandbox_file not registered")
+			"list_sandbox_files/read_file/write_sandbox_file/edit_sandbox_file not registered")
 	}
+}
+
+// registerSkillFileTools registers write_skill_file / edit_skill_file for the
+// built-in skill installer, and for nothing else.
+//
+// The installer's shell already runs as root inside the skills image root, so
+// these tools grant no reach it does not have. They exist because its only
+// writer was `cat` with a heredoc: every file went through the shell's
+// command-length cap and two levels of quoting, which truncated or mangled
+// anything larger than a few lines.
+//
+// Two conditions gate registration, and both are checked here rather than
+// trusted from the caller. SkillInstallMode is settable only through
+// EnableSkillInstallMode, which refuses every agent but the built-in
+// installer. The skill directory is re-validated against the install path
+// rules (host versions root or image root), so a run that somehow carried a
+// bad scope gets no writer at all instead of one pointed somewhere unintended.
+func (s *agentService) registerSkillFileTools(
+	ctx context.Context,
+	toolRegistry *tools.ToolRegistry,
+	sessionID string,
+	config *types.AgentConfig,
+) {
+	if config == nil || !config.SkillInstallMode() {
+		return
+	}
+	skillDir, ok := s.validInstallDir(config)
+	if !ok {
+		logger.Warnf(ctx, "Install mode carries no valid skill directory (%q); skill file tools not registered", config.SkillInstallDir())
+		return
+	}
+	sandboxMgr, err := s.resolveWorkspaceSandbox(ctx, sessionID, config)
+	if err != nil {
+		logger.Warnf(ctx, "Failed to resolve sandbox for skill file tools: %v", err)
+		return
+	}
+	store, ok := sandboxMgr.(tools.SkillFileStore)
+	if !ok {
+		logger.Infof(ctx, "Sandbox backend cannot write the skills image root; skill file tools not registered")
+		return
+	}
+	toolRegistry.RegisterTool(tools.NewWriteSkillFileTool(store, skillDir))
+	toolRegistry.RegisterTool(tools.NewEditSkillFileTool(store, skillDir))
+	logger.Infof(ctx, "Registered skill file tools scoped to %s", skillDir)
+}
+
+// validInstallDir is the skill directory the installer may write. Host
+// installs live under the local versions root, remote ones under the image.
+func (s *agentService) validInstallDir(config *types.AgentConfig) (string, bool) {
+	if config == nil || !config.SkillInstallMode() {
+		return "", false
+	}
+	if sandbox.IsHostSkillTarget(config.SandboxConfigID) {
+		if s.hostSkillVersionsRoot == "" {
+			return "", false
+		}
+		return sandbox.ValidatedSkillDirUnder(s.hostSkillVersionsRoot, config.SkillInstallDir())
+	}
+	return sandbox.ValidatedImageSkillDir(config.SkillInstallDir())
 }
 
 // registerSandboxShellIfAllowed registers shell_exec when this run is
@@ -438,7 +569,7 @@ func (s *agentService) registerSandboxShellIfAllowed(
 	sessionID string,
 	config *types.AgentConfig,
 ) {
-	if config == nil || (!config.SkillsEnabled && !config.SkillInstallMode()) {
+	if config == nil {
 		return
 	}
 	sandboxMgr, err := s.resolveWorkspaceSandbox(ctx, sessionID, config)
@@ -449,7 +580,20 @@ func (s *agentService) registerSandboxShellIfAllowed(
 	if sandboxMgr == nil {
 		return
 	}
+	if sandboxMgr.GetType() != sandbox.SandboxTypeHost && !config.SkillsEnabled && !config.SkillInstallMode() {
+		return
+	}
 	s.registerSandboxShellTool(ctx, toolRegistry, sandboxMgr, config)
+}
+
+// resolveOpts is every resolve option this run is entitled to. Only the
+// built-in installer may reach the install sandbox.
+func (s *agentService) resolveOpts(config *types.AgentConfig) []resolveOption {
+	opts := []resolveOption{withLiteHostSandbox(s.hostSandbox), withLiteDesktop(s.hostDesktop)}
+	if config != nil && config.SkillInstallMode() && s.hostSkillInstaller != nil {
+		opts = append(opts, withHostSkillInstaller(s.hostSkillInstaller))
+	}
+	return opts
 }
 
 // resolveWorkspaceSandbox returns the session's remote sandbox manager, or
@@ -472,6 +616,7 @@ func (s *agentService) resolveWorkspaceSandbox(
 	sandboxMgr, _, err := resolveSandboxForExecution(
 		ctx, s.sandboxResolver, s.sandboxMgr, s.sandboxPinner,
 		tenantID, sessionID, configID, s.sandboxPolicy,
+		s.resolveOpts(config)...,
 	)
 	if err != nil {
 		return nil, err
@@ -496,9 +641,10 @@ func (s *agentService) initializeSkillsManager(
 	toolRegistry *tools.ToolRegistry,
 ) (*skills.Manager, error) {
 	tenantID, _ := types.TenantIDFromContext(ctx)
-	sandboxMgr, configID, err := resolveSandboxForExecution(
+	sandboxMgr, pin, err := resolveSandboxForExecution(
 		ctx, s.sandboxResolver, s.sandboxMgr, s.sandboxPinner,
 		tenantID, sessionID, config.SandboxConfigID, s.sandboxPolicy,
+		s.resolveOpts(config)...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("resolve sandbox config for session %s: %w", sessionID, err)
@@ -507,7 +653,8 @@ func (s *agentService) initializeSkillsManager(
 		sandboxMgr = sandbox.NewDisabledManager()
 	}
 
-	logger.Infof(ctx, "Workspace sandbox in use: config=%s type=%s", configID, sandboxMgr.GetType())
+	logger.Infof(ctx, "Workspace sandbox in use: config=%s workspace=%d type=%s",
+		pin.ConfigID, pin.TenantOr(tenantID), sandboxMgr.GetType())
 
 	// Create skills manager
 	skillsConfig := &skills.ManagerConfig{
@@ -517,6 +664,9 @@ func (s *agentService) initializeSkillsManager(
 	}
 
 	skillsManager := skills.NewManager(skillsConfig, sandboxMgr)
+	if s.hostDesktop && s.hostSkillsRoot != "" {
+		skillsManager.WithSkillsRoot(s.hostSkillsRoot)
+	}
 	if source := s.tenantSkillSource(ctx, config); source != nil {
 		skillsManager.WithTenantSource(source)
 	}
@@ -529,16 +679,32 @@ func (s *agentService) initializeSkillsManager(
 		return nil, fmt.Errorf("failed to initialize skills: %w", err)
 	}
 
-	// Skill tools follow SkillsEnabled, not merely sandbox availability: the
-	// skill installer agent must have shell_exec WITHOUT execute_skill_script,
-	// since it is the thing installing skills. shell_exec itself is registered
-	// by registerSandboxShellIfAllowed, not here.
+	// read_file is the unified skill/workspace reader. Attach the active skills
+	// catalog even when the workspace has no file store so installed resources
+	// remain readable; keep read_skill as a compatibility capability for local
+	// agents whose prompts still name it.
 	if config.SkillsEnabled {
+		shellEnabled := false
+		if tool, err := toolRegistry.GetTool(tools.ToolShellExec); err == nil {
+			if shell, ok := tool.(*tools.ShellExecTool); ok {
+				shell.WithSkillEnvironment(skillsManager)
+				shellEnabled = true
+			}
+		}
+		var reader *tools.ReadFileTool
+		if tool, err := toolRegistry.GetTool(tools.ToolReadFile); err == nil {
+			reader, _ = tool.(*tools.ReadFileTool)
+		}
+		if reader == nil {
+			reader = tools.NewReadFileTool(nil)
+			toolRegistry.RegisterTool(reader)
+		}
+		reader.WithSkills(skillsManager, shellEnabled)
 		toolRegistry.RegisterTool(tools.NewReadSkillTool(skillsManager))
 		logger.Infof(ctx, "Registered read_skill tool")
 	}
 
-	if sandboxMgr.GetType() != sandbox.SandboxTypeDisabled && config.SkillsEnabled {
+	if sandboxMgr.GetType() != sandbox.SandboxTypeDisabled && config.SkillsEnabled && !config.SkillInstallMode() {
 		toolRegistry.RegisterTool(tools.NewExecuteSkillScriptTool(skillsManager))
 		logger.Infof(ctx, "Registered execute_skill_script tool")
 	}
@@ -569,9 +735,95 @@ func (s *agentService) tenantSkillSource(
 	// a caller ever creates the engine under a shorter-lived context, bundle
 	// downloads start failing for installed skills only, and loadBundle needs
 	// a ctx parameter.
-	return skills.NewTenantSkillSource(rows, func(ref string) ([]byte, error) {
-		return s.readSkillBundle(ctx, ownerTenantID, ref)
+	root := sandbox.SkillsImageRoot
+	if s.hostDesktop && s.hostSkillsRoot != "" {
+		root = s.hostSkillsRoot
+	}
+	return skills.NewTenantSkillSourceAt(root, rows, func(row *types.TenantSkillEntity) ([]byte, error) {
+		return s.loadInstalledSkillBundle(ctx, ownerTenantID, row)
 	})
+}
+
+// loadInstalledSkillBundle reads the archive one installed skill was built
+// from. An object named by the row itself is that archive. A row that only
+// names a catalog is answered from the definition's zip, but the definition is
+// mutable — registering the same skill again stores a new object and updates
+// the catalog ref, while this sandbox goes on running the image built from the
+// previous bytes. Skill resources serve what was installed, so a definition
+// that has moved on is reported rather than substituted.
+func (s *agentService) loadInstalledSkillBundle(
+	ctx context.Context, tenantID uint64, row *types.TenantSkillEntity,
+) ([]byte, error) {
+	if row == nil {
+		return nil, errors.New("skill is required")
+	}
+	if ref := strings.TrimSpace(row.BundleRef); ref != "" {
+		return s.readSkillBundle(ctx, tenantID, ref)
+	}
+	catalogID := strings.TrimSpace(row.CatalogID)
+	if catalogID == "" || s.db == nil {
+		return nil, fmt.Errorf("skill %s has no stored bundle; its files cannot be read", row.Name)
+	}
+	catalog, err := repository.NewTenantSkillRepository(s.db).GetCatalog(ctx, tenantID, catalogID)
+	if err != nil {
+		return nil, err
+	}
+	if catalog == nil || strings.TrimSpace(catalog.BundleRef) == "" {
+		return nil, fmt.Errorf("skill %s has no stored bundle; its files cannot be read", row.Name)
+	}
+	archive, err := s.readSkillBundle(ctx, tenantID, strings.TrimSpace(catalog.BundleRef))
+	if err != nil {
+		return nil, err
+	}
+	// Check the bytes: a catalog reference and digest that disagree is exactly
+	// the state left by a stamped-but-unstored archive.
+	if want := strings.TrimSpace(row.BundleSHA256); want != "" && !archiveMatchesSHA(archive, want) {
+		return nil, fmt.Errorf(
+			"skill %s was registered again from a different archive; reinstall it on this sandbox before reading its files", row.Name)
+	}
+	return archive, nil
+}
+
+func (s *agentService) lookupSessionWorkspaceLayout(
+	ctx context.Context,
+	sessionID string,
+	config *types.AgentConfig,
+) sandbox.WorkspaceLayout {
+	configID := ""
+	if config != nil {
+		configID = config.SandboxConfigID
+	}
+	mgr, err := s.resolveWorkspaceSandbox(ctx, sessionID, config)
+	return sessionWorkspaceLayout(ctx, sessionID, mgr, err, s.hostSandbox, configID)
+}
+
+// sessionWorkspaceLayout is shared by prompts and attachment staging. Lite
+// host sessions must not fall back to the remote /workspace contract.
+func sessionWorkspaceLayout(
+	ctx context.Context,
+	sessionID string,
+	mgr sandbox.Manager,
+	resolveErr error,
+	host sandbox.Manager,
+	configID string,
+) sandbox.WorkspaceLayout {
+	if resolveErr != nil || mgr == nil {
+		if liteHostSandbox(host) != nil && !hasNamedSandboxConfig(configID) {
+			return sandbox.FailedHostWorkspaceLayout()
+		}
+		return sandbox.RemoteWorkspaceLayout()
+	}
+	if provider, ok := mgr.(sandbox.SessionWorkspaceLayoutProvider); ok && provider != nil {
+		layout, err := provider.SessionWorkspaceLayout(ctx, sessionID)
+		if err != nil || !layout.HasRoot() {
+			return sandbox.FailedHostWorkspaceLayout()
+		}
+		return layout.Normalized()
+	}
+	if mgr.GetType() == sandbox.SandboxTypeHost {
+		return sandbox.FailedHostWorkspaceLayout()
+	}
+	return sandbox.RemoteWorkspaceLayout()
 }
 
 // userEnvResolver builds the per-caller environment resolver for this run, or
@@ -587,6 +839,9 @@ func (s *agentService) userEnvResolver(
 	ctx context.Context, config *types.AgentConfig,
 ) skills.SkillEnvResolver {
 	configID := config.SandboxConfigID
+	if s.hostDesktop {
+		configID = sandbox.HostSkillTargetID
+	}
 	if configID == "" {
 		return nil
 	}
@@ -611,7 +866,43 @@ func (s *agentService) userEnvResolver(
 	if tenantID == 0 {
 		return nil
 	}
-	return NewUserEnvResolver(rows, repository.NewTenantSkillRepository(s.db), tenantID, configID)
+	var createTime map[string]string
+	if !sandbox.IsHostSkillTarget(configID) {
+		createTime = sandboxCreateTimeEnvVars(ctx, s.db, tenantID, configID)
+	}
+	return NewUserEnvResolver(
+		rows,
+		repository.NewTenantSkillRepository(s.db),
+		createTime,
+		tenantID, configID,
+	)
+}
+
+// sandboxCreateTimeEnvVars loads the config's env_vars once per agent run for
+// the required check. They are not re-injected: the container already has them.
+// A read failure degrades to empty so a DB blip does not surface as "nobody
+// has set this credential".
+func sandboxCreateTimeEnvVars(
+	ctx context.Context, db *gorm.DB, tenantID uint64, configID string,
+) map[string]string {
+	if db == nil || db.Config == nil {
+		return nil
+	}
+	cfg, err := repository.NewTenantSandboxConfigRepository(db).GetByID(ctx, tenantID, configID)
+	if err != nil {
+		logger.Warnf(ctx, "[skill] sandbox config %s: create-time env unavailable: %v", configID, err)
+		return nil
+	}
+	if cfg == nil || cfg.Config == nil {
+		return nil
+	}
+	env := map[string]string{}
+	for name, value := range cfg.Config.EnvVars {
+		if value != "" {
+			env[name] = value
+		}
+	}
+	return env
 }
 
 // skillEnvCapture writes declared skill credentials a successful shell_exec
@@ -619,14 +910,23 @@ func (s *agentService) userEnvResolver(
 // against. Errors stay inside the callback so a failed persist cannot change
 // the tool result the model already received.
 func (s *agentService) skillEnvCapture(config *types.AgentConfig) tools.SkillEnvCapture {
-	if s.db == nil || config == nil || config.SandboxConfigID == "" {
+	if s.db == nil || config == nil {
 		return nil
 	}
 	configID := config.SandboxConfigID
+	if s.hostDesktop {
+		// Lite agents store no config; values live under the host target,
+		// which is where userEnvResolver reads them.
+		configID = sandbox.HostSkillTargetID
+	}
+	if configID == "" {
+		return nil
+	}
 	return func(ctx context.Context, skillName string, pairs map[string]string) {
 		svc := NewUserEnvService(
 			repository.NewTenantSkillRepository(s.db),
 			repository.NewTenantSandboxConfigRepository(s.db),
+			HostSandboxManager{Desktop: s.hostDesktop},
 		)
 		if err := svc.CaptureSkillEnv(ctx, configID, skillName, pairs); err != nil {
 			logger.Warnf(ctx, "[skill] capture env for %s failed: %v", skillName, err)
@@ -691,12 +991,23 @@ func (s *agentService) registerSandboxShellTool(
 	config *types.AgentConfig,
 ) {
 	if config.SkillInstallMode() {
-		if executor := sessionSandboxInstallShellExecutor(sandboxMgr); executor != nil {
-			toolRegistry.RegisterTool(tools.NewInstallShellExecTool(executor))
-			logger.Infof(ctx, "Registered install-mode shell_exec tool")
-		} else {
+		executor := sessionSandboxInstallShellExecutor(sandboxMgr)
+		if executor == nil {
 			logger.Warnf(ctx, "Sandbox backend does not advertise install-mode shell; skill install cannot run")
+			return
 		}
+		skillDir, ok := s.validInstallDir(config)
+		if !ok {
+			logger.Warnf(ctx, "Install mode carries no valid skill directory (%q); shell_exec not registered",
+				config.SkillInstallDir())
+			return
+		}
+		if sandbox.IsHostSkillTarget(config.SandboxConfigID) {
+			toolRegistry.RegisterTool(tools.NewHostInstallShellExecTool(executor, skillDir))
+		} else {
+			toolRegistry.RegisterTool(tools.NewInstallShellExecTool(executor, skillDir))
+		}
+		logger.Infof(ctx, "Registered install-mode shell_exec tool (work_dir defaults to %s)", skillDir)
 		return
 	}
 	if executor := sessionSandboxShellExecutor(sandboxMgr); executor != nil {
@@ -777,25 +1088,28 @@ func (s *agentService) registerTools(
 	if !hasKnowledge {
 		filteredTools := make([]string, 0)
 		kbTools := map[string]bool{
-			tools.ToolKnowledgeSearch:     true,
-			tools.ToolGrepChunks:          true,
-			tools.ToolListKnowledgeChunks: true,
-			tools.ToolQueryKnowledgeGraph: true,
-			tools.ToolGetDocumentInfo:     true,
-			tools.ToolDatabaseQuery:       true,
-			tools.ToolDataAnalysis:        true,
-			tools.ToolDataSchema:          true,
+			tools.ToolSearchKnowledge:           true,
+			tools.ToolKnowledgeSearch:           true,
+			tools.ToolReadDocument:              true,
+			tools.ToolListDocuments:             true,
+			tools.LegacyToolGrepChunks:          true,
+			tools.LegacyToolListKnowledgeChunks: true,
+			tools.LegacyToolGetDocumentInfo:     true,
+			tools.ToolQueryKnowledgeGraph:       true,
+			tools.ToolDatabaseQuery:             true,
+			tools.ToolDataAnalysis:              true,
+			tools.ToolDataSchema:                true,
 			// Wiki tools also require at least one KB in scope.
-			tools.ToolWikiReadPage:      true,
-			tools.ToolWikiSearch:        true,
-			tools.ToolWikiReadSourceDoc: true,
-			tools.ToolWikiFlagIssue:     true,
-			tools.ToolWikiWritePage:     true,
-			tools.ToolWikiReplaceText:   true,
-			tools.ToolWikiRenamePage:    true,
-			tools.ToolWikiDeletePage:    true,
-			tools.ToolWikiReadIssue:     true,
-			tools.ToolWikiUpdateIssue:   true,
+			tools.ToolWikiReadPage:            true,
+			tools.ToolWikiSearch:              true,
+			tools.LegacyToolWikiReadSourceDoc: true,
+			tools.ToolWikiFlagIssue:           true,
+			tools.ToolWikiWritePage:           true,
+			tools.ToolWikiReplaceText:         true,
+			tools.ToolWikiRenamePage:          true,
+			tools.ToolWikiDeletePage:          true,
+			tools.ToolWikiReadIssue:           true,
+			tools.ToolWikiUpdateIssue:         true,
 		}
 
 		// If no knowledge and no web search, also disable todo_write (not useful for simple chat)
@@ -842,24 +1156,26 @@ func (s *agentService) registerTools(
 	// in AgentEditorModal.vue. These are *all* tools that retrieve/inspect
 	// content from RAG-style knowledge bases.
 	ragToolSet := map[string]bool{
+		tools.ToolSearchKnowledge:     true,
 		tools.ToolKnowledgeSearch:     true,
-		tools.ToolGrepChunks:          true,
-		tools.ToolListKnowledgeChunks: true,
 		tools.ToolQueryKnowledgeGraph: true,
-		tools.ToolGetDocumentInfo:     true,
 		tools.ToolDatabaseQuery:       true,
 	}
+	documentToolSet := map[string]bool{
+		tools.ToolReadDocument:  true,
+		tools.ToolListDocuments: true,
+	}
 	allWikiToolSet := map[string]bool{
-		tools.ToolWikiReadPage:      true,
-		tools.ToolWikiSearch:        true,
-		tools.ToolWikiReadSourceDoc: true,
-		tools.ToolWikiFlagIssue:     true,
-		tools.ToolWikiWritePage:     true,
-		tools.ToolWikiReplaceText:   true,
-		tools.ToolWikiRenamePage:    true,
-		tools.ToolWikiDeletePage:    true,
-		tools.ToolWikiReadIssue:     true,
-		tools.ToolWikiUpdateIssue:   true,
+		tools.ToolWikiReadPage:            true,
+		tools.ToolWikiSearch:              true,
+		tools.LegacyToolWikiReadSourceDoc: true,
+		tools.ToolWikiFlagIssue:           true,
+		tools.ToolWikiWritePage:           true,
+		tools.ToolWikiReplaceText:         true,
+		tools.ToolWikiRenamePage:          true,
+		tools.ToolWikiDeletePage:          true,
+		tools.ToolWikiReadIssue:           true,
+		tools.ToolWikiUpdateIssue:         true,
 	}
 
 	// Hard safety nets: drop tools whose runtime prerequisite is missing.
@@ -884,7 +1200,7 @@ func (s *agentService) registerTools(
 		filtered := make([]string, 0, len(allowedTools))
 		dropped := make([]string, 0)
 		for _, t := range allowedTools {
-			if ragToolSet[t] {
+			if ragToolSet[t] || (documentToolSet[t] && !hasWikiKB) {
 				dropped = append(dropped, t)
 				continue
 			}
@@ -909,6 +1225,15 @@ func (s *agentService) registerTools(
 			toolToRegister = tools.NewSequentialThinkingTool()
 		case tools.ToolTodoWrite:
 			toolToRegister = tools.NewTodoWriteTool()
+		case tools.ToolSearchKnowledge:
+			toolToRegister = tools.NewSearchKnowledgeTool(
+				s.knowledgeBaseService,
+				s.knowledgeService,
+				s.chunkService,
+				config.SearchTargets,
+				rerankModel,
+				s.cfg,
+			)
 		case tools.ToolKnowledgeSearch:
 			toolToRegister = tools.NewKnowledgeSearchTool(
 				s.knowledgeBaseService,
@@ -918,16 +1243,13 @@ func (s *agentService) registerTools(
 				rerankModel,
 				s.cfg,
 			)
-		case tools.ToolGrepChunks:
-			toolToRegister = tools.NewGrepChunksTool(s.db, config.SearchTargets)
-			logger.Infof(ctx, "Registered grep_chunks tool with searchTargets: %d targets", len(config.SearchTargets))
-		case tools.ToolListKnowledgeChunks:
-			toolToRegister = tools.NewListKnowledgeChunksTool(s.knowledgeService, s.chunkService, config.SearchTargets)
+		case tools.ToolReadDocument:
+			toolToRegister = tools.NewReadDocumentTool(s.knowledgeService, s.chunkService, config.SearchTargets)
+		case tools.ToolListDocuments:
+			toolToRegister = tools.NewListDocumentsTool(s.knowledgeService, config.SearchTargets)
 		case tools.ToolQueryKnowledgeGraph:
 			toolToRegister = tools.NewQueryKnowledgeGraphTool(s.knowledgeBaseService, config.SearchTargets).
 				WithKnowledgeScope(s.knowledgeService)
-		case tools.ToolGetDocumentInfo:
-			toolToRegister = tools.NewGetDocumentInfoTool(s.knowledgeService, s.chunkService, config.SearchTargets)
 		case tools.ToolSearchConversations:
 			// The owner is captured from the caller's identity here, not read
 			// from the model's arguments, so no prompt can redirect the search
@@ -944,18 +1266,12 @@ func (s *agentService) registerTools(
 			toolToRegister = tools.NewDatabaseQueryTool(s.db, config.SearchTargets)
 		case tools.ToolWebSearch:
 			toolToRegister = tools.NewWebSearchTool(
-				s.webSearchService,
-				s.knowledgeBaseService,
-				s.knowledgeService,
-				s.webSearchStateService,
-				sessionID,
-				config.WebSearchMaxResults,
-				config.WebSearchProviderID,
+				s.webSearchService, config.WebSearchMaxResults, config.WebSearchProviderID,
 			)
 			logger.Infof(ctx, "Registered web_search tool for session: %s, maxResults: %d, providerID: %s", sessionID, config.WebSearchMaxResults, config.WebSearchProviderID)
 
 		case tools.ToolWebFetch:
-			toolToRegister = tools.NewWebFetchTool(chatModel)
+			toolToRegister = tools.NewWebFetchTool()
 			logger.Infof(ctx, "Registered web_fetch tool for session: %s", sessionID)
 
 		case tools.ToolDataAnalysis:
@@ -973,8 +1289,6 @@ func (s *agentService) registerTools(
 			toolToRegister = tools.NewWikiReadPageTool(s.wikiPageService, s.knowledgeService, wikiScopes, wikiRoutes)
 		case tools.ToolWikiSearch:
 			toolToRegister = tools.NewWikiSearchTool(s.wikiPageService, s.knowledgeService, wikiScopes, wikiRoutes)
-		case tools.ToolWikiReadSourceDoc:
-			toolToRegister = tools.NewWikiReadSourceDocTool(s.knowledgeService, s.chunkService, config.SearchTargets)
 		case tools.ToolWikiFlagIssue:
 			toolToRegister = tools.NewWikiFlagIssueTool(s.wikiPageService, wikiKBIDs, wikiRoutes).
 				WithKnowledgeScope(s.knowledgeService, config.SearchTargets)
@@ -994,6 +1308,7 @@ func (s *agentService) registerTools(
 			toolToRegister = tools.NewWikiDeletePageTool(s.wikiPageService, wikiKBIDs, wikiRoutes)
 
 		case tools.ToolShellExec, tools.ToolReadSkill, tools.ToolExecuteSkillScript,
+			tools.ToolWriteSkillFile, tools.ToolEditSkillFile,
 			tools.ToolListSandboxFiles, tools.ToolReadSandboxFile, tools.ToolWriteSandboxFile,
 			tools.ToolEditSandboxFile:
 			// Bound to the resolved sandbox manager in registerSandboxFileTools
@@ -1106,7 +1421,7 @@ func (s *agentService) getKnowledgeBaseInfos(ctx context.Context, kbIDs []string
 			pageResult, err := s.knowledgeService.ListFAQEntries(metaCtx, kbID, &types.Pagination{
 				Page:     1,
 				PageSize: 10,
-			}, nil, 0, "", "", "")
+			}, nil, 0, "", "", "", nil)
 			if err == nil && pageResult != nil {
 				docCount = int(pageResult.Total)
 				if entries, ok := pageResult.Data.([]*types.FAQEntry); ok {

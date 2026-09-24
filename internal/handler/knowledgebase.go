@@ -12,6 +12,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/application/service"
+	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/errors"
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -27,6 +28,7 @@ import (
 
 // KnowledgeBaseHandler defines the HTTP handler for knowledge base operations
 type KnowledgeBaseHandler struct {
+	cfg                *config.Config
 	service            interfaces.KnowledgeBaseService
 	knowledgeService   interfaces.KnowledgeService
 	kbShareService     interfaces.KBShareService
@@ -297,7 +299,7 @@ func (h *KnowledgeBaseHandler) resolveKBStoreView(
 
 // HybridSearch godoc
 // @Summary      混合搜索
-// @Description  在知识库中执行向量和关键词混合搜索。推荐使用 POST；GET 携带 JSON 请求体仍受支持（兼容旧客户端）。
+// @Description  底层召回：向量+关键词混合检索，默认不 rerank（可用 rerank 字段开启）；一般检索请用 /knowledge-search。推荐 POST，GET 带 JSON 体仅兼容旧客户端。
 // @Tags         知识库
 // @Accept       json
 // @Produce      json
@@ -334,6 +336,15 @@ func (h *KnowledgeBaseHandler) HybridSearch(c *gin.Context) {
 		_ = c.Error(apperrors.NewBadRequestError("query_text is required"))
 		return
 	}
+	if err := req.Rerank.Validate(); err != nil {
+		_ = c.Error(apperrors.NewBadRequestError(err.Error()))
+		return
+	}
+	if req.Rerank.IsEnabled() && strings.TrimSpace(req.QueryText) == "" {
+		// The rerank model scores passages against the query text.
+		_ = c.Error(apperrors.NewBadRequestError("query_text is required when rerank is enabled"))
+		return
+	}
 
 	logger.Infof(ctx, "Executing hybrid search, knowledge base ID: %s, query: %s, effectiveTenantID: %d",
 		secutils.SanitizeForLog(id), secutils.SanitizeForLog(req.QueryText), effectiveTenantID)
@@ -346,9 +357,17 @@ func (h *KnowledgeBaseHandler) HybridSearch(c *gin.Context) {
 		return
 	}
 
-	// Execute hybrid search with default search parameters
+	// Execute hybrid search. Without a rerank object this is the raw recall
+	// primitive it has always been; with one, the response carries meta.
 	// Note: For shared KBs, the service uses effectiveTenantID internally via context
-	results, err := h.service.HybridSearch(ctx, id, req)
+	var retrieval *types.RetrievalResult
+	if req.Rerank != nil {
+		retrieval, err = h.service.HybridSearchWithRerank(ctx, id, req)
+	} else {
+		var results []*types.SearchResult
+		results, err = h.service.HybridSearch(ctx, id, req)
+		retrieval = &types.RetrievalResult{Results: results}
+	}
 	if err != nil {
 		// Service-layer typed AppErrors (e.g. ErrVectorStoreBindingInvalid,
 		// ErrVectorStoreUnavailable, BadRequest from multi-store fan-out)
@@ -365,11 +384,15 @@ func (h *KnowledgeBaseHandler) HybridSearch(c *gin.Context) {
 	}
 
 	logger.Infof(ctx, "Hybrid search completed, knowledge base ID: %s, result count: %d",
-		secutils.SanitizeForLog(id), len(results))
-	c.JSON(http.StatusOK, gin.H{
+		secutils.SanitizeForLog(id), len(retrieval.Results))
+	response := gin.H{
 		"success": true,
-		"data":    rewriter.CopyReferences(ctx, results),
-	})
+		"data":    rewriter.CopyReferences(ctx, retrieval.Results),
+	}
+	if retrieval.Meta.Rerank != nil {
+		response["meta"] = retrieval.Meta
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // CreateKnowledgeBase godoc

@@ -23,6 +23,25 @@ func NewMessageRepository(db *gorm.DB) interfaces.MessageRepository {
 	}
 }
 
+// ListAssistantCheckpointsUpTo returns assistant checkpoint rows strictly
+// before the composite history cursor, oldest first.
+func (r *messageRepository) ListAssistantCheckpointsUpTo(
+	ctx context.Context, sessionID string, boundary time.Time, boundaryID string,
+) ([]*types.Message, error) {
+	var messages []*types.Message
+	err := r.db.WithContext(ctx).
+		Model(&types.Message{}).
+		Select("id", "session_id", "role", "created_at", "sandbox_checkpoint").
+		Where("session_id = ? AND role = ?", sessionID, "assistant").
+		Where("created_at < ? OR (created_at = ? AND id < ?)", boundary, boundary, boundaryID).
+		Order("created_at ASC, id ASC").
+		Find(&messages).Error
+	if err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
 // CreateMessage creates a new message
 func (r *messageRepository) CreateMessage(
 	ctx context.Context, message *types.Message,
@@ -255,11 +274,12 @@ func (r *messageRepository) GetMessagesByKnowledgeIDs(
 	return results, nil
 }
 
-// GetMessagesByRequestIDs retrieves messages by their request IDs (used to fetch Q&A pair partners)
+// GetMessagesByRequestIDs retrieves partner messages only from the requested
+// session, preventing a colliding request ID from crossing session boundaries.
 func (r *messageRepository) GetMessagesByRequestIDs(
-	ctx context.Context, requestIDs []string,
+	ctx context.Context, sessionID string, requestIDs []string,
 ) ([]*types.MessageWithSession, error) {
-	if len(requestIDs) == 0 {
+	if sessionID == "" || len(requestIDs) == 0 {
 		return nil, nil
 	}
 	var results []*types.MessageWithSession
@@ -268,6 +288,7 @@ func (r *messageRepository) GetMessagesByRequestIDs(
 		Select("messages.*, sessions.title as session_title").
 		Joins("INNER JOIN sessions ON sessions.id = messages.session_id AND sessions.deleted_at IS NULL").
 		Where("messages.deleted_at IS NULL").
+		Where("messages.session_id = ?", sessionID).
 		Where("messages.request_id IN ?", requestIDs).
 		Find(&results).Error; err != nil {
 		return nil, err
@@ -307,9 +328,47 @@ func (r *messageRepository) UpdateMessageRenderedContent(ctx context.Context, se
 		Update("rendered_content", renderedContent).Error
 }
 
+// UpdateMessageContextCheckpoint writes only the context checkpoint column of
+// an assistant message in the owning session.
+func (r *messageRepository) UpdateMessageContextCheckpoint(
+	ctx context.Context, sessionID, messageID string, checkpoint *types.ContextCheckpoint,
+) error {
+	return r.db.WithContext(ctx).
+		Model(&types.Message{}).
+		Where("id = ? AND session_id = ? AND role = ?", messageID, sessionID, "assistant").
+		Update("context_checkpoint", checkpoint).Error
+}
+
 // DeleteMessagesBySessionID deletes all messages belonging to a session (soft delete)
 func (r *messageRepository) DeleteMessagesBySessionID(ctx context.Context, sessionID string) error {
 	return r.db.WithContext(ctx).Where("session_id = ?", sessionID).Delete(&types.Message{}).Error
+}
+
+func (r *messageRepository) DeleteMessagesFrom(
+	ctx context.Context, sessionID string, boundary time.Time, boundaryID string, inclusive bool,
+) ([]*types.Message, error) {
+	condition := "created_at > ? OR (created_at = ? AND id > ?)"
+	if inclusive {
+		condition = "created_at > ? OR (created_at = ? AND id >= ?)"
+	}
+	var deleted []*types.Message
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		scope := func() *gorm.DB {
+			return tx.Where("session_id = ?", sessionID).
+				Where(condition, boundary, boundary, boundaryID)
+		}
+		if err := scope().Order("created_at ASC, id ASC").Find(&deleted).Error; err != nil {
+			return err
+		}
+		if len(deleted) == 0 {
+			return nil
+		}
+		return scope().Delete(&types.Message{}).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return deleted, nil
 }
 
 // UpdateMessageKnowledgeID updates the knowledge_id field for a message
@@ -322,41 +381,99 @@ func (r *messageRepository) UpdateMessageKnowledgeID(
 		Update("knowledge_id", knowledgeID).Error
 }
 
-// GetSessionArtifacts returns every skill-produced MessageArtifact recorded
-// against any assistant message of the session, in creation order.
-//
-// Projection is scoped to the artifacts JSONB column plus created_at (used
-// to order the flattened output). Assistant messages without artifacts (the
-// common case) contribute an empty slice and cost nothing extra.
-func (r *messageRepository) GetSessionArtifacts(
-	ctx context.Context, sessionID string,
-) (types.MessageArtifacts, error) {
-	if sessionID == "" {
-		return nil, nil
+func (r *messageRepository) ListMessagesBySessionAfterCursor(
+	ctx context.Context, sessionID string, cursor types.MemoryMessageCursor, limit int,
+) ([]*types.Message, error) {
+	var messages []*types.Message
+	query := r.db.WithContext(ctx).Where("session_id = ?", sessionID)
+	if !cursor.At.IsZero() || cursor.ID != "" {
+		query = query.Where("created_at > ? OR (created_at = ? AND id > ?)", cursor.At, cursor.At, cursor.ID)
 	}
-	var rows []struct {
-		Artifacts types.MessageArtifacts `gorm:"column:artifacts"`
-		CreatedAt time.Time              `gorm:"column:created_at"`
-	}
-	if err := r.db.WithContext(ctx).
-		Model(&types.Message{}).
-		Select("artifacts", "created_at").
-		Where("session_id = ? AND deleted_at IS NULL", sessionID).
-		Order("created_at ASC").
-		Find(&rows).Error; err != nil {
+	if err := query.Order("created_at ASC, id ASC").Limit(limit).Find(&messages).Error; err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 {
-		return types.MessageArtifacts{}, nil
+	if err := attachArtifacts(ctx, r.db, messages...); err != nil {
+		return nil, err
 	}
-	result := make(types.MessageArtifacts, 0, len(rows))
-	for _, row := range rows {
-		if len(row.Artifacts) == 0 {
+	return messages, nil
+}
+
+func (r *messageRepository) ListMessagesBySessionBeforeCursor(
+	ctx context.Context, sessionID string, before time.Time, beforeID string, limit int,
+) ([]*types.Message, error) {
+	var messages []*types.Message
+	query := r.db.WithContext(ctx).Where("session_id = ?", sessionID)
+	if !before.IsZero() || beforeID != "" {
+		query = query.Where("created_at < ? OR (created_at = ? AND id < ?)", before, before, beforeID)
+	}
+	if err := query.Order("created_at DESC, id DESC").Limit(limit).Find(&messages).Error; err != nil {
+		return nil, err
+	}
+	if err := attachArtifacts(ctx, r.db, messages...); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+func (r *messageRepository) ListMessagesBySessionUpTo(
+	ctx context.Context, sessionID string, boundary time.Time, boundaryID string,
+) ([]*types.Message, error) {
+	var messages []*types.Message
+	if err := r.db.WithContext(ctx).
+		Where("session_id = ?", sessionID).
+		Where("created_at < ? OR (created_at = ? AND id < ?)", boundary, boundary, boundaryID).
+		Order("created_at ASC, id ASC").
+		Find(&messages).Error; err != nil {
+		return nil, err
+	}
+	if err := attachArtifacts(ctx, r.db, messages...); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+func (r *messageRepository) GetLatestContextCheckpoint(
+	ctx context.Context, sessionID string,
+) (*types.Message, error) {
+	var messages []*types.Message
+	if err := r.db.WithContext(ctx).
+		Select("id", "session_id", "request_id", "role", "created_at", "context_checkpoint").
+		Where("session_id = ? AND role = 'assistant' AND context_checkpoint IS NOT NULL", sessionID).
+		Order("created_at DESC, id DESC").
+		Limit(1).
+		Find(&messages).Error; err != nil {
+		return nil, err
+	}
+	if len(messages) == 0 {
+		return nil, nil
+	}
+	return messages[0], nil
+}
+
+func (r *messageRepository) RewriteSandboxCheckpoints(
+	ctx context.Context, sessionID, oldSandboxID, newSandboxID string,
+) error {
+	if sessionID == "" || oldSandboxID == "" || newSandboxID == "" || oldSandboxID == newSandboxID {
+		return nil
+	}
+	var messages []*types.Message
+	if err := r.db.WithContext(ctx).Where("session_id = ?", sessionID).Find(&messages).Error; err != nil {
+		return err
+	}
+	for _, message := range messages {
+		if message == nil || message.SandboxCheckpoint == nil || message.SandboxCheckpoint.SandboxID != oldSandboxID {
 			continue
 		}
-		result = append(result, row.Artifacts...)
+		updated := *message.SandboxCheckpoint
+		updated.SandboxID = newSandboxID
+		if err := r.db.WithContext(ctx).
+			Model(&types.Message{}).
+			Where("id = ? AND session_id = ?", message.ID, sessionID).
+			Update("sandbox_checkpoint", updated).Error; err != nil {
+			return err
+		}
 	}
-	return result, nil
+	return nil
 }
 
 // GetSessionAttachments returns every user-uploaded attachment in creation

@@ -6,8 +6,8 @@ const editor = readFileSync(new URL('./ModelEditorDialog.vue', import.meta.url),
 const settings = readFileSync(new URL('../views/settings/ModelSettings.vue', import.meta.url), 'utf8')
 
 test('shows thinking control only for chat and reasoning effort for chat plus VLM', () => {
-  assert.match(editor, /<div v-if="showThinkingControlField"[\s\S]*?thinkingControlLabel/)
-  assert.match(editor, /<div v-if="showReasoningEffortField"[\s\S]*?reasoningEffortLabel/)
+  assert.match(editor, /<div v-if="showThinkingControlField"[\s\S]*?advanced\.legacyThinking\.label/)
+  assert.match(editor, /<div v-if="showReasoningEffortField"[\s\S]*?model\.editor\.reasoningEffort/)
   assert.match(editor, /activeModelType\.value === 'chat' && formData\.value\.source === 'remote'/)
   assert.match(editor, /activeModelType\.value === 'chat' \|\| activeModelType\.value === 'vllm'/)
 })

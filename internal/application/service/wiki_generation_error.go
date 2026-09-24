@@ -142,12 +142,18 @@ func classifyWikiGenerationError(ctx context.Context, err error) error {
 			isRetryableWikiStreamCode(streamErr.Details.Code) {
 			return newWikiGenerationError(WikiGenerationErrorTransientTransport, err)
 		}
+		if streamErr.Details.HTTPStatus == 403 && isWikiRateLimitResponse(err.Error()) {
+			return newWikiGenerationError(WikiGenerationErrorTransientTransport, err)
+		}
 		return newWikiGenerationError(WikiGenerationErrorDeterministicOutput, err)
 	}
 
 	var protocolErr *openaiapi.ProtocolHTTPError
 	if errors.As(err, &protocolErr) {
 		if protocolErr.StatusCode == 408 || protocolErr.StatusCode == 429 || protocolErr.StatusCode >= 500 {
+			return newWikiGenerationError(WikiGenerationErrorTransientTransport, err)
+		}
+		if protocolErr.StatusCode == 403 && isWikiRateLimitResponse(err.Error()) {
 			return newWikiGenerationError(WikiGenerationErrorTransientTransport, err)
 		}
 		return newWikiGenerationError(WikiGenerationErrorDeterministicOutput, err)
@@ -165,6 +171,21 @@ func classifyWikiGenerationError(ctx context.Context, err error) error {
 	}
 
 	return newWikiGenerationError(WikiGenerationErrorDeterministicOutput, err)
+}
+
+// isWikiRateLimitResponse recognizes gateways that encode QPM/QPS throttling
+// as HTTP 403. A plain 403 remains an authorization failure and is not retried.
+func isWikiRateLimitResponse(message string) bool {
+	message = strings.ToLower(message)
+	for _, indicator := range []string{
+		"qpm", "qps", "rate limit", "rate_limit", "too many requests", "throttl",
+		"调用频率", "频率超限", "请求过于频繁", "繁忙", "try again later", "retry later", "slow down",
+	} {
+		if strings.Contains(message, indicator) {
+			return true
+		}
+	}
+	return false
 }
 
 func isRetryableWikiStreamCode(code string) bool {

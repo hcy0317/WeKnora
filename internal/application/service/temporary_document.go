@@ -93,15 +93,20 @@ var temporaryTextExtensions = map[string]struct{}{
 	".md": {}, ".markdown": {}, ".txt": {}, ".csv": {}, ".json": {}, ".xml": {}, ".yaml": {}, ".yml": {}, ".log": {},
 }
 
+type sessionAttachmentLookup interface {
+	GetSessionAttachments(context.Context, string) (types.MessageAttachments, error)
+}
+
 type temporaryDocumentService struct {
-	repo            interfaces.TemporaryDocumentRepository
-	fileService     interfaces.FileService
-	resourceCatalog interfaces.ResourceCatalog
-	documentReader  interfaces.DocumentReader
-	imageResolver   *docparser.ImageResolver
-	modelService    interfaces.ModelService
-	tenantService   interfaces.TenantService
-	taskEnqueuer    interfaces.TaskEnqueuer
+	repo               interfaces.TemporaryDocumentRepository
+	sessionAttachments sessionAttachmentLookup
+	fileService        interfaces.FileService
+	resourceCatalog    interfaces.ResourceCatalog
+	documentReader     interfaces.DocumentReader
+	imageResolver      *docparser.ImageResolver
+	modelService       interfaces.ModelService
+	tenantService      interfaces.TenantService
+	taskEnqueuer       interfaces.TaskEnqueuer
 }
 
 func NewTemporaryDocumentService(
@@ -113,11 +118,13 @@ func NewTemporaryDocumentService(
 	modelService interfaces.ModelService,
 	tenantService interfaces.TenantService,
 	taskEnqueuer interfaces.TaskEnqueuer,
+	sessionAttachments interfaces.MessageRepository,
 ) interfaces.TemporaryDocumentService {
 	return &temporaryDocumentService{
 		repo: repo, fileService: fileService, resourceCatalog: resourceCatalog,
 		documentReader: documentReader, imageResolver: imageResolver,
 		modelService: modelService, tenantService: tenantService, taskEnqueuer: taskEnqueuer,
+		sessionAttachments: sessionAttachments,
 	}
 }
 
@@ -242,11 +249,11 @@ func (s *temporaryDocumentService) supportsExtension(ctx context.Context, tenant
 }
 
 func (s *temporaryDocumentService) Get(ctx context.Context, tenantID uint64, sessionID, documentID string) (*types.TemporaryDocument, error) {
-	return s.repo.GetScoped(ctx, tenantID, sessionID, documentID)
+	return s.getSessionDocument(ctx, tenantID, sessionID, documentID)
 }
 
 func (s *temporaryDocumentService) OpenFile(ctx context.Context, tenantID uint64, sessionID, documentID string) (io.ReadCloser, string, error) {
-	document, err := s.repo.GetScoped(ctx, tenantID, sessionID, documentID)
+	document, err := s.getSessionDocument(ctx, tenantID, sessionID, documentID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -258,6 +265,39 @@ func (s *temporaryDocumentService) OpenFile(ctx context.Context, tenantID uint64
 		return nil, "", err
 	}
 	return file, document.FileName, nil
+}
+
+// getSessionDocument accepts a parent-session attachment only when that exact
+// document ID appears in the requested session's persisted message history.
+func (s *temporaryDocumentService) getSessionDocument(
+	ctx context.Context, tenantID uint64, sessionID, documentID string,
+) (*types.TemporaryDocument, error) {
+	document, err := s.repo.GetScoped(ctx, tenantID, sessionID, documentID)
+	if err != nil {
+		return nil, err
+	}
+	if document == nil {
+		document, err = s.repo.GetByID(ctx, tenantID, documentID)
+		if err != nil || document == nil {
+			return document, err
+		}
+	}
+	if document.SessionID == sessionID {
+		return document, nil
+	}
+	if s.sessionAttachments == nil || sessionID == "" {
+		return nil, nil
+	}
+	attachments, err := s.sessionAttachments.GetSessionAttachments(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	for _, attachment := range attachments {
+		if attachment.ID == documentID {
+			return document, nil
+		}
+	}
+	return nil, nil
 }
 
 func (s *temporaryDocumentService) List(ctx context.Context, tenantID uint64, sessionID string) ([]*types.TemporaryDocument, error) {
@@ -609,7 +649,7 @@ func (s *temporaryDocumentService) ResolveForPrompt(ctx context.Context, tenantI
 			continue
 		}
 		seen[documentID] = struct{}{}
-		document, err := s.repo.GetScoped(ctx, tenantID, sessionID, documentID)
+		document, err := s.getSessionDocument(ctx, tenantID, sessionID, documentID)
 		if err != nil {
 			return nil, err
 		}

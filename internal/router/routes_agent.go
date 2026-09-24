@@ -2,11 +2,13 @@ package router
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/Tencent/WeKnora/internal/embedpolicy"
 	"github.com/Tencent/WeKnora/internal/handler"
 	"github.com/Tencent/WeKnora/internal/middleware"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -325,14 +327,42 @@ func embedChannelIDFromPath(path string) string {
 	if !strings.HasPrefix(path, prefix) {
 		return ""
 	}
-	rest := strings.TrimPrefix(path, prefix)
-	if i := strings.IndexByte(rest, '/'); i >= 0 {
-		rest = rest[:i]
+	rest := strings.TrimSuffix(strings.TrimPrefix(path, prefix), "/")
+	if rest == "" || rest == "." || rest == ".." ||
+		strings.TrimSpace(rest) != rest || strings.ContainsAny(rest, "/\\%?#") {
+		return ""
 	}
-	if i := strings.IndexByte(rest, '?'); i >= 0 {
-		rest = rest[:i]
+	return rest
+}
+
+// embedFramePolicyHandler serves only framing policy, never channel config.
+func embedFramePolicyHandler(svc interfaces.EmbedChannelService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		c.Header("Content-Security-Policy", "frame-ancestors 'none'")
+		u, err := url.ParseRequestURI(c.GetHeader("X-Embed-Page-URI"))
+		if err != nil || u.IsAbs() || u.Host != "" {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+		channelID := embedChannelIDFromPath(u.Path)
+		if channelID == "" {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+		channel, err := svc.LookupEnabledChannel(c.Request.Context(), channelID)
+		if err != nil || channel == nil {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+		policy := embedpolicy.FrameAncestors(channel.AllowedOriginsList())
+		c.Header("Content-Security-Policy", policy)
+		if policy == "frame-ancestors 'none'" {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+		c.Status(http.StatusNoContent)
 	}
-	return strings.TrimSpace(rest)
 }
 
 // embedFrameAncestorsMiddleware sets a per-channel `frame-ancestors` CSP on the

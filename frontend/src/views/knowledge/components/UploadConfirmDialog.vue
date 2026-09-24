@@ -480,6 +480,26 @@
                     </div>
                   </div>
 
+                  <div v-show="activeSection === 'summary'" class="section" data-section="summary">
+                    <div class="kb-settings-block">
+                      <div class="section-header">
+                        <h2 class="section-title">{{ t('uploadConfirm.documentSummary') }}</h2>
+                        <p class="section-desc">{{ t('uploadConfirm.documentSummaryDescription') }}</p>
+                      </div>
+                      <div class="settings-group">
+                        <div class="setting-row">
+                          <div class="setting-info">
+                            <label>{{ t('uploadConfirm.generateSummary') }}</label>
+                            <p class="desc">{{ t('uploadConfirm.generateSummaryHint') }}</p>
+                          </div>
+                          <div class="setting-control">
+                            <t-switch v-model="uiState.summaryEnabled" size="medium" />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
                   <div v-show="activeSection === 'question'" class="section">
                     <div class="kb-settings-block">
                       <div class="section-header">
@@ -576,7 +596,7 @@ import type {
 const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']
 const AUDIO_EXTENSIONS = ['mp3', 'wav', 'm4a', 'flac', 'ogg']
 
-type ConfigSectionKey = 'tags' | 'parser' | 'chunking' | 'multimodal' | 'asr' | 'question' | 'graph'
+type ConfigSectionKey = 'tags' | 'parser' | 'chunking' | 'multimodal' | 'asr' | 'summary' | 'question' | 'graph'
 type IssueSectionKey = 'multimodal' | 'asr'
 
 interface ChunkingUIConfig {
@@ -598,6 +618,7 @@ interface ChunkingUIConfig {
 }
 
 interface UploadUIState {
+  summaryEnabled: boolean
   chunkingConfig: ChunkingUIConfig
   multimodalConfig: { enabled: boolean; vllmModelId: string; descriptionLanguage?: string; customInstructions?: string }
   asrConfig: { enabled: boolean; modelId: string; language: string }
@@ -936,6 +957,7 @@ const navItems = computed(() => {
     t('knowledgeEditor.sidebar.asr'),
     issueSectionKeys.value.has('asr'),
   )
+  push('summary', 'file', t('uploadConfirm.documentSummary'))
   push('question', 'chat', t('knowledgeEditor.advanced.questionGeneration.label'))
   if (isGraphSectionAvailable.value) {
     push('graph', 'chart-bubble', t('knowledgeEditor.sidebar.graph'))
@@ -997,6 +1019,10 @@ function getSectionNavStatus(
         statusTone: asr.modelId ? undefined : 'warning',
       }
     }
+    case 'summary':
+      return uiState.value.summaryEnabled
+        ? { status: t('uploadConfirm.statusOn') }
+        : { status: t('uploadConfirm.statusOff'), statusTone: 'muted' }
     case 'question': {
       const question = uiState.value.questionGenerationConfig
       if (!question.enabled) {
@@ -1056,6 +1082,7 @@ function goToSection(key: ConfigSectionKey) {
 
 function createDefaultUIState(): UploadUIState {
   return {
+    summaryEnabled: true,
     chunkingConfig: {
       chunkSize: 512,
       chunkOverlap: 80,
@@ -1092,6 +1119,7 @@ function initFromKbInfo(kb: any) {
   }
 
   uiState.value = {
+    summaryEnabled: true,
     chunkingConfig: {
       chunkSize: kb.chunking_config?.chunk_size || 512,
       chunkOverlap: kb.chunking_config?.chunk_overlap || 80,
@@ -1142,6 +1170,7 @@ function buildProcessOverrides(): KnowledgeProcessOverrides {
   const chunking = state.chunkingConfig
 
   const overrides: KnowledgeProcessOverrides = {
+    summary_enabled: state.summaryEnabled,
     parser_engine_rules: chunking.parserEngineRules,
     chunking_config: {
       chunk_size: chunking.chunkSize,
@@ -1195,6 +1224,7 @@ function buildProcessOverrides(): KnowledgeProcessOverrides {
 function applyOverridesToState(o?: KnowledgeProcessOverrides | null) {
   if (!o) return
   const s = uiState.value
+  if (o.summary_enabled != null) s.summaryEnabled = o.summary_enabled
   const cc = o.chunking_config
   if (cc) {
     if (cc.chunk_size != null) s.chunkingConfig.chunkSize = cc.chunk_size
@@ -1466,7 +1496,7 @@ const handleConfirm = () => {
   height: 85vh;
   max-height: 750px;
   overflow: hidden;
-  border-radius: 12px;
+  border-radius: var(--app-radius-xl);
   background: var(--td-bg-color-container);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
 }
@@ -1482,7 +1512,7 @@ const handleConfirm = () => {
   width: 32px;
   height: 32px;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: var(--td-bg-color-secondarycontainer);
   color: var(--td-text-color-secondary);
   cursor: pointer;
@@ -1504,7 +1534,7 @@ const handleConfirm = () => {
   flex-direction: column;
   flex-shrink: 0;
   width: 220px;
-  background: var(--td-bg-color-settings-modal, var(--td-bg-color-secondarycontainer));
+  background: var(--td-bg-color-settings-modal);
   border-right: 1px solid var(--td-component-stroke);
 }
 
@@ -1539,7 +1569,7 @@ const handleConfirm = () => {
   flex: 1;
   min-width: 0;
   padding-right: 0;
-  font-size: 16px;
+  font-size: var(--app-text-xl);
   font-weight: 600;
   line-height: 1.35;
   color: var(--td-text-color-primary);
@@ -1557,8 +1587,8 @@ const handleConfirm = () => {
   min-width: 20px;
   height: 20px;
   padding: 0 6px;
-  border-radius: 10px;
-  font-size: 11px;
+  border-radius: var(--app-radius-lg);
+  font-size: var(--app-text-xs);
   font-weight: 600;
   line-height: 20px;
   text-align: center;
@@ -1587,11 +1617,11 @@ const handleConfirm = () => {
   border: 0;
   background: transparent;
   font-family: var(--app-font-family);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 18px;
   color: var(--td-text-color-secondary);
   cursor: pointer;
-  transition: color 0.15s ease;
+  transition: color var(--app-motion-fast) ease;
 
   &:hover {
     color: var(--td-brand-color);
@@ -1618,7 +1648,7 @@ const handleConfirm = () => {
 
 .destination-crumb__caret {
   flex-shrink: 0;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   color: var(--td-text-color-placeholder);
 }
 
@@ -1645,8 +1675,8 @@ const handleConfirm = () => {
   gap: 8px;
   margin-bottom: 2px;
   padding: 6px 6px 6px 8px;
-  border-radius: 6px;
-  transition: background-color 0.15s ease;
+  border-radius: var(--app-radius-sm);
+  transition: background-color var(--app-motion-fast) ease;
 
   &:last-child {
     margin-bottom: 0;
@@ -1667,7 +1697,7 @@ const handleConfirm = () => {
 }
 
 .file-icon {
-  font-size: 16px;
+  font-size: var(--app-text-xl);
   color: var(--td-text-color-secondary);
 }
 
@@ -1683,7 +1713,7 @@ const handleConfirm = () => {
 .file-name {
   display: block;
   overflow: hidden;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   font-weight: 500;
   line-height: 1.35;
   color: var(--td-text-color-primary);
@@ -1694,7 +1724,7 @@ const handleConfirm = () => {
 .file-size {
   display: block;
   margin-top: 1px;
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   line-height: 1.3;
   color: var(--td-text-color-placeholder);
   overflow: hidden;
@@ -1720,11 +1750,11 @@ const handleConfirm = () => {
   height: 22px;
   padding: 0;
   border: none;
-  border-radius: 4px;
+  border-radius: var(--app-radius-xs);
   background: transparent;
   color: var(--td-text-color-placeholder);
   cursor: pointer;
-  transition: opacity 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+  transition: opacity var(--app-motion-fast) ease, color var(--app-motion-fast) ease, background-color var(--app-motion-fast) ease;
   opacity: 0.45;
 
   .file-item:hover &,
@@ -1741,7 +1771,7 @@ const handleConfirm = () => {
 .files-empty {
   flex: 1;
   padding: 16px 8px;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   color: var(--td-text-color-placeholder);
   text-align: center;
 }
@@ -1756,9 +1786,9 @@ const handleConfirm = () => {
 .manual-source-title {
   margin: 0;
   padding: 8px 10px;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: var(--td-bg-color-container-hover);
-  font-size: 13px;
+  font-size: var(--app-text-md);
   font-weight: 500;
   line-height: 1.4;
   color: var(--td-text-color-primary);
@@ -1767,7 +1797,7 @@ const handleConfirm = () => {
 
 .manual-source-meta {
   margin: 6px 2px 0;
-  font-size: 11px;
+  font-size: var(--app-text-xs);
   color: var(--td-text-color-placeholder);
 }
 
@@ -1785,7 +1815,7 @@ const handleConfirm = () => {
   flex-shrink: 0;
   width: 216px;
   min-height: 0;
-  background-color: var(--td-bg-color-settings-modal, var(--td-bg-color-secondarycontainer));
+  background-color: var(--td-bg-color-settings-modal);
   border-right: 1px solid var(--td-component-stroke);
 }
 
@@ -1795,7 +1825,7 @@ const handleConfirm = () => {
 
 .settings-sidebar-title {
   margin: 0;
-  font-size: 16px;
+  font-size: var(--app-text-xl);
   font-weight: 600;
   line-height: 1.35;
   color: var(--td-text-color-primary);
@@ -1811,7 +1841,7 @@ const handleConfirm = () => {
 .nav-group-title {
   padding: 6px 14px 2px;
   color: var(--td-text-color-placeholder);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   font-weight: 600;
   letter-spacing: 0.02em;
 
@@ -1831,13 +1861,13 @@ const handleConfirm = () => {
   margin-bottom: 2px;
   padding: 9px 10px;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--app-radius-sm);
   background: transparent;
-  font-size: 14px;
+  font-size: var(--app-text-base);
   color: var(--td-text-color-primary);
   text-align: left;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: all var(--app-motion-base) ease;
   user-select: none;
 
   &:hover {
@@ -1871,7 +1901,7 @@ const handleConfirm = () => {
   justify-content: center;
   margin-right: 8px;
   margin-top: 2px;
-  font-size: 16px;
+  font-size: var(--app-text-xl);
   color: inherit;
 }
 
@@ -1885,7 +1915,7 @@ const handleConfirm = () => {
 
 .nav-label {
   overflow: hidden;
-  font-size: 13px;
+  font-size: var(--app-text-md);
   font-weight: 500;
   line-height: 1.35;
   text-overflow: ellipsis;
@@ -1894,7 +1924,7 @@ const handleConfirm = () => {
 
 .nav-status {
   overflow: hidden;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.35;
   color: var(--td-text-color-placeholder);
   text-overflow: ellipsis;
@@ -1951,16 +1981,16 @@ const handleConfirm = () => {
   margin-bottom: 16px;
   padding: 10px 12px;
   border: 1px solid var(--td-component-stroke);
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   background: var(--td-bg-color-secondarycontainer);
-  font-size: 13px;
+  font-size: var(--app-text-md);
   line-height: 1.5;
   color: var(--td-text-color-secondary);
 
   .t-icon {
     flex-shrink: 0;
     margin-top: 1px;
-    font-size: 16px;
+    font-size: var(--app-text-xl);
     color: var(--td-brand-color);
   }
 }
@@ -1980,14 +2010,14 @@ const handleConfirm = () => {
 
   .section-title {
     margin: 0 0 6px;
-    font-size: 20px;
+    font-size: var(--app-text-3xl);
     font-weight: 600;
     color: var(--td-text-color-primary);
   }
 
   .section-desc {
     margin: 0;
-    font-size: 14px;
+    font-size: var(--app-text-base);
     line-height: 22px;
     color: var(--td-text-color-placeholder);
   }
@@ -2002,14 +2032,14 @@ const handleConfirm = () => {
 
   .section-title {
     margin: 0 0 6px;
-    font-size: 20px;
+    font-size: var(--app-text-3xl);
     font-weight: 600;
     color: var(--td-text-color-primary);
   }
 
   .section-desc {
     margin: 0;
-    font-size: 14px;
+    font-size: var(--app-text-base);
     line-height: 1.5;
     color: var(--td-text-color-secondary);
   }
@@ -2045,21 +2075,21 @@ const handleConfirm = () => {
   label {
     display: block;
     margin-bottom: 4px;
-    font-size: 15px;
+    font-size: var(--app-text-lg);
     font-weight: 500;
     color: var(--td-text-color-primary);
   }
 
   .desc {
     margin: 0;
-    font-size: 13px;
+    font-size: var(--app-text-md);
     line-height: 1.5;
     color: var(--td-text-color-secondary);
   }
 
   .warn {
     margin: 4px 0 0;
-    font-size: 12px;
+    font-size: var(--app-text-sm);
     line-height: 1.4;
     color: var(--td-warning-color);
   }
@@ -2110,7 +2140,7 @@ const handleConfirm = () => {
 
 .field-hint {
   margin: 6px 0 0;
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   line-height: 1.5;
   color: var(--td-text-color-placeholder);
 
@@ -2128,7 +2158,7 @@ const handleConfirm = () => {
   border: none;
   background: transparent;
   color: var(--td-brand-color);
-  font-size: 13px;
+  font-size: var(--app-text-md);
   cursor: pointer;
 
   .t-icon {
@@ -2210,7 +2240,7 @@ const handleConfirm = () => {
 
 .modal-enter-active,
 .modal-leave-active {
-  transition: opacity 0.2s ease;
+  transition: opacity var(--app-motion-base) ease;
 }
 
 .modal-enter-from,
@@ -2230,7 +2260,7 @@ const handleConfirm = () => {
     padding: 4px !important;
     margin-top: 6px !important;
     min-width: 208px;
-    border-radius: 10px !important;
+    border-radius: var(--app-radius-lg) !important;
     background: var(--td-bg-color-container) !important;
     border: 0.5px solid var(--td-component-stroke) !important;
     box-shadow:

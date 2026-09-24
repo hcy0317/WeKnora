@@ -326,7 +326,7 @@ watch(
   background: var(--td-bg-color-container);
   color: var(--td-text-color-primary);
   box-sizing: border-box;
-  transition: background-color 150ms ease, color 150ms ease;
+  transition: background-color var(--app-motion-fast) ease, color var(--app-motion-fast) ease;
 }
 
 .engine-lifecycle__mode-control :deep(.t-radio-button + .t-radio-button) {

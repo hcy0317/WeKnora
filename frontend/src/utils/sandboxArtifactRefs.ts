@@ -19,6 +19,7 @@
  */
 
 import { escapeHTML } from './security.ts';
+import { renderArtifactFileIcon } from './artifactFileIcon';
 
 /** 与后端 artifactListItem / SSE publicArtifactViews 对齐的最小字段集。 */
 export interface ArtifactRefMeta {
@@ -32,6 +33,8 @@ export interface ArtifactRefMeta {
    * 同义，取其一即可。
    */
   url?: string;
+  /** User deleted this artifact; keep the tombstone so its handle still resolves. */
+  deleted_at?: string | null;
 }
 
 export interface ArtifactRefContext {
@@ -44,6 +47,8 @@ export interface ArtifactRefLabels {
   previewHint: string;
   /** 本轮已结束但引用对不上任何产物时的副标题，如「文件不可用」。 */
   missingHint: string;
+  /** 文件已被用户删除时的副标题，如「文件已删除」。 */
+  deletedHint: string;
 }
 
 const RESOURCE_HANDLE_RE = /^resource:\/\/([A-Za-z0-9_-]{22})$/;
@@ -277,6 +282,11 @@ export class ArtifactBlobURLCache {
     return this.disposeMatching((key) => key.startsWith(messageCachePrefix(ctx)));
   }
 
+  disposeArtifact(ctx: ArtifactRefContext, index: number): number {
+    const key = blobCacheKey(ctx, index);
+    return this.disposeMatching((candidate) => candidate === key);
+  }
+
   disposeSession(sessionId: string): number {
     return this.disposeMatching((key) => key.startsWith(sessionCachePrefix(sessionId)));
   }
@@ -391,6 +401,12 @@ export function disposeArtifactBlobURLsForMessage(ctx: ArtifactRefContext): numb
   return artifactBlobCache.disposeMessage(ctx);
 }
 
+export function disposeArtifactBlobURL(ctx: ArtifactRefContext, index: number): number {
+  const key = blobCacheKey(ctx, index);
+  artifactBlobRequests.detachMatching((candidate) => candidate === key);
+  return artifactBlobCache.disposeArtifact(ctx, index);
+}
+
 export function disposeArtifactBlobURLsForSession(sessionId: string): number {
   const prefix = sessionCachePrefix(sessionId);
   artifactBlobRequests.detachMatching((key) => key.startsWith(prefix));
@@ -402,32 +418,24 @@ export function disposeAllArtifactBlobURLs(): number {
   return artifactBlobCache.disposeAll();
 }
 
-function fileIconSvg(): string {
-  return (
-    '<svg class="artifact-ref-card__glyph" viewBox="0 0 24 24" aria-hidden="true">'
-    + '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z" '
-    + 'fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>'
-    + '<path d="M14 2v6h6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>'
-    + '</svg>'
-  );
-}
-
 // 与 chatMarkdownRenderer 的流式图片骨架同一个类名，样式复用。
 const STREAMING_PLACEHOLDER =
   '<span class="streaming-image-loading"><span class="streaming-image-loading__skeleton"></span></span>';
 
-function renderCard(fileName: string, hint: string, index: number | null): string {
+type ArtifactCardVariant = 'ready' | 'pending' | 'deleted';
+
+function renderCard(fileName: string, hint: string, index: number | null, variant: ArtifactCardVariant): string {
   const safeName = escapeHTML(fileName);
   const safeHint = escapeHTML(hint);
   // 卡片必须是内联元素：marked 会把图片包在 <p> 里，块级元素会被 HTML 解析器
   // 提到段落外面，破坏正文结构。
-  const interactive = index === null
-    ? ''
-    : ` data-artifact-index="${index}" role="button" tabindex="0"`;
-  const state = index === null ? ' artifact-ref-card--pending' : '';
+  const interactive = variant === 'ready' && index !== null
+    ? ` data-artifact-index="${index}" role="button" tabindex="0"`
+    : '';
+  const state = variant === 'ready' ? '' : ` artifact-ref-card--${variant}`;
   return (
     `<span class="artifact-ref-card${state}"${interactive} title="${safeName}">`
-    + `<span class="artifact-ref-card__icon" aria-hidden="true">${fileIconSvg()}</span>`
+    + `<span class="artifact-ref-card__icon" aria-hidden="true">${renderArtifactFileIcon(fileName)}</span>`
     + '<span class="artifact-ref-card__text">'
     + `<span class="artifact-ref-card__name">${safeName}</span>`
     + `<span class="artifact-ref-card__hint">${safeHint}</span>`
@@ -466,10 +474,12 @@ export function renderArtifactReference(args: {
   /** 本轮回答还在生成中。产物要到本轮结束才会收集，此时解析不到是正常的。 */
   streaming?: boolean;
 }): string | null {
-  const ref = parseArtifactRef(args.href);
+  const href = (args.href || '').trim();
+  if (!href) return '';
+  const ref = parseArtifactRef(href);
   if (!ref) return null;
 
-  const artifact = resolveArtifactRef(args.href, args.artifacts);
+  const artifact = resolveArtifactRef(href, args.artifacts);
   if (!artifact) {
     // 句柄对不上本消息的产物，说明这是别的受保护文件（知识库检索图、
     // 附件图……）。交回默认渲染，由 hydrateProtectedFileImages 带鉴权拉取。
@@ -482,13 +492,20 @@ export function renderArtifactReference(args: {
     // 继续显示「生成中」。
     const fallbackName = ref.name || (args.alt || '').trim();
     if (!fallbackName) return '';
-    return renderCard(fallbackName, args.labels.missingHint, null);
+    return renderCard(fallbackName, args.labels.missingHint, null, 'pending');
+  }
+
+  if (artifact.deleted_at) {
+    if (args.context) disposeArtifactBlobURL(args.context, artifact.index);
+    const name = artifact.file_name || (args.alt || '').trim();
+    if (!name) return '';
+    return renderCard(name, args.labels.deletedHint, null, 'deleted');
   }
 
   if (rendersAsImage(artifact)) {
     return renderImage(artifact, args.alt || '', args.context ?? null);
   }
-  return renderCard(artifact.file_name, args.labels.previewHint, artifact.index);
+  return renderCard(artifact.file_name, args.labels.previewHint, artifact.index, 'ready');
 }
 
 async function loadArtifactBlobURL(ctx: ArtifactRefContext, index: number): Promise<string | null> {

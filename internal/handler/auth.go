@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	stderrors "errors"
@@ -21,6 +22,12 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
+
+var liteSetupToken string
+
+// SetLiteSetupToken is called by the native desktop host before serving
+// requests. Web deployments leave it empty and cannot issue anonymous admin tokens.
+func SetLiteSetupToken(token string) { liteSetupToken = token }
 
 const oidcNonceCookieName = "weknora_oidc_nonce"
 const oidcNonceCookieMaxAge = 600
@@ -863,6 +870,12 @@ func (h *AuthHandler) AutoSetup(c *gin.Context) {
 	if Edition != "lite" {
 		appErr := errors.NewForbiddenError("auto-setup is only available in lite edition")
 		c.Error(appErr)
+		return
+	}
+	if liteSetupToken == "" || subtle.ConstantTimeCompare(
+		[]byte(c.GetHeader("X-WeKnora-Desktop-Token")), []byte(liteSetupToken),
+	) != 1 {
+		_ = c.Error(errors.NewUnauthorizedError("desktop authentication is required"))
 		return
 	}
 

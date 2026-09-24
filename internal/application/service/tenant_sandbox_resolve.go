@@ -61,6 +61,92 @@ type WorkspaceSandboxPolicy interface {
 	WorkspaceScriptsDisabled(ctx context.Context, tenantID uint64) (bool, error)
 }
 
+// HostSandboxManager is Lite's OS sandbox. A nil Manager means this process
+// cannot enforce a sandbox. Web binaries always inject the zero value, so
+// empty remote configs resolve to disabled rather than host.
+type HostSandboxManager struct {
+	Manager sandbox.Manager
+	// Desktop is true in the Lite desktop build even when this machine cannot
+	// enforce a sandbox. Lite hides remote sandboxes entirely.
+	Desktop bool
+	// SkillTree and SkillInstaller serve local skill installs. Both are nil
+	// unless Manager is.
+	SkillTree      HostSkillTree
+	SkillInstaller HostSkillInstaller
+}
+
+// SkillsAvailable reports whether local skills can be installed and run.
+func (h HostSandboxManager) SkillsAvailable() bool {
+	return h.Desktop && liteHostSandbox(h.Manager) != nil && h.SkillTree != nil && h.SkillInstaller != nil
+}
+
+type resolveOption func(*resolveOptions)
+
+type resolveOptions struct {
+	liteHost sandbox.Manager
+	// liteOnly is the Lite desktop build: named remote configs and pins are
+	// never resolved, whatever an agent or session stored.
+	liteOnly bool
+	// hostSkillInstaller serves the built-in installer's host install session.
+	hostSkillInstaller sandbox.Manager
+}
+
+func withLiteHostSandbox(manager sandbox.Manager) resolveOption {
+	return func(options *resolveOptions) { options.liteHost = liteHostSandbox(manager) }
+}
+
+func withLiteDesktop(desktop bool) resolveOption {
+	return func(o *resolveOptions) { o.liteOnly = desktop }
+}
+
+func withHostSkillInstaller(m sandbox.Manager) resolveOption {
+	return func(o *resolveOptions) { o.hostSkillInstaller = m }
+}
+
+func liteHostSandbox(m sandbox.Manager) sandbox.Manager {
+	if m == nil || m.GetType() != sandbox.SandboxTypeHost {
+		return nil
+	}
+	return m
+}
+
+func resolveLiteSandbox(
+	ctx context.Context, policy WorkspaceSandboxPolicy, tenantID uint64, configID string, o resolveOptions,
+) sandbox.Manager {
+	if workspaceScriptsDisabled(ctx, policy, tenantID) {
+		return sandbox.NewDisabledManager()
+	}
+	if sandbox.IsHostSkillTarget(configID) && o.hostSkillInstaller != nil {
+		return o.hostSkillInstaller
+	}
+	if lite := liteHostSandbox(o.liteHost); lite != nil {
+		return lite
+	}
+	return sandbox.NewDisabledManager()
+}
+
+func applyResolveOptions(opts []resolveOption) resolveOptions {
+	var o resolveOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	return o
+}
+
+func workspaceScriptsDisabled(ctx context.Context, policy WorkspaceSandboxPolicy, tenantID uint64) bool {
+	if policy == nil || tenantID == 0 {
+		return false
+	}
+	disabled, err := policy.WorkspaceScriptsDisabled(ctx, tenantID)
+	if err != nil {
+		logger.Warnf(ctx, "[sandbox] failed to read workspace sandbox policy for %d: %v", tenantID, err)
+		return false
+	}
+	return disabled
+}
+
 // resolveTenantSandboxForConfig returns the Manager for an explicit config.
 //
 // Unlike the previous tenant-only helper this does NOT degrade to the default

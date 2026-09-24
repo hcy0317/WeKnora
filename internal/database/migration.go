@@ -111,9 +111,18 @@ const (
 	rootAttemptUniqueVersion      = 85
 	postgresCollisionBaseVersion  = 80
 	postgresUpstreamBaseVersion   = 84
+	postgresLocalFinalVersion     = 99
+	postgresUpstreamFinalVersion  = 111
+	postgresUpstreamVersionOffset = 16
+	postgresMergedFinalVersion    = 127
 	sqliteCollisionBaseVersion    = 3
 	sqliteUpstreamBaseVersion     = 4
 	sqliteUpstreamUsageVersion    = 12
+	sqliteLocalFinalVersion       = 24
+	sqliteUpstreamFinalVersion    = 31
+	sqliteUpstreamVersionOffset   = 14
+	sqliteUpstreamSkillsVersion   = 28
+	sqliteMergedFinalVersion      = 46
 )
 
 type migrationGateSnapshot struct {
@@ -324,25 +333,47 @@ func reconcilePostgresMigrationCollision(
 		}
 	}
 
-	if version < 85 || version > 90 {
+	if version < 85 || version > postgresUpstreamFinalVersion {
+		if version > postgresUpstreamFinalVersion && version < postgresMergedFinalVersion {
+			localExists, err := postgresRelationExists(ctx, db, "tenant_skill_bundle_ref_claims")
+			if err != nil {
+				return version, fmt.Errorf("inspect merged PostgreSQL migration marker at version %d: %w", version, err)
+			}
+			if !localExists {
+				return version, fmt.Errorf("unrecognized PostgreSQL migration lineage at version %d", version)
+			}
+		}
 		return version, nil
 	}
 	localExists, upstreamExists, err := postgresUpstreamCollisionMarkers(ctx, db, version)
 	if err != nil {
-		return version, fmt.Errorf("inspect Tencent PostgreSQL migration collision at version %d: %w", version, err)
+		return version, fmt.Errorf("inspect PostgreSQL migration lineage at version %d: %w", version, err)
 	}
-	if localExists || !upstreamExists {
+	if localExists {
 		return version, nil
+	}
+	if !upstreamExists {
+		return version, fmt.Errorf("ambiguous PostgreSQL migration lineage at version %d (local=%t, upstream=%t)",
+			version, localExists, upstreamExists)
 	}
 
 	logger.Warnf(ctx,
-		"Detected Tencent PostgreSQL migration version %d; replaying fork compatibility range from %d",
-		version, postgresUpstreamBaseVersion+1)
+		"Detected Tencent PostgreSQL migration version %d; applying local migrations through %d before remapping",
+		version, postgresLocalFinalVersion)
 	if err := m.Force(postgresUpstreamBaseVersion); err != nil {
-		return version, fmt.Errorf("rewind Tencent PostgreSQL migration version %d to %d: %w",
+		return version, fmt.Errorf("rewind Tencent PostgreSQL migration version %d to local base %d: %w",
 			version, postgresUpstreamBaseVersion, err)
 	}
-	return postgresUpstreamBaseVersion, nil
+	if err := m.Migrate(postgresLocalFinalVersion + 1); err != nil && err != migrate.ErrNoChange {
+		return version, fmt.Errorf("replay local PostgreSQL migrations through %d from upstream version %d: %w",
+			postgresLocalFinalVersion+1, version, err)
+	}
+	remappedVersion := version + postgresUpstreamVersionOffset
+	if err := m.Force(int(remappedVersion)); err != nil {
+		return version, fmt.Errorf("remap Tencent PostgreSQL migration version %d to %d: %w",
+			version, remappedVersion, err)
+	}
+	return remappedVersion, nil
 }
 
 func postgresUpstreamCollisionMarkers(
@@ -379,6 +410,47 @@ func postgresUpstreamCollisionMarkers(
 		if err == nil {
 			upstreamExists, err = postgresRelationExists(ctx, db, "tenant_skill_catalog")
 		}
+	case 91, 92:
+		localExists, err = postgresRelationExists(ctx, db, "knowledge_completion_outbox")
+		if err == nil && version == 91 {
+			upstreamExists, err = postgresColumnExists(ctx, db, "mcp_tool_approvals", "enabled")
+		} else if err == nil {
+			upstreamExists, err = postgresRelationExists(ctx, db, "mcp_metadata")
+		}
+	case 93:
+		localExists, err = postgresRelationExists(ctx, db, "knowledge_completion_outbox")
+		if err == nil {
+			upstreamExists, err = postgresRelationExists(ctx, db, "browser_devices")
+		}
+	case 94:
+		localExists, err = postgresRelationExists(ctx, db, "knowledge_completion_outbox")
+		if err == nil {
+			upstreamExists, err = postgresRelationExists(ctx, db, "memory_extraction_sessions")
+		}
+	case 95, 96:
+		localExists, err = postgresRelationExists(ctx, db, "knowledge_completion_outbox")
+		if err == nil {
+			upstreamExists, err = postgresRelationExists(ctx, db, "memory_extraction_sessions")
+		}
+	case 97, 98:
+		localExists, err = postgresRelationExists(ctx, db, "knowledge_completion_outbox")
+		if err == nil && version == 97 {
+			upstreamExists, err = postgresColumnExists(ctx, db, "sessions", "forked_from_message_id")
+		} else if err == nil {
+			upstreamExists, err = postgresRelationExists(ctx, db, "fork_snapshot_leases")
+		}
+	case 99:
+		localExists, err = postgresRelationExists(ctx, db, "tenant_skill_bundle_ref_claims")
+		if err == nil {
+			upstreamExists, err = postgresRelationExists(ctx, db, "fork_snapshot_leases")
+		}
+	default:
+		if version >= 100 && version <= postgresUpstreamFinalVersion {
+			localExists, err = postgresRelationExists(ctx, db, "tenant_skill_bundle_ref_claims")
+			if err == nil {
+				upstreamExists, err = postgresRelationExists(ctx, db, "fork_snapshot_leases")
+			}
+		}
 	}
 	return localExists, upstreamExists, err
 }
@@ -389,6 +461,15 @@ func sqliteTableExists(ctx context.Context, db *sql.DB, table string) (bool, err
 		SELECT EXISTS (
 			SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?
 		)`, table).Scan(&exists)
+	return exists, err
+}
+
+func sqliteIndexExistsForMigration(ctx context.Context, db *sql.DB, index string) (bool, error) {
+	var exists bool
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?
+		)`, index).Scan(&exists)
 	return exists, err
 }
 
@@ -407,45 +488,118 @@ func reconcileSQLiteMigrationCollision(
 	if dirty {
 		return version, nil
 	}
-	if version >= sqliteUpstreamUsageVersion && version < 17 {
-		usageExists, err := sqliteColumnExistsForMigration(ctx, db, "messages", "usage")
+	if version > sqliteUpstreamFinalVersion && version < sqliteMergedFinalVersion {
+		localExists, err := sqliteTableExists(ctx, db, "tenant_skill_bundle_ref_claims")
 		if err != nil {
-			return version, fmt.Errorf("inspect upstream SQLite message usage migration: %w", err)
+			return version, fmt.Errorf("inspect merged SQLite migration marker at version %d: %w", version, err)
 		}
-		if usageExists {
-			manifestExists, err := sqliteTableExists(ctx, db, "question_generation_manifests")
-			if err != nil {
-				return version, fmt.Errorf("inspect fork SQLite question manifest migration: %w", err)
-			}
-			resumeVersion := version
-			if !manifestExists {
-				resumeVersion = sqliteUpstreamUsageVersion - 1
-				if err := m.Force(int(resumeVersion)); err != nil {
-					return version, fmt.Errorf("rewind Tencent SQLite migration version %d to %d: %w",
-						version, resumeVersion, err)
-				}
-			}
-			logger.Warnf(ctx,
-				"Detected Tencent SQLite message usage at version %d; completing fork migrations through 16",
-				version)
-			if resumeVersion < 16 {
-				if err := m.Migrate(16); err != nil && err != migrate.ErrNoChange {
-					return version, fmt.Errorf("replay fork SQLite compatibility migrations from %d to 16: %w",
-						resumeVersion, err)
-				}
-			}
-			// Tencent already applied the DDL represented by the fork's v17.
-			// Advance only the clean version marker so the column and its data are
-			// preserved without replaying an unsupported duplicate ADD COLUMN.
-			if err := m.Force(17); err != nil {
-				return version, fmt.Errorf("mark Tencent SQLite message usage as fork migration 17: %w", err)
-			}
-			return 17, nil
+		if !localExists {
+			return version, fmt.Errorf("unrecognized SQLite migration lineage at version %d", version)
 		}
-	}
-	if version < 4 || version > 9 {
 		return version, nil
 	}
+	if version < sqliteUpstreamUsageVersion || version > sqliteUpstreamFinalVersion {
+		if version >= 4 && version <= 9 {
+			return reconcileLegacySQLiteMigrationCollision(ctx, m, db, version)
+		}
+		return version, nil
+	}
+
+	localExists, upstreamExists, err := sqliteMigrationLineageMarkers(ctx, db, version)
+	if err != nil {
+		return version, fmt.Errorf("inspect SQLite migration lineage at version %d: %w", version, err)
+	}
+	if version <= 16 {
+		usageExists, usageErr := sqliteColumnExistsForMigration(ctx, db, "messages", "usage")
+		if usageErr != nil {
+			return version, fmt.Errorf("inspect SQLite message usage lineage at version %d: %w", version, usageErr)
+		}
+		if usageExists {
+			// Upstream introduced messages.usage at v12. A local v12-v16
+			// database cannot have applied it yet, even if the rest of the
+			// schema carries local-only objects.
+			localExists = false
+			upstreamExists = true
+		}
+	}
+	if localExists {
+		return version, nil
+	}
+	if !upstreamExists {
+		return version, fmt.Errorf("ambiguous SQLite migration lineage at version %d (local=%t, upstream=%t)",
+			version, localExists, upstreamExists)
+	}
+
+	logger.Warnf(ctx,
+		"Detected Tencent SQLite migration version %d; replaying local lineage before remapping",
+		version)
+	if err := m.Force(sqliteUpstreamUsageVersion - 1); err != nil {
+		return version, fmt.Errorf("rewind Tencent SQLite migration version %d to %d: %w",
+			version, sqliteUpstreamUsageVersion-1, err)
+	}
+	if err := m.Migrate(16); err != nil && err != migrate.ErrNoChange {
+		return version, fmt.Errorf("replay local SQLite migrations through 16 from upstream version %d: %w", version, err)
+	}
+	usageExists, err := sqliteColumnExistsForMigration(ctx, db, "messages", "usage")
+	if err != nil {
+		return version, fmt.Errorf("inspect upstream SQLite message usage migration: %w", err)
+	}
+	if !usageExists {
+		return version, fmt.Errorf("upstream SQLite migration version %d lacks messages.usage", version)
+	}
+	if err := m.Force(17); err != nil {
+		return version, fmt.Errorf("mark upstream SQLite message usage at local version 17: %w", err)
+	}
+	if version >= sqliteUpstreamSkillsVersion {
+		ready, readyErr := sqliteUpstreamSkillSchemaReady(ctx, db)
+		if readyErr != nil {
+			return version, fmt.Errorf("inspect upstream SQLite skill schema at version %d: %w", version, readyErr)
+		}
+		if !ready {
+			return version, fmt.Errorf("upstream SQLite migration version %d has an incomplete tenant skill schema", version)
+		}
+		if err := m.Force(sqliteLocalFinalVersion); err != nil {
+			return version, fmt.Errorf("mark upstream SQLite skill schema through local version %d: %w",
+				sqliteLocalFinalVersion, err)
+		}
+	} else if err := m.Migrate(sqliteLocalFinalVersion); err != nil && err != migrate.ErrNoChange {
+		return version, fmt.Errorf("replay local SQLite migrations through %d from upstream version %d: %w",
+			sqliteLocalFinalVersion, version, err)
+	}
+	if err := m.Migrate(sqliteLocalFinalVersion + 1); err != nil && err != migrate.ErrNoChange {
+		return version, fmt.Errorf("apply local SQLite lineage boundary %d: %w", sqliteLocalFinalVersion+1, err)
+	}
+	if version == sqliteUpstreamFinalVersion {
+		// Tencent v0.8.2 added model_catalog_configs at upstream v31. The
+		// merged chain already has all v31 features, so apply the local
+		// compatibility migration at 45, then mark the catalog migration at
+		// 46 as present instead of trying to create the existing table again.
+		localCompatVersion := version + sqliteUpstreamVersionOffset - 1
+		if err := m.Force(int(localCompatVersion)); err != nil {
+			return version, fmt.Errorf("remap Tencent SQLite migration version %d to local compatibility version %d: %w",
+				version, localCompatVersion, err)
+		}
+		if err := m.Migrate(localCompatVersion + 1); err != nil && err != migrate.ErrNoChange {
+			return version, fmt.Errorf("apply local SQLite compatibility migration %d: %w",
+				localCompatVersion+1, err)
+		}
+		if err := m.Force(sqliteMergedFinalVersion); err != nil {
+			return version, fmt.Errorf("mark Tencent SQLite model catalog migration as merged version %d: %w",
+				sqliteMergedFinalVersion, err)
+		}
+		return sqliteMergedFinalVersion, nil
+	}
+	remappedVersion := version + sqliteUpstreamVersionOffset
+	if err := m.Force(int(remappedVersion)); err != nil {
+		return version, fmt.Errorf("remap Tencent SQLite migration version %d to %d: %w",
+			version, remappedVersion, err)
+	}
+	return remappedVersion, nil
+}
+
+func reconcileLegacySQLiteMigrationCollision(
+	ctx context.Context, m *migrate.Migrate, db *sql.DB, version uint,
+) (uint, error) {
 	memoryExists, err := sqliteTableExists(ctx, db, "memory_subjects")
 	if err != nil {
 		return version, fmt.Errorf("inspect upstream SQLite memory migration: %w", err)
@@ -487,6 +641,134 @@ func reconcileSQLiteMigrationCollision(
 			version, replayFrom, err)
 	}
 	return uint(replayFrom), nil
+}
+
+func sqliteMigrationLineageMarkers(
+	ctx context.Context, db *sql.DB, version uint,
+) (localExists, upstreamExists bool, err error) {
+	switch version {
+	case 12:
+		localExists, err = sqliteTableExists(ctx, db, "question_generation_manifests")
+		if err == nil {
+			upstreamExists, err = sqliteColumnExistsForMigration(ctx, db, "messages", "usage")
+		}
+	case 13:
+		localExists, err = sqliteTableExists(ctx, db, "wiki_ingest_work_units")
+		if err == nil {
+			upstreamExists, err = sqliteColumnExistsForMigration(ctx, db, "mcp_tool_approvals", "enabled")
+		}
+	case 14:
+		localExists, err = sqliteTableExists(ctx, db, "wiki_canonical_identities")
+		if err == nil {
+			upstreamExists, err = sqliteTableExists(ctx, db, "browser_devices")
+		}
+	case 15:
+		localExists, err = sqliteTableExists(ctx, db, "wiki_generation_fragments")
+		if err == nil {
+			upstreamExists, err = sqliteTableExists(ctx, db, "memory_extraction_sessions")
+		}
+	case 16:
+		localExists, err = sqliteTableExists(ctx, db, "knowledge_completion_outbox")
+		if err == nil {
+			upstreamExists, err = sqliteTableExists(ctx, db, "memory_extraction_sessions")
+		}
+	case 17:
+		localExists, err = sqliteTableExists(ctx, db, "knowledge_completion_outbox")
+		if err == nil {
+			upstreamExists, err = sqliteTableExists(ctx, db, "memory_extraction_sessions")
+		}
+	case 18:
+		localExists, err = sqliteTableExists(ctx, db, "tenant_skills")
+		if err == nil {
+			upstreamExists, err = sqliteColumnExistsForMigration(ctx, db, "sessions", "forked_from_message_id")
+		}
+	case 19:
+		localExists, err = sqliteColumnExistsForMigration(ctx, db, "tenant_skills", "install_session_id")
+		if err == nil {
+			upstreamExists, err = sqliteTableExists(ctx, db, "fork_snapshot_leases")
+		}
+	case 20:
+		localExists, err = sqliteColumnExistsForMigration(ctx, db, "tenant_skill_snapshots", "planned_name")
+		if err == nil {
+			upstreamExists, err = sqliteTableExists(ctx, db, "fork_snapshot_leases")
+		}
+	case 21:
+		localExists, err = sqliteTableExists(ctx, db, "tenant_user_env_vars")
+		if err == nil {
+			upstreamExists, err = sqliteColumnExistsForMigration(ctx, db, "knowledge_bases", "profile_config")
+		}
+	case 22, 23:
+		localExists, err = sqliteTableExists(ctx, db, "tenant_skill_catalog")
+		if err == nil && version == 22 {
+			upstreamExists, err = sqliteTableExists(ctx, db, "mcp_endpoints")
+		} else if err == nil {
+			upstreamExists, err = sqliteTableExists(ctx, db, "message_artifacts")
+		}
+	case 24:
+		localExists, err = sqliteTableExists(ctx, db, "tenant_skill_bundle_ref_claims")
+		if err == nil {
+			upstreamExists, err = sqliteColumnExistsForMigration(ctx, db, "messages", "context_checkpoint")
+		}
+	case 25:
+		localExists, err = sqliteTableExists(ctx, db, "tenant_skill_bundle_ref_claims")
+		if err == nil {
+			upstreamExists, err = sqliteIndexExistsForMigration(ctx, db, "idx_messages_session_created_id")
+		}
+	case 26:
+		localExists, err = sqliteTableExists(ctx, db, "tenant_skill_bundle_ref_claims")
+		if err == nil {
+			upstreamExists, err = sqliteColumnExistsForMigration(ctx, db, "message_artifacts", "deleted_at")
+		}
+	case 27:
+		localExists, err = sqliteTableExists(ctx, db, "tenant_skill_bundle_ref_claims")
+		if err == nil {
+			upstreamExists, err = sqliteColumnExistsForMigration(ctx, db, "sessions", "sandbox_config_tenant_id")
+		}
+	case 28:
+		localExists, err = sqliteTableExists(ctx, db, "tenant_skill_bundle_ref_claims")
+		if err == nil {
+			upstreamExists, err = sqliteColumnExistsForMigration(ctx, db, "tenant_skills", "served")
+		}
+	case 29:
+		localExists, err = sqliteTableExists(ctx, db, "tenant_skill_bundle_ref_claims")
+		if err == nil {
+			upstreamExists, err = sqliteColumnExistsForMigration(ctx, db, "sessions", "host_workspace_dir")
+		}
+	case 30:
+		localExists, err = sqliteTableExists(ctx, db, "tenant_skill_bundle_ref_claims")
+		if err == nil {
+			upstreamExists, err = sqliteColumnExistsForMigration(ctx, db, "im_channels", "locale")
+		}
+	case 31:
+		localExists, err = sqliteTableExists(ctx, db, "tenant_skill_bundle_ref_claims")
+		if err == nil {
+			upstreamExists, err = sqliteTableExists(ctx, db, "model_catalog_configs")
+		}
+	}
+	return localExists, upstreamExists, err
+}
+
+func sqliteUpstreamSkillSchemaReady(ctx context.Context, db *sql.DB) (bool, error) {
+	for _, table := range []string{"tenant_skills", "tenant_skill_snapshots", "tenant_skill_catalog", "tenant_user_env_vars"} {
+		exists, err := sqliteTableExists(ctx, db, table)
+		if err != nil || !exists {
+			return false, err
+		}
+	}
+	for _, column := range []struct{ table, column string }{
+		{"tenant_skills", "catalog_id"},
+		{"tenant_skills", "install_session_id"},
+		{"tenant_skills", "install_message_id"},
+		{"tenant_skills", "envs"},
+		{"tenant_skills", "served"},
+		{"tenant_skill_snapshots", "planned_name"},
+	} {
+		exists, err := sqliteColumnExistsForMigration(ctx, db, column.table, column.column)
+		if err != nil || !exists {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // RunMigrationsWithOptions executes all pending database migrations with custom options

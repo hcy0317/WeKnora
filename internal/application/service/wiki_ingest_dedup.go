@@ -488,10 +488,9 @@ func normalizeWikiIdentityTitle(title string) string {
 }
 
 // exactIdentityTarget returns the stable existing page for an extracted item
-// when a same-type candidate has the exact normalized display title. The LLM
-// remains responsible for semantic/alias matches; this deterministic fast path
-// only covers the unambiguous identity invariant that one page type should not
-// carry two pages with the same visible title.
+// when a candidate has the exact normalized display title. Same-type matches
+// win; an exact entity/concept counterpart is reused only when no same-type
+// page exists. The LLM remains responsible for semantic/alias matches.
 func exactIdentityTarget(
 	item extractedItem,
 	pageType string,
@@ -503,25 +502,46 @@ func exactIdentityTarget(
 		return ""
 	}
 	matches := make([]string, 0, 2)
+	crossMatches := make([]string, 0, 2)
 	for slug := range candidates {
 		page := pages[slug]
-		if page == nil || page.PageType != pageType {
+		if page == nil {
 			continue
 		}
-		if normalizeWikiIdentityTitle(page.Title) == identity {
+		candidateType := page.PageType
+		if candidateType == "" {
+			candidateType = slugKind(page.Slug)
+		}
+		if normalizeWikiIdentityTitle(page.Title) != identity {
+			continue
+		}
+		if candidateType == pageType {
 			matches = append(matches, page.Slug)
+		} else if candidateType == otherWikiPageType(pageType) {
+			crossMatches = append(crossMatches, page.Slug)
 		}
 	}
-	if len(matches) == 0 {
+	if len(matches) > 0 {
+		for _, slug := range matches {
+			if slug == item.Slug {
+				return slug
+			}
+		}
+		sort.Strings(matches)
+		return matches[0]
+	}
+	if len(crossMatches) == 0 {
 		return ""
 	}
-	for _, slug := range matches {
-		if slug == item.Slug {
-			return slug
-		}
+	sort.Strings(crossMatches)
+	return crossMatches[0]
+}
+
+func otherWikiPageType(pageType string) string {
+	if pageType == types.WikiPageTypeEntity {
+		return types.WikiPageTypeConcept
 	}
-	sort.Strings(matches)
-	return matches[0]
+	return types.WikiPageTypeEntity
 }
 
 func identityClaimString(v interface{}) string {
@@ -819,6 +839,62 @@ func (s *wikiIngestService) attachExactIdentityPages(
 
 	for identity, slugs := range slugsByIdentity {
 		bindExactIdentityPages(slugs, cached[identity], pageType, identity, candidatePages, itemCandidates)
+	}
+
+	// A model can classify the same title as an entity in one batch and a
+	// concept in another. Query the exact counterpart type too, so formatting
+	// drift that missed the similarity probe cannot create a second page.
+	other := otherWikiPageType(pageType)
+	crossCached := make(map[string][]*types.WikiPageLite, len(slugsByIdentity))
+	crossMiss := make([]string, 0, len(slugsByIdentity))
+	for identity := range slugsByIdentity {
+		if pages, ok := loadCachedIdentityPages(batchCtx, other, identity); ok {
+			crossCached[identity] = pages
+			continue
+		}
+		crossMiss = append(crossMiss, identity)
+	}
+	if len(crossMiss) > 0 {
+		pages, err := s.wikiService.FindPagesByNormalizedTitles(ctx, kbID, other, crossMiss)
+		if err != nil {
+			logger.Warnf(ctx, "wiki ingest: cross-type identity lookup failed for %s (%d titles): %v",
+				other, len(crossMiss), err)
+		} else {
+			byIdentity := make(map[string][]*types.WikiPageLite, len(crossMiss))
+			for _, page := range pages {
+				if page == nil {
+					continue
+				}
+				identity := normalizeWikiIdentityTitle(page.Title)
+				if identity != "" {
+					byIdentity[identity] = append(byIdentity[identity], page)
+				}
+			}
+			for _, identity := range crossMiss {
+				hits := byIdentity[identity]
+				if hits == nil {
+					hits = []*types.WikiPageLite{}
+				}
+				crossCached[identity] = hits
+				storeCachedIdentityPages(batchCtx, other, identity, hits)
+			}
+		}
+	}
+	for identity, slugs := range slugsByIdentity {
+		for _, page := range crossCached[identity] {
+			if page == nil || page.Slug == "" || page.PageType != other {
+				continue
+			}
+			if _, exists := candidatePages[page.Slug]; !exists {
+				candidatePages[page.Slug] = page
+			}
+			for _, slug := range slugs {
+				if itemCandidates[slug] == nil {
+					itemCandidates[slug] = make(map[string]bool)
+				}
+				itemCandidates[slug][page.Slug] = true
+			}
+		}
 	}
 }
 

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { renderArtifactFileIcon } from './artifactFileIcon'
 
 import {
   ArtifactBlobRequestCoordinator,
@@ -11,7 +12,20 @@ import {
   type ArtifactRefMeta,
 } from './sandboxArtifactRefs.ts'
 
-const labels = { previewHint: '点击预览', missingHint: '文件不可用' }
+const labels = { previewHint: '点击预览', missingHint: '文件不可用', deletedHint: '文件已删除' }
+
+test('inline file cards reuse the drawer icon and keep filenames escaped', () => {
+  for (const name of ['report.pdf', 'table.xlsx', 'notes.docx', 'slides.pptx', 'chart.html', 'bad.<img src=x onerror=alert(1)>']) {
+    const icon = renderArtifactFileIcon(name)
+    const html = renderArtifactReference({ href: 'sandbox:' + name, artifacts: [{ index: 3, file_name: name }], labels })
+    assert.ok(html?.includes(icon))
+    assert.ok(html?.includes('data-artifact-index="3"'))
+    assert.doesNotMatch(icon, /<img|onerror/)
+    assert.doesNotMatch(html!, /<img src=x/)
+  }
+  assert.match(renderArtifactFileIcon('report.pdf'), /kind-file-pdf/)
+  assert.match(renderArtifactFileIcon('report.pdf'), />PDF<\/text>/)
+})
 
 // 22 位句柄，与后端 types.ResourceHandleLength 一致。
 const handleFor = (i: number) => `art${i}`.padEnd(22, 'x')
@@ -141,6 +155,16 @@ test('after the turn ends an unresolved reference says so instead of hanging', (
   assert.ok(!html?.includes('role="button"'))
 })
 
+test('an empty image destination is skipped instead of rendering a broken img', () => {
+  const html = renderArtifactReference({
+    href: '',
+    alt: '根目录示例文件',
+    artifacts: [],
+    labels,
+  })
+  assert.equal(html, '')
+})
+
 test('file names with spaces and parentheses resolve end to end', () => {
   const raw = '![成交量](sandbox:腾讯控股(00700) 成交量_838ccc.html)'
   const normalized = normalizeSandboxArtifactRefs(raw)
@@ -192,6 +216,49 @@ test('artifact names are HTML-escaped', () => {
   assert.ok(html?.includes('&lt;img'))
 })
 
+test('a deleted artifact renders as a greyed, non-clickable card', () => {
+  const html = renderArtifactReference({
+    href: refFor(0),
+    alt: '市场画像评分',
+    artifacts: artifacts.map((a, i) =>
+      i === 0 ? { ...a, deleted_at: '2026-09-20T02:00:00Z' } : a,
+    ),
+    labels,
+  })
+  assert.ok(html?.includes('artifact-ref-card--deleted'))
+  assert.ok(html?.includes('文件已删除'))
+  assert.ok(html?.includes('市场画像评分_e7edba.html'), 'the name still says which file it was')
+  // Not clickable: the bytes are gone, so opening the preview would 404.
+  assert.ok(!html?.includes('data-artifact-index'))
+  assert.ok(!html?.includes('role="button"'))
+  // And distinguishable from a reference that never resolved at all.
+  assert.ok(!html?.includes('artifact-ref-card--pending'))
+})
+
+test('a deleted image artifact degrades to the card instead of a broken img', () => {
+  // renderImage would emit a placeholder that hydrateArtifactImages then fails
+  // to fill, leaving a permanently blank image in the answer.
+  const html = renderArtifactReference({
+    href: refFor(1),
+    alt: '走势',
+    artifacts: artifacts.map((a, i) =>
+      i === 1 ? { ...a, deleted_at: '2026-09-20T02:00:00Z' } : a,
+    ),
+    labels,
+  })
+  assert.ok(html?.includes('artifact-ref-card--deleted'))
+  assert.ok(!html?.includes('artifact-ref-image'))
+  assert.ok(!html?.includes('<img'))
+})
+
+test('a deleted artifact is not mistaken for a foreign handle', () => {
+  // Dropping tombstones before rendering would make the handle unresolvable,
+  // and an unresolved handle falls through to protected-image rendering — a
+  // broken image rather than an honest "deleted" card.
+  const live = artifacts.filter((_, i) => i !== 0)
+  assert.equal(renderArtifactReference({ href: refFor(0), artifacts: live, labels }), null)
+})
+
 test('artifact blob cache is LRU-bounded and revokes evicted URLs', () => {
   const revoked: string[] = []
   const cache = new ArtifactBlobURLCache(2, (url) => revoked.push(url))
@@ -207,25 +274,31 @@ test('artifact blob cache is LRU-bounded and revokes evicted URLs', () => {
   assert.deepEqual(revoked, ['blob:second'])
 })
 
-test('artifact blob cache disposes one message or a whole session', () => {
+test('artifact blob cache disposes one artifact, one message, or a whole session', () => {
   const revoked: string[] = []
   const cache = new ArtifactBlobURLCache(10, (url) => revoked.push(url))
   const firstMessage = { sessionId: 'session-a', messageId: 'message-a' }
   const secondMessage = { sessionId: 'session-a', messageId: 'message-b' }
   const otherSession = { sessionId: 'session-b', messageId: 'message-a' }
 
-  cache.set(firstMessage, 0, 'blob:first-message')
+  cache.set(firstMessage, 0, 'blob:first-message-0')
+  cache.set(firstMessage, 1, 'blob:first-message-1')
   cache.set(secondMessage, 0, 'blob:second-message')
   cache.set(otherSession, 0, 'blob:other-session')
 
-  cache.disposeMessage(firstMessage)
+  cache.disposeArtifact(firstMessage, 0)
   assert.equal(cache.get(firstMessage, 0), undefined)
+  assert.equal(cache.get(firstMessage, 1), 'blob:first-message-1')
+  assert.deepEqual(revoked, ['blob:first-message-0'])
+
+  cache.disposeMessage(firstMessage)
+  assert.equal(cache.get(firstMessage, 1), undefined)
   assert.equal(cache.get(secondMessage, 0), 'blob:second-message')
 
   cache.disposeSession('session-a')
   assert.equal(cache.get(secondMessage, 0), undefined)
   assert.equal(cache.get(otherSession, 0), 'blob:other-session')
-  assert.deepEqual(revoked, ['blob:first-message', 'blob:second-message'])
+  assert.deepEqual(revoked, ['blob:first-message-0', 'blob:first-message-1', 'blob:second-message'])
 })
 
 test('artifact blob request disposal detaches only the obsolete generation', async () => {
@@ -256,8 +329,8 @@ test('artifact blob request disposal detaches only the obsolete generation', asy
   assert.equal(await first, null)
   assert.deepEqual(discarded, ['blob:obsolete'])
 
-  // The obsolete request's finally block must not remove the remounted
-  // generation: a concurrent consumer still shares the second promise.
+  // The obsolete request's finally block must not remove the replacement
+  // generation, which another consumer still shares.
   const sharedSecond = coordinator.load(
     key,
     async () => 'blob:unexpected-third',

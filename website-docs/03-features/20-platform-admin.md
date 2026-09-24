@@ -34,13 +34,12 @@ WeKnora 的权限分两层：**空间内**的四级角色（见[租户、用户�
 
 之后新增/移除管理员在界面上操作即可（对应 `POST /system/admin/promote` / `revoke`）。撤销有两道保险：**不能撤销自己**，也**不能撤销最后一个系统管理员**——否则平台会永久失去系统级管理能力。对已经不是管理员的用户重复撤销返回 200（幂等），但审计记录里 `changed=false`，便于事后区分真实撤销与空操作。
 
-## 2. 控制台能做什么
-
-界面入口在「设置」侧栏底部，仅系统管理员可见（前端白名单见 `frontend/src/config/settingsAccess.ts` 的 `SYSTEM_ADMIN_SETTINGS_SECTIONS`），四个分区：
+系统管理员可在「设置」侧栏查看以下管理分区：
 
 | 分区 | 作用 | 接口 |
 | --- | --- | --- |
-| 系统设置 | 全局运行时开关（注册模式、空间策略、并发、SSRF 白名单等），改完即时生效，见 §9.3 | `GET/PUT/DELETE /system/admin/settings[/:key]` |
+| 系统设置 | 全局运行时开关（注册模式、空间策略、并发、SSRF 白名单等），按设置项的生效规则应用，见下方设置表 | `GET/PUT/DELETE /system/admin/settings[/:key]` |
+| 模型目录 | 查看目录模型及其来源，编辑、添加模型或用 JSON 批量修改（保存即生效），按版本历史恢复；详见[模型目录管理](06-models.md#系统管理员维护模型目录) | `/system/admin/model-catalog*` |
 | 任务队列 | 查看 asynq 各队列实时积压、逐个任务的重试/归档/删除、批量清空归档任务；Lite 模式返回 `available=false` | `/system/admin/runtime/queues*` |
 | 平台 API Key | 面向控制面自动化的 platform 作用域 Key，能力包括 `system_tenants_read/manage`、`system_settings_read/manage`、`system_runtime_read/manage`、`system_audit_read` | `/system/admin/api-keys` |
 | 系统审计日志 | `tenant_id = 0` 的平台级事件（改设置、提升/撤销管理员、队列操作等）。空间级审计接口按 tenant 过滤，看不到这些行 | `GET /system/admin/audit-log` |
@@ -52,7 +51,20 @@ WeKnora 的权限分两层：**空间内**的四级角色（见[租户、用户�
 
 ## 3. 运行时可改的系统设置
 
-`internal/application/service/system_setting.go` 维护一张注册表，表内的键可以在控制台里改，**数据库值盖过环境变量**，绝大多数改完立即生效，不用重启：
+自 v0.8.2 起，系统管理员可在「设置 → 系统设置 → 账户与访问」中点击「创建用户」开通本地账号：填写用户名（2–50 字符）和邮箱，保持「自动生成随机密码」开启，或关闭后手动填写符合密码策略的密码。适用于关闭公开注册后由管理员统一开户的场景。空间分配遵循 `auth.default_tenant_mode`：`create_personal` 创建个人空间，`tenantless` 等待用户加入空间。
+
+<Screenshot
+  src="/screenshots/system-admin-create-user.png"
+  caption="系统管理员创建用户：填写账号信息与一次性密码展示"
+  hint="「设置 → 系统设置 → 账户与访问」下打开「创建用户」对话框，展示用户名、邮箱与「自动生成随机密码」开关；可另附创建成功后显示一次性密码和「复制账号信息」按钮的结果页。" />
+
+自动生成的密码仅在本次创建结果显示，应当场复制完整账号信息；确认前对话框不能关闭，关闭后不能再次查询明文。每次创建都会写入系统审计日志（`system.user_created`）。重复身份返回已有用户，不改密码；邮箱和用户名分别指向不同用户时拒绝创建。接口见[系统 API](../04-api/02-api-system.md)。
+
+创建用户与首个管理员引导是不同操作：bootstrap 仍只提升已存在用户，不负责创建账号。
+
+## 运行时设置参考 {#_3-运行时可改的系统设置}
+
+支持的运行时设置可在控制台中修改。数据库中的设置值优先于环境变量，多数立即生效；影响新资源或需重建运行时的设置以表中说明为准。
 
 | 键 | 类型 | 默认 | 生效时机 |
 | --- | --- | --- | --- |

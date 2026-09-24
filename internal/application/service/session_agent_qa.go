@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/Tencent/WeKnora/internal/agent"
 	"github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/models/rerank"
 	"github.com/Tencent/WeKnora/internal/types"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
 // AgentQA performs agent-based question answering with conversation history and streaming support
@@ -131,12 +134,16 @@ func (s *sessionService) AgentQA(
 		if historyTurns <= 0 {
 			historyTurns = 5
 		}
-		llmContext, err = LoadAgentHistory(ctx, s.messageRepo, sessionID, historyTurns)
+		budget := agent.HistoryTokenBudget(agentConfig)
+		llmContext, agentConfig.ContextTokenScale, err = LoadAgentHistory(
+			ctx, s.messageRepo, sessionID, budget, agentConfig.RetainRetrievalHistory, historyTurns,
+		)
 		if err != nil {
 			logger.Warnf(ctx, "Failed to load agent history from DB: %v, continuing without history", err)
 			llmContext = []chat.Message{}
 		}
-		logger.Infof(ctx, "Loaded %d history messages from DB (turns=%d)", len(llmContext), historyTurns)
+		logger.Infof(ctx, "Loaded %d history messages from DB (budget=%d, turns=%d, token scale=%.2f)",
+			len(llmContext), budget, historyTurns, agentConfig.ContextTokenScale)
 	} else {
 		logger.Infof(ctx, "Multi-turn disabled for this agent, running without history")
 		llmContext = []chat.Message{}
@@ -146,8 +153,16 @@ func (s *sessionService) AgentQA(
 	// are running cannot rebuild the VM between tool calls. Staging below is
 	// the first resolve: if the previous turn left a stale mark, that is
 	// where the new image is picked up.
-	releaseTurn := s.holdSandboxTurn(ctx, sessionID, agentConfig.SandboxConfigID)
-	defer releaseTurn()
+	// HTTP sends acquire the lease before persisting the turn. Direct callers
+	// take one here so a concurrent skill install cannot replace the sandbox
+	// between tool calls.
+	if !req.TurnLeaseHeld {
+		releaseTurn, err := s.holdSandboxTurn(ctx, sessionID, agentConfig.SandboxConfigID)
+		if err != nil {
+			return err
+		}
+		defer releaseTurn()
+	}
 
 	// Reconcile all durable session attachments into the session's remote
 	// sandbox before the model can request shell or skill execution. The
@@ -166,7 +181,15 @@ func (s *sessionService) AgentQA(
 	if storeErr != nil {
 		return fmt.Errorf("resolve sandbox file store for session %s: %w", sessionID, storeErr)
 	}
-	if inputStore != nil {
+	mgr, _, layoutErr := resolveSandboxForExecution(
+		ctx, s.sandboxResolver, s.sandboxMgr, s.sandboxPinner,
+		req.Session.TenantID, sessionID, agentConfig.SandboxConfigID, s.sandboxPolicy,
+		withLiteHostSandbox(s.hostSandbox), withLiteDesktop(s.hostDesktop),
+	)
+	layout := sessionWorkspaceLayout(
+		ctx, sessionID, mgr, layoutErr, s.hostSandbox, agentConfig.SandboxConfigID,
+	)
+	if inputStore != nil && strings.TrimSpace(layout.InputDir) != "" {
 		sessionAttachments, loadErr := s.messageRepo.GetSessionAttachments(ctx, sessionID)
 		if loadErr != nil {
 			return fmt.Errorf("load session attachments for sandbox staging: %w", loadErr)
@@ -312,10 +335,18 @@ func (s *sessionService) buildAgentConfig(
 	// because that is where resolveSandboxForExecution reads it; skillsForRun
 	// picks the config the same way the sandbox resolution does.
 	sandboxTenantID, _ := types.TenantIDFromContext(ctx)
-	skillConfigID, tenantSkills := skillsForRun(
-		ctx, s.sandboxPinner, s.sandboxConfigRepo, s.tenantSkillRepo,
-		sandboxTenantID, req.Session.ID, agentConfig.SandboxConfigID,
+	var (
+		skillConfigID string
+		tenantSkills  []*types.TenantSkillEntity
 	)
+	if s.hostDesktop {
+		skillConfigID, tenantSkills = hostSkillsForRun(ctx, s.tenantSkillRepo, s.hostSkillTree, sandboxTenantID)
+	} else {
+		skillConfigID, tenantSkills = skillsForRun(
+			ctx, s.sandboxPinner, s.sandboxConfigRepo, s.tenantSkillRepo,
+			sandboxTenantID, req.Session.ID, agentConfig.SandboxConfigID,
+		)
+	}
 	agentConfig.TenantSkills = tenantSkills
 	if len(tenantSkills) > 0 {
 		// The config named here is the one the skills came from, which is the
@@ -390,6 +421,7 @@ func (s *sessionService) buildAgentConfig(
 		return nil, fmt.Errorf("build search targets: %w", err)
 	}
 	agentConfig.SearchTargets = searchTargets
+	agentConfig.QuestionOrigin = questionOriginInTargets(ctx, req.QuestionOrigin, searchTargets)
 	// Document tags are stored in knowledge_tag_relations, so document-KB tag
 	// scopes are resolved to concrete knowledge IDs before retrieval. Preserve
 	// those resolved IDs as this turn's pinned documents as well: otherwise the
@@ -409,6 +441,60 @@ func (s *sessionService) buildAgentConfig(
 	}
 
 	return agentConfig, nil
+}
+
+// questionOriginInTargets keeps a picked suggestion's origin only when the
+// current turn can actually search that knowledge base and, when applicable,
+// that document. The origin is a retrieval hint and cannot widen scope.
+func questionOriginInTargets(
+	ctx context.Context, origin *types.QuestionOrigin, targets types.SearchTargets,
+) *types.QuestionOrigin {
+	if origin == nil {
+		return nil
+	}
+	kbID := strings.TrimSpace(origin.KnowledgeBaseID)
+	if kbID == "" {
+		return nil
+	}
+	covered := false
+	for _, target := range targets {
+		if target != nil && target.KnowledgeBaseID == kbID {
+			covered = true
+			break
+		}
+	}
+	if !covered {
+		logger.Infof(ctx, "Ignoring question origin: knowledge base %s is outside this turn's search targets",
+			secutils.SanitizeForLog(kbID))
+		return nil
+	}
+	kept := &types.QuestionOrigin{KnowledgeBaseID: kbID}
+	docID := strings.TrimSpace(origin.KnowledgeID)
+	if docID != "" && targetsCoverDocument(targets, kbID, docID) {
+		kept.KnowledgeID = docID
+	}
+	return kept
+}
+
+func targetsCoverDocument(targets types.SearchTargets, kbID, docID string) bool {
+	for _, target := range targets {
+		if target == nil || target.KnowledgeBaseID != kbID {
+			continue
+		}
+		switch target.Type {
+		case types.SearchTargetTypeKnowledgeBase:
+			if len(target.TagIDs) == 0 {
+				return true
+			}
+		case types.SearchTargetTypeKnowledge:
+			for _, knowledgeID := range target.KnowledgeIDs {
+				if knowledgeID == docID {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func mergeResolvedTagKnowledgeIDs(

@@ -40,13 +40,13 @@ func TestPinWritesWhenUnset(t *testing.T) {
 	pinner := NewSessionSandboxPinner(newPinTestDB(t))
 	ctx := context.Background()
 
-	got, err := pinner.Pin(ctx, "s-1", "cfg-a")
+	got, err := pinner.Pin(ctx, "s-1", SandboxPin{ConfigID: "cfg-a"})
 	require.NoError(t, err)
-	require.Equal(t, "cfg-a", got)
+	require.Equal(t, "cfg-a", got.ConfigID)
 
 	read, err := pinner.Read(ctx, "s-1")
 	require.NoError(t, err)
-	require.Equal(t, "cfg-a", read)
+	require.Equal(t, "cfg-a", read.ConfigID)
 }
 
 // Two concurrent first-sandbox creations must converge on one config, or the
@@ -55,22 +55,22 @@ func TestPinIsIdempotentAndReturnsExistingWinner(t *testing.T) {
 	pinner := NewSessionSandboxPinner(newPinTestDB(t))
 	ctx := context.Background()
 
-	first, err := pinner.Pin(ctx, "s-1", "cfg-a")
+	first, err := pinner.Pin(ctx, "s-1", SandboxPin{ConfigID: "cfg-a"})
 	require.NoError(t, err)
-	require.Equal(t, "cfg-a", first)
+	require.Equal(t, "cfg-a", first.ConfigID)
 
-	second, err := pinner.Pin(ctx, "s-1", "cfg-b")
+	second, err := pinner.Pin(ctx, "s-1", SandboxPin{ConfigID: "cfg-b"})
 	require.NoError(t, err)
-	require.Equal(t, "cfg-a", second, "the first writer wins; later callers adopt it")
+	require.Equal(t, "cfg-a", second.ConfigID, "the first writer wins; later callers adopt it")
 }
 
 func TestPinLeavesEmptyConfigUnpinned(t *testing.T) {
 	pinner := NewSessionSandboxPinner(newPinTestDB(t))
 	ctx := context.Background()
 
-	got, err := pinner.Pin(ctx, "s-1", "")
+	got, err := pinner.Pin(ctx, "s-1", SandboxPin{})
 	require.NoError(t, err)
-	require.Empty(t, got)
+	require.True(t, got.IsZero())
 }
 
 // A padded ID must land in the column exactly as Read will compare it, or the
@@ -79,13 +79,13 @@ func TestPinTrimsConfigIDBeforeStoring(t *testing.T) {
 	pinner := NewSessionSandboxPinner(newPinTestDB(t))
 	ctx := context.Background()
 
-	got, err := pinner.Pin(ctx, "s-1", "  cfg-a  ")
+	got, err := pinner.Pin(ctx, "s-1", SandboxPin{ConfigID: "  cfg-a  "})
 	require.NoError(t, err)
-	require.Equal(t, "cfg-a", got)
+	require.Equal(t, "cfg-a", got.ConfigID)
 
 	read, err := pinner.Read(ctx, "s-1")
 	require.NoError(t, err)
-	require.Equal(t, "cfg-a", read)
+	require.Equal(t, "cfg-a", read.ConfigID)
 }
 
 // Pin runs right after a sandbox was created, so a vanished session must be an
@@ -95,11 +95,11 @@ func TestPinFailsWhenSessionIsGone(t *testing.T) {
 	pinner := NewSessionSandboxPinner(db)
 	ctx := context.Background()
 
-	_, err := pinner.Pin(ctx, "missing", "cfg-a")
+	_, err := pinner.Pin(ctx, "missing", SandboxPin{ConfigID: "cfg-a"})
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 
 	require.NoError(t, db.Delete(&types.Session{}, "id = ?", "s-1").Error)
-	_, err = pinner.Pin(ctx, "s-1", "cfg-a")
+	_, err = pinner.Pin(ctx, "s-1", SandboxPin{ConfigID: "cfg-a"})
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound,
 		"a soft-deleted session already had its sandbox destroyed")
 }
@@ -120,7 +120,7 @@ func TestClearReleasesPin(t *testing.T) {
 	pinner := NewSessionSandboxPinner(newPinTestDB(t))
 	ctx := context.Background()
 
-	_, err := pinner.Pin(ctx, "s-1", "cfg-a")
+	_, err := pinner.Pin(ctx, "s-1", SandboxPin{ConfigID: "cfg-a"})
 	require.NoError(t, err)
 	require.NoError(t, pinner.Clear(ctx, "s-1"))
 
@@ -137,7 +137,7 @@ func TestSoftDeleteHidesSandboxPin(t *testing.T) {
 	pinner := NewSessionSandboxPinner(db)
 	ctx := context.Background()
 
-	_, err := pinner.Pin(ctx, "s-1", "cfg-a")
+	_, err := pinner.Pin(ctx, "s-1", SandboxPin{ConfigID: "cfg-a"})
 	require.NoError(t, err)
 
 	require.NoError(t, db.Delete(&types.Session{}, "id = ?", "s-1").Error)
@@ -203,7 +203,7 @@ func TestResolveSandboxForExecutionPinsDockerBackend(t *testing.T) {
 
 func TestResolveSandboxForExecutionKeepsExistingRemotePin(t *testing.T) {
 	pinner := NewSessionSandboxPinner(newPinTestDB(t))
-	_, err := pinner.Pin(context.Background(), "s-1", "cfg-existing")
+	_, err := pinner.Pin(context.Background(), "s-1", SandboxPin{ConfigID: "cfg-existing"})
 	require.NoError(t, err)
 	want := &pinTestManager{typ: sandbox.SandboxTypeE2B}
 

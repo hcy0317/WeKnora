@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/Tencent/WeKnora/internal/application/service"
+	"github.com/Tencent/WeKnora/internal/browserskill"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
@@ -13,10 +14,12 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 )
 
 // Handler handles all HTTP requests related to conversation sessions
 type Handler struct {
+	browserSkill         *browserskill.Manager
 	messageService       interfaces.MessageService // Service for managing messages
 	suggestionService    interfaces.MessageSuggestionService
 	sessionService       interfaces.SessionService       // Service for managing sessions
@@ -29,6 +32,7 @@ type Handler struct {
 	kbShareService       interfaces.KBShareService       // Service for resolving shared KB permissions
 	fileService          interfaces.FileService          // Service for file storage (image uploads)
 	storageResolver      interfaces.StorageBackendResolver
+	resourceCatalog      interfaces.ResourceCatalog
 	modelService         interfaces.ModelService // Service for model management (VLM access)
 	attachmentProcessor  *AttachmentProcessor    // Processor for file attachments
 	temporaryDocuments   interfaces.TemporaryDocumentService
@@ -36,7 +40,19 @@ type Handler struct {
 	// after an agent turn completes. May be nil when the sandbox backend does
 	// not support artifact collection; handlers must check before using.
 	artifactCollector *service.ArtifactCollector
-	memoryService     interfaces.MemoryService // Service for cross-session long-term memory
+	workspaceCheckpointer *service.WorkspaceCheckpointer
+	sandboxIDLookup       SandboxIDLookup
+	memoryService         interfaces.MemoryService // Service for cross-session long-term memory
+	userService           interfaces.UserService
+	memberService         interfaces.TenantMemberService
+	terminalService       *service.SandboxTerminalService
+	desktopService        *service.SandboxDesktopService
+	desktopTickets        service.SandboxDesktopTicketStore
+	desktopLast           service.SandboxDesktopLastStore
+	redis                 *redis.Client
+	forkService           sessionForker
+	rewindService         sessionRewinder
+	approvedProjectDirs   HostProjectDirsLoader
 }
 
 // NewHandler creates a new instance of Handler with all necessary dependencies
@@ -53,14 +69,29 @@ func NewHandler(
 	kbShareService interfaces.KBShareService,
 	fileService interfaces.FileService,
 	storageResolver interfaces.StorageBackendResolver,
+	resourceCatalog interfaces.ResourceCatalog,
 	modelService interfaces.ModelService,
 	documentReader interfaces.DocumentReader,
 	imageResolver *docparser.ImageResolver,
 	temporaryDocuments interfaces.TemporaryDocumentService,
 	artifactCollector *service.ArtifactCollector,
+	workspaceCheckpointer *service.WorkspaceCheckpointer,
+	sandboxIDLookup SandboxIDLookup,
 	memoryService interfaces.MemoryService,
+	userService interfaces.UserService,
+	memberService interfaces.TenantMemberService,
+	terminalService *service.SandboxTerminalService,
+	browserSkill *browserskill.Manager,
+	desktopService *service.SandboxDesktopService,
+	desktopTickets service.SandboxDesktopTicketStore,
+	desktopLast service.SandboxDesktopLastStore,
+	rdb *redis.Client,
+	forkService *service.SessionForkService,
+	rewindService *service.SessionRewindService,
+	approvedProjectDirs HostProjectDirsLoader,
 ) *Handler {
 	return &Handler{
+		browserSkill:          browserSkill,
 		sessionService:       sessionService,
 		messageService:       messageService,
 		suggestionService:    suggestionService,
@@ -73,10 +104,23 @@ func NewHandler(
 		kbShareService:       kbShareService,
 		fileService:          fileService,
 		storageResolver:      storageResolver,
+		resourceCatalog:      resourceCatalog,
 		modelService:         modelService,
 		temporaryDocuments:   temporaryDocuments,
 		artifactCollector:    artifactCollector,
+		workspaceCheckpointer: workspaceCheckpointer,
+		sandboxIDLookup:       sandboxIDLookup,
 		memoryService:        memoryService,
+		userService:          userService,
+		memberService:        memberService,
+		terminalService:      terminalService,
+		desktopService:       desktopService,
+		desktopTickets:       desktopTickets,
+		desktopLast:          desktopLast,
+		redis:                rdb,
+		forkService:          forkService,
+		rewindService:        rewindService,
+		approvedProjectDirs:  approvedProjectDirs,
 		attachmentProcessor: NewAttachmentProcessor(
 			fileService,
 			documentReader,

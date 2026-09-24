@@ -1,5 +1,7 @@
 package event
 
+import "time"
+
 // EventData contains common event data structures for different stages
 
 // QueryData represents query-related event data
@@ -195,6 +197,9 @@ type AgentFinalAnswerData struct {
 	Content    string `json:"content"`
 	Done       bool   `json:"done"`
 	IsFallback bool   `json:"is_fallback,omitempty"` // True when response is a fallback (no knowledge base match)
+	// Truncated means the provider stopped at the completion-token cap; the
+	// client should not present the partial answer as complete.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // AgentReflectionData represents agent reflection data
@@ -272,4 +277,35 @@ type MCPOAuthResolvedData struct {
 	Reason     string `json:"reason,omitempty"`
 	TimedOut   bool   `json:"timed_out,omitempty"`
 	Canceled   bool   `json:"canceled,omitempty"`
+}
+
+// CommandOutputData is a bounded cumulative tail so reconnecting clients do not
+// need to reconstruct output from every shell event.
+type CommandOutputData struct {
+	ToolCallID string    `json:"tool_call_id"`
+	Command    string    `json:"command"`
+	StartedAt  time.Time `json:"started_at"`
+	Output     string    `json:"output"`
+	Done       bool      `json:"done"`
+}
+
+// ContextCompactedData describes a history window compaction for the active run.
+type ContextCompactedData struct {
+	Reason         string `json:"reason"`
+	Round          int    `json:"round"`
+	TokensBefore   int    `json:"tokens_before"`
+	TokensAfter    int    `json:"tokens_after"`
+	MessagesBefore int    `json:"messages_before"`
+	MessagesAfter  int    `json:"messages_after"`
+	Summary        string `json:"summary"`
+	Degraded       bool   `json:"degraded,omitempty"`
+	SplitTurn      bool   `json:"split_turn,omitempty"`
+}
+
+// UserMessageInjectedData confirms that an in-flight turn accepted a steer.
+type UserMessageInjectedData struct {
+	SteerID       string `json:"steer_id"`
+	Content       string `json:"content"`
+	MessageID     string `json:"message_id"`
+	UserMessageID string `json:"user_message_id,omitempty"`
 }

@@ -126,6 +126,14 @@ def _load_whitelist() -> Tuple[FrozenSet[str], Tuple[str, ...], Tuple[Union[ipad
     return frozenset(exact_hosts), tuple(suffix_hosts), tuple(cidr_nets)
 
 
+def _whitelist_only_enabled() -> bool:
+    """Whether SSRF_DNS_WHITELIST_ONLY refuses hosts before DNS."""
+    raw = os.environ.get("SSRF_DNS_WHITELIST_ONLY", "").strip()
+    if not raw:
+        return False
+    return raw.lower() not in {"0", "f", "false"}
+
+
 def _is_whitelisted(hostname: str) -> bool:
     lowered = hostname.lower()
     exact_hosts, suffix_hosts, cidr_nets = _load_whitelist()
@@ -224,6 +232,15 @@ def is_ssrf_safe_url(raw_url: str) -> Tuple[bool, str]:
     hostname_lower = hostname.lower()
     if _is_whitelisted(hostname_lower):
         return True, ""
+
+    # In whitelist-only mode, a hostname outside the configured allowlist is
+    # rejected here so validation never performs a DNS lookup for it.
+    if _whitelist_only_enabled():
+        return (
+            False,
+            f"host is not in the SSRF whitelist: {hostname_lower} "
+            "(SSRF_DNS_WHITELIST_ONLY is on; add it to SSRF_WHITELIST to allow it)",
+        )
 
     if hostname_lower in RESTRICTED_HOSTNAMES:
         return False, f"hostname {hostname_lower} is restricted"

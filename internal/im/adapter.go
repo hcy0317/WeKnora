@@ -162,6 +162,13 @@ type StreamSender interface {
 	EndStream(ctx context.Context, incoming *IncomingMessage, streamID string) error
 }
 
+// FullOutputProgressSender optionally supports an initial placeholder that is
+// replaced once with the final answer, without streaming intermediate tokens.
+type FullOutputProgressSender interface {
+	StreamSender
+	SupportsFullOutputProgress() bool
+}
+
 // FileDownloader is an optional interface that adapters can implement to support
 // downloading file attachments from the IM platform. It allows file/image
 // messages to be supplied to QA as attachments; when a knowledge_base_id is

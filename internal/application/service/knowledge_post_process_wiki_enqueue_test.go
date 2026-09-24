@@ -18,6 +18,7 @@ type wikiEnqueueFailureKnowledgeRepo struct {
 	interfaces.KnowledgeRepository
 	knowledge        *types.Knowledge
 	expectedSubtasks int
+	setFinalizingErr error
 }
 
 func (r *wikiEnqueueFailureKnowledgeRepo) GetKnowledgeByIDOnly(
@@ -32,6 +33,9 @@ func (r *wikiEnqueueFailureKnowledgeRepo) SetFinalizing(
 	_ string,
 	expectedSubtasks int,
 ) (bool, error) {
+	if r.setFinalizingErr != nil {
+		return false, r.setFinalizingErr
+	}
 	r.expectedSubtasks = expectedSubtasks
 	r.knowledge.ParseStatus = types.ParseStatusFinalizing
 	return true, nil
@@ -96,6 +100,7 @@ type wikiEnqueueFailureTaskQueue struct {
 	taskTypes        []string
 	questionPayloads []types.QuestionGenerationPayload
 	graphPayloads    []types.ExtractChunkPayload
+	extractChunkIDs  []string
 	wikiErr          error
 	summaryErr       error
 	fastTracker      SpanTracker
@@ -118,6 +123,7 @@ func (q *wikiEnqueueFailureTaskQueue) Enqueue(
 		var payload types.ExtractChunkPayload
 		if err := json.Unmarshal(task.Payload(), &payload); err == nil {
 			q.graphPayloads = append(q.graphPayloads, payload)
+			q.extractChunkIDs = append(q.extractChunkIDs, payload.ChunkID)
 		}
 	}
 	if task.Type() == types.TypeSummaryGeneration && q.summaryErr != nil {
@@ -142,6 +148,30 @@ func (q *wikiEnqueueFailureTaskQueue) Enqueue(
 		return nil, q.wikiErr
 	}
 	return &asynq.TaskInfo{ID: "queued", Type: task.Type()}, nil
+}
+
+type wikiEnqueueFailureChunkRepo struct {
+	interfaces.ChunkRepository
+	chunks []*types.Chunk
+}
+
+func (r *wikiEnqueueFailureChunkRepo) ListChunksByKnowledgeIDAndTypes(
+	_ context.Context, tenantID uint64, knowledgeID string, chunkTypes []types.ChunkType,
+) ([]*types.Chunk, error) {
+	wanted := make(map[types.ChunkType]bool, len(chunkTypes))
+	for _, chunkType := range chunkTypes {
+		wanted[chunkType] = true
+	}
+	rows := make([]*types.Chunk, 0, len(r.chunks))
+	for _, chunk := range r.chunks {
+		if chunk == nil || chunk.KnowledgeID != knowledgeID || (tenantID != 0 && chunk.TenantID != tenantID) {
+			continue
+		}
+		if len(wanted) == 0 || wanted[chunk.ChunkType] {
+			rows = append(rows, chunk)
+		}
+	}
+	return rows, nil
 }
 
 type wikiEnqueueFailurePendingRepo struct {

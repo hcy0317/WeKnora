@@ -107,3 +107,31 @@ func (r *customAgentRepository) ListNamesBySandboxConfigID(
 	err := query.Order("name ASC").Pluck("name", &names).Error
 	return names, err
 }
+
+// ListModelUsages returns active agents that reference a model, with only the
+// fields needed to explain each binding to the settings UI.
+func (r *customAgentRepository) ListModelUsages(
+	ctx context.Context, tenantID uint64, modelID string,
+) ([]types.ModelUsageResource, error) {
+	rows := make([]*types.CustomAgent, 0)
+	query := r.db.WithContext(ctx).
+		Model(&types.CustomAgent{}).
+		Select("id", "name", "config").
+		Where("tenant_id = ?", tenantID)
+	query = scopeCustomAgentsByModelID(query, modelID)
+	if err := query.Order("name ASC, id ASC").Limit(types.ModelUsageListLimit).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	usages := make([]types.ModelUsageResource, 0, len(rows))
+	for _, row := range rows {
+		bindings := customAgentModelUsageBindings(row, modelID)
+		if len(bindings) == 0 {
+			continue
+		}
+		usages = append(usages, types.ModelUsageResource{
+			ID: row.ID, Name: row.Name, Bindings: bindings,
+		})
+	}
+	return usages, nil
+}

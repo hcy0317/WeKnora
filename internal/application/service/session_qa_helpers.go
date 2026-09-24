@@ -6,8 +6,29 @@ import (
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/models/api"
 	"github.com/Tencent/WeKnora/internal/types"
 )
+
+// applyRequestReasoningEffort applies the per-turn override without mutating
+// the persisted agent defaults. Empty or invalid values leave those defaults
+// untouched; HTTP parsing rejects invalid values before this helper is used.
+func applyRequestReasoningEffort(override string, thinking **bool, effort *string) {
+	if strings.TrimSpace(override) == "" {
+		return
+	}
+	level, ok := api.ParseReasoningEffort(override)
+	if !ok {
+		return
+	}
+	if effort != nil {
+		*effort = string(level)
+	}
+	if thinking != nil {
+		enabled := level.Enabled()
+		*thinking = &enabled
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Shared QA helpers: KB resolution, model resolution, retrieval tenant

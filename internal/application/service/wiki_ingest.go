@@ -26,6 +26,7 @@ import (
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
+	"gorm.io/gorm"
 )
 
 // ErrWikiIngestConcurrent is returned by the wiki ingest handler in Lite mode
@@ -201,6 +202,12 @@ return proposed
 	// 32768 matches verified complete outputs for large Chinese policy docs;
 	// shorter replies still stop early via finish_reason=stop. See #2604.
 	wikiLLMMaxTokens = 32768
+
+	// Page rewrites return the whole Markdown page, so a budget-truncated
+	// fragment is never safe to persist. Continue only this prompt; structured
+	// extraction already retries malformed JSON through its parse-failure path.
+	wikiPageModifyMaxContinuations = 3
+	wikiPageModifyContinuationDone = "(complete)"
 
 	// wikiTaskType is the task_type stamp used in task_pending_ops and
 	// task_dead_letters rows for this pipeline. Stable across the lifetime
@@ -815,6 +822,15 @@ func EnqueueWikiRetract(
 	pendingRepo interfaces.TaskPendingOpsRepository,
 	payload WikiRetractPayload,
 ) {
+	_ = enqueueWikiRetract(ctx, task, pendingRepo, payload)
+}
+
+func enqueueWikiRetract(
+	ctx context.Context,
+	task interfaces.TaskEnqueuer,
+	pendingRepo interfaces.TaskPendingOpsRepository,
+	payload WikiRetractPayload,
+) error {
 	op := WikiPendingOp{
 		Op:          WikiOpRetract,
 		KnowledgeID: payload.KnowledgeID,
@@ -827,7 +843,7 @@ func EnqueueWikiRetract(
 	payloadBytes, err := json.Marshal(op)
 	if err != nil {
 		logger.Warnf(ctx, "wiki retract: failed to marshal pending op: %v", err)
-		return
+		return err
 	}
 	accepted, err := enqueueWikiPendingOp(ctx, pendingRepo, &types.TaskPendingOp{
 		TenantID: payload.TenantID,
@@ -840,11 +856,11 @@ func EnqueueWikiRetract(
 	})
 	if err != nil {
 		logger.Warnf(ctx, "wiki retract: failed to enqueue pending op: %v", err)
-		return
+		return err
 	}
 	if !accepted {
 		logger.Infof(ctx, "wiki retract: skip enqueue for deleted KB %s", payload.KnowledgeBaseID)
-		return
+		return nil
 	}
 
 	trigger := WikiIngestPayload{
@@ -862,7 +878,9 @@ func EnqueueWikiRetract(
 	)
 	if _, err := task.Enqueue(t); err != nil {
 		logger.Warnf(ctx, "wiki retract: failed to enqueue trigger task: %v", err)
+		return err
 	}
+	return nil
 }
 
 // Handle implements interfaces.TaskHandler for asynq task processing. The
@@ -894,6 +912,70 @@ func (s *wikiIngestService) clearDeletedKnowledgeBasePendingOps(ctx context.Cont
 	cleanupCtx, cancel := wikiIngestCleanupContext(ctx)
 	defer cancel()
 	return cleaner.DeleteByScope(cleanupCtx, types.TaskScopeKnowledgeBase, kbID)
+}
+
+func (s *wikiIngestService) releaseIngestForUnavailableWiki(ctx context.Context, kbID, reason string) error {
+	drainer, ok := s.pendingRepo.(interface {
+		DrainUnclaimedAndRelease(context.Context, string, string, string, string, time.Time) ([]string, error)
+	})
+	if !ok {
+		return fmt.Errorf("wiki ingest: KB %s unavailable (%s)", kbID, reason)
+	}
+	cleanupCtx, cancel := wikiIngestCleanupContext(ctx)
+	defer cancel()
+	knowledgeIDs, err := drainer.DrainUnclaimedAndRelease(cleanupCtx,
+		wikiTaskType, wikiTaskScope, kbID, WikiOpIngest, time.Now().Add(-wikiClaimStaleAfter))
+	if err != nil {
+		return fmt.Errorf("wiki ingest: KB %s unavailable (%s), drain pending ingest: %w", kbID, reason, err)
+	}
+	logger.Warnf(ctx, "wiki ingest: KB %s unavailable (%s), dropped pending ingest for %d document(s)",
+		kbID, reason, len(knowledgeIDs))
+	return nil
+}
+
+// WikiPendingLanguage returns the language recorded on the newest queued wiki
+// ingest op. Startup recovery has no request context, but taxonomy planning
+// must use the language that created the durable queue rows.
+func WikiPendingLanguage(ctx context.Context, db *gorm.DB, tenantID uint64, kbID string) string {
+	if db == nil || kbID == "" {
+		return ""
+	}
+	var payloads []string
+	if err := db.WithContext(ctx).Model(&types.TaskPendingOp{}).
+		Where("tenant_id = ? AND task_type = ? AND scope = ? AND scope_id = ? AND op = ?",
+			tenantID, wikiTaskType, wikiTaskScope, kbID, WikiOpIngest).
+		Order("id DESC").Limit(1).
+		Pluck("payload", &payloads).Error; err != nil || len(payloads) == 0 {
+		return ""
+	}
+	var op WikiPendingOp
+	if err := json.Unmarshal([]byte(payloads[0]), &op); err != nil {
+		return ""
+	}
+	return op.Language
+}
+
+// tenantIsDeleted stops durable wiki work for a workspace that no longer has
+// an active tenant. Pending knowledge rows survive tenant deletion, so a
+// restarted worker must not turn them into new synthesis-model requests.
+// Older test doubles and transient liveness lookup failures fail open; startup
+// queue recovery and the normal task retry path remain responsible for them.
+func (s *wikiIngestService) tenantIsDeleted(ctx context.Context, tenantID uint64) bool {
+	if tenantID == 0 || s.pendingRepo == nil {
+		return false
+	}
+	checker, ok := s.pendingRepo.(interface {
+		HasActiveTenant(context.Context, uint64) (bool, error)
+	})
+	if !ok {
+		return false
+	}
+	active, err := checker.HasActiveTenant(ctx, tenantID)
+	if err != nil {
+		logger.Warnf(ctx, "wiki: tenant liveness lookup failed for tenant %d: %v (failing open)", tenantID, err)
+		return false
+	}
+	return !active
 }
 
 func (s *wikiIngestService) enqueueFinalizeRow(ctx context.Context, op *types.TaskPendingOp) (bool, error) {
@@ -1263,10 +1345,13 @@ func (s *wikiIngestService) reserveInflightSlot(ctx context.Context, kbID string
 		return nil, false
 	}
 
-	renewCtx, cancel := context.WithCancel(context.Background())
+	renewCtx, cancel := context.WithCancel(ctx)
+	renewDone := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(wikiInflightRenew)
 		defer ticker.Stop()
+		defer close(renewDone)
+		defer s.redisClient.ZRem(context.Background(), key, token)
 		for {
 			select {
 			case <-renewCtx.Done():
@@ -1280,7 +1365,7 @@ func (s *wikiIngestService) reserveInflightSlot(ctx context.Context, kbID string
 	}()
 	return func() {
 		cancel()
-		s.redisClient.ZRem(context.Background(), key, token)
+		<-renewDone
 	}, true
 }
 
@@ -3294,17 +3379,93 @@ func (s *wikiIngestService) deduplicateExtractedBatch(
 // transient 504 from the upstream gateway used to drop the document's
 // summary page permanently. Retries plus failedOps requeuing (see
 // mapOneDocument) turn those events into at-most-a-few-minute hiccups.
-func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel chat.Chat, promptTpl string, data map[string]string) (string, error) {
+func (s *wikiIngestService) generateWithTemplate(
+	ctx context.Context, chatModel chat.Chat, promptTpl string, data map[string]string,
+) (string, error) {
+	result, err := s.generateWithTemplateResult(ctx, chatModel, promptTpl, data)
+	return result.Content, err
+}
+
+type wikiTemplateResult struct {
+	Content      string
+	FinishReason string
+}
+
+var errWikiPageRewriteTruncated = errors.New("wiki page rewrite truncated at the completion budget")
+
+func isWikiPageLengthStop(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "length", "max_tokens", "max_output_tokens":
+		return true
+	default:
+		return false
+	}
+}
+
+// continueWikiPageRewrite completes only full-page rewrites that hit their
+// completion-token limit. Its calls share the outer attempt deadline and the
+// caller settles one durable generation fragment only after the full page is
+// available.
+func continueWikiPageRewrite(
+	ctx context.Context,
+	chatModel chat.Chat,
+	messages []chat.Message,
+	opts *chat.ChatOptions,
+	purpose, existingSummary, pageTitle string,
+	first *types.ChatResponse,
+) (*types.ChatResponse, error) {
+	if first == nil || !isWikiPageLengthStop(first.FinishReason) {
+		return first, nil
+	}
+	conversation := append([]chat.Message(nil), messages...)
+	combined := strings.Builder{}
+	combined.WriteString(first.Content)
+	last := first
+	for continuation := 1; continuation <= wikiPageModifyMaxContinuations; continuation++ {
+		logger.Warnf(ctx,
+			"wiki ingest: page rewrite %s hit completion budget (finish_reason=%s, %d chars); continuation %d/%d",
+			pageTitle, last.FinishReason, combined.Len(), continuation, wikiPageModifyMaxContinuations)
+		conversation = append(
+			append([]chat.Message(nil), conversation...),
+			chat.Message{Role: "assistant", Content: last.Content},
+			chat.Message{Role: "user", Content: agent.WikiPageModifyContinuationPrompt},
+		)
+		next, err := callWikiLLMWithFallbacks(ctx, chatModel, conversation, opts, purpose, existingSummary, pageTitle)
+		if err != nil {
+			return nil, err
+		}
+		if next == nil {
+			return nil, newWikiGenerationError(
+				WikiGenerationErrorDeterministicOutput,
+				errors.New("wiki page rewrite continuation returned nil response"),
+			)
+		}
+		if strings.EqualFold(strings.TrimSpace(next.Content), wikiPageModifyContinuationDone) {
+			return &types.ChatResponse{Content: combined.String(), FinishReason: "stop"}, nil
+		}
+		combined.WriteString(next.Content)
+		last = next
+		if !isWikiPageLengthStop(last.FinishReason) {
+			return &types.ChatResponse{Content: combined.String(), FinishReason: last.FinishReason}, nil
+		}
+	}
+	return nil, fmt.Errorf("%w (finish_reason=%s after %d continuation rounds)",
+		errWikiPageRewriteTruncated, last.FinishReason, wikiPageModifyMaxContinuations)
+}
+
+func (s *wikiIngestService) generateWithTemplateResult(
+	ctx context.Context, chatModel chat.Chat, promptTpl string, data map[string]string,
+) (wikiTemplateResult, error) {
 	tmpl, err := template.New("wiki").Parse(promptTpl)
 	if err != nil {
-		return "", fmt.Errorf("parse template: %w", err)
+		return wikiTemplateResult{}, fmt.Errorf("parse template: %w", err)
 	}
 
 	maskedData, urlMap := maskTemplateDataImageURLs(data)
 
 	var buf strings.Builder
 	if err := tmpl.Execute(&buf, maskedData); err != nil {
-		return "", fmt.Errorf("execute template: %w", err)
+		return wikiTemplateResult{}, fmt.Errorf("execute template: %w", err)
 	}
 
 	prompt := buf.String()
@@ -3350,7 +3511,7 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 		Options  *chat.ChatOptions `json:"options"`
 	}{Messages: messages, Options: opts})
 	if err != nil {
-		return "", fmt.Errorf("encode wiki generation request: %w", err)
+		return wikiTemplateResult{}, fmt.Errorf("encode wiki generation request: %w", err)
 	}
 	requestKey := chat.BuildPromptCacheKey(
 		tenantID, chatModel.GetModelID(), "wiki_exact_request",
@@ -3358,7 +3519,7 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 	)
 	ledger, err := s.prepareWikiGenerationLedger(ctx, purpose, requestJSON, chatModel)
 	if err != nil {
-		return "", err
+		return wikiTemplateResult{}, err
 	}
 
 	execute := func() (interface{}, error) {
@@ -3386,7 +3547,7 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 					return "", budgetErr
 				}
 				if !granted {
-					return reserved.Output, nil
+					return wikiTemplateResult{Content: reserved.Output, FinishReason: "stop"}, nil
 				}
 			}
 			attemptCtx, cancelAttempt := context.WithTimeout(ctx, attemptTimeout)
@@ -3394,6 +3555,12 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 				attemptCtx, chatModel, messages, opts, purpose,
 				maskedData["ExistingSummary"], maskedData["PageTitle"],
 			)
+			if callErr == nil && response != nil && promptTpl == agent.WikiPageModifyUserPrompt {
+				response, callErr = continueWikiPageRewrite(
+					attemptCtx, chatModel, messages, opts, purpose,
+					maskedData["ExistingSummary"], maskedData["PageTitle"], response,
+				)
+			}
 			attemptTimedOut := errors.Is(callErr, context.DeadlineExceeded) && ctx.Err() == nil
 			cancelAttempt()
 			if attemptTimedOut {
@@ -3412,7 +3579,7 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 					if ledgerErr := ledger.complete(ctx, reserved, response.Content); ledgerErr != nil {
 						return "", ledgerErr
 					}
-					return response.Content, nil
+					return wikiTemplateResult{Content: response.Content, FinishReason: response.FinishReason}, nil
 				}
 			}
 			if callErr == nil {
@@ -3455,22 +3622,24 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 	if !tenantScoped {
 		value, executeErr := execute()
 		if executeErr != nil {
-			return "", executeErr
+			return wikiTemplateResult{}, executeErr
 		}
-		content, _ := value.(string)
-		return unmaskImageURLs(content, urlMap), nil
+		generated, _ := value.(wikiTemplateResult)
+		generated.Content = unmaskImageURLs(generated.Content, urlMap)
+		return generated, nil
 	}
 	resultCh := s.llmRequests.DoChan(requestKey, execute)
 
 	select {
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return wikiTemplateResult{}, ctx.Err()
 	case result := <-resultCh:
 		if result.Err != nil {
-			return "", result.Err
+			return wikiTemplateResult{}, result.Err
 		}
-		content, _ := result.Val.(string)
-		return unmaskImageURLs(content, urlMap), nil
+		generated, _ := result.Val.(wikiTemplateResult)
+		generated.Content = unmaskImageURLs(generated.Content, urlMap)
+		return generated, nil
 	}
 }
 

@@ -686,7 +686,7 @@ func TestSnapshotBelongsToOtherConfig(t *testing.T) {
 }
 
 func TestTenantSkillServiceStartIsIdempotent(t *testing.T) {
-	svc := NewTenantSkillService(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	svc := NewTenantSkillService(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, HostSandboxManager{})
 
 	require.NoError(t, svc.Start(context.Background()))
 	require.NoError(t, svc.Start(context.Background()),
@@ -732,7 +732,7 @@ func newReaperFixture(t *testing.T) *reaperFixture {
 	resolver := &reaperSandboxResolver{provider: provider}
 	svc := NewTenantSkillService(
 		skills, configs, nil, resolver,
-		nil, nil, nil, nil, nil, nil, nil, nil,
+		nil, nil, nil, nil, nil, nil, nil, nil, HostSandboxManager{},
 	)
 	svc.now = func() time.Time { return now }
 	return &reaperFixture{

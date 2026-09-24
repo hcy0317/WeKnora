@@ -538,3 +538,20 @@ func CloneContext(ctx context.Context) context.Context {
 
 	return newCtx
 }
+
+// CloneContextWithoutTrace preserves detached identity and tenant metadata
+// while dropping both the Langfuse trace handle and the active OpenTelemetry
+// span. Use it for background housekeeping that must not become a child of a
+// completed chat request.
+func CloneContextWithoutTrace(ctx context.Context) context.Context {
+	newCtx := context.Background()
+	for _, key := range types.ContextKeysClonedAcrossDetach() {
+		if key == types.LangfuseTraceContextKey {
+			continue
+		}
+		if value := ctx.Value(key); value != nil {
+			newCtx = context.WithValue(newCtx, key, value)
+		}
+	}
+	return newCtx
+}

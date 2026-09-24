@@ -42,6 +42,7 @@ type customAgentService struct {
 	wikiPageRepo   interfaces.WikiPageRepository
 	tagRepo        interfaces.KnowledgeTagRepository
 	knowledgeRepo  interfaces.KnowledgeRepository
+	agentShareRepo interfaces.AgentShareRepository
 }
 
 // NewCustomAgentService creates a new custom agent service
@@ -53,6 +54,7 @@ func NewCustomAgentService(
 	wikiPageRepo interfaces.WikiPageRepository,
 	tagRepo interfaces.KnowledgeTagRepository,
 	knowledgeRepo interfaces.KnowledgeRepository,
+	agentShareRepo interfaces.AgentShareRepository,
 ) interfaces.CustomAgentService {
 	return &customAgentService{
 		repo:           repo,
@@ -62,6 +64,7 @@ func NewCustomAgentService(
 		wikiPageRepo:   wikiPageRepo,
 		tagRepo:        tagRepo,
 		knowledgeRepo:  knowledgeRepo,
+		agentShareRepo: agentShareRepo,
 	}
 }
 
@@ -247,7 +250,9 @@ func (s *customAgentService) ListAgents(ctx context.Context) ([]*types.CustomAge
 }
 
 // UpdateAgent updates an agent's information
-func (s *customAgentService) UpdateAgent(ctx context.Context, agent *types.CustomAgent) (*types.CustomAgent, error) {
+func (s *customAgentService) UpdateAgent(
+	ctx context.Context, agent *types.CustomAgent, avatar *string,
+) (*types.CustomAgent, error) {
 	if agent.ID == "" {
 		logger.Error(ctx, "Agent ID is empty")
 		return nil, errors.New("agent ID cannot be empty")
@@ -286,7 +291,17 @@ func (s *customAgentService) UpdateAgent(ctx context.Context, agent *types.Custo
 	// Update fields
 	existingAgent.Name = agent.Name
 	existingAgent.Description = agent.Description
-	existingAgent.Avatar = agent.Avatar
+	// Omitted avatar means a config-only edit; a pointer to an empty string is
+	// the explicit clear operation.
+	if avatar != nil {
+		if err := (&types.CustomAgent{Avatar: *avatar}).ValidateAvatar(); err != nil {
+			return nil, err
+		}
+		existingAgent.Avatar = *avatar
+	}
+	if err := s.checkSharedAgentKBScope(ctx, existingAgent, agent.Config); err != nil {
+		return nil, err
+	}
 	existingAgent.Config = agent.Config
 	existingAgent.UpdatedAt = time.Now()
 
@@ -307,6 +322,29 @@ func (s *customAgentService) UpdateAgent(ctx context.Context, agent *types.Custo
 
 	logger.Infof(ctx, "Custom agent updated successfully, ID: %s", agent.ID)
 	return existingAgent, nil
+}
+
+func (s *customAgentService) checkSharedAgentKBScope(
+	ctx context.Context, existing *types.CustomAgent, config types.CustomAgentConfig,
+) error {
+	if s.agentShareRepo == nil || s.kbService == nil {
+		return nil
+	}
+	shares, err := s.agentShareRepo.ListByAgent(ctx, existing.ID)
+	if err != nil {
+		return err
+	}
+	for _, share := range shares {
+		if share != nil && share.SourceTenantID == existing.TenantID {
+			updated := *existing
+			updated.Config = config
+			userID, _ := types.UserIDFromContext(ctx)
+			return checkAgentKBScopeShareable(
+				ctx, s.kbService.GetKnowledgeBasesByIDsOnly, existing, &updated, userID,
+			)
+		}
+	}
+	return nil
 }
 
 // updateBuiltinAgent updates a built-in agent's configuration (but not basic info)

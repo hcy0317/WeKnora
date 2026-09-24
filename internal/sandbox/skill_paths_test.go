@@ -15,9 +15,9 @@ func TestSkillDirFor(t *testing.T) {
 	require.Equal(t, "/opt/weknora/tenant/skills/sk-1", dir)
 }
 
-func TestSessionSkillPackageDir(t *testing.T) {
-	require.Equal(t, "/workspace/.skill-packages/律师助手", SessionSkillPackageDir("律师助手"))
-	require.Equal(t, "/workspace/.skill-packages", SessionSkillPackageDir("../escape"))
+func TestSkillVenvPython(t *testing.T) {
+	require.Equal(t, "/opt/weknora/tenant/skills/律师助手/.venv/bin/python",
+		SkillVenvPython(SkillsImageRoot+"/律师助手"))
 }
 
 func TestSkillDirForRejectsPathEscape(t *testing.T) {
@@ -161,10 +161,34 @@ func TestSkillInterpreterCommand(t *testing.T) {
 		}
 	})
 
-	t.Run("shell scripts run with sh", func(t *testing.T) {
+	// Skills ship `#!/bin/bash` almost exclusively, and on Debian /bin/sh is
+	// dash: an array literal, `function f()`, a C-style for loop and process
+	// substitution are syntax errors there. Running these files with sh broke
+	// scripts that are perfectly valid, and made the install-time `sh -n` check
+	// refuse them on the way in.
+	t.Run("shell scripts prefer bash", func(t *testing.T) {
 		cmd, args := SkillInterpreterCommand(dir, dir+"/scripts/run.sh")
 		require.Equal(t, "/bin/sh", cmd)
-		require.Equal(t, []string{dir + "/scripts/run.sh"}, args)
+		require.Len(t, args, 3)
+		require.Equal(t, "-c", args[0])
+		require.Contains(t, args[1], "exec bash "+dir+"/scripts/run.sh")
+		require.Contains(t, args[1], "else", "there must be a fallback when bash is absent")
+		require.Equal(t, "weknora-skill", args[2])
+	})
+
+	t.Run("a shell script receives the caller's arguments", func(t *testing.T) {
+		if _, err := os.Stat("/bin/sh"); err != nil {
+			t.Skipf("shell is not available: %v", err)
+		}
+		scriptDir := t.TempDir()
+		script := filepath.Join(scriptDir, "echo-args.sh")
+		require.NoError(t, os.WriteFile(script, []byte("printf '%s\\n' \"$@\"\n"), 0o755))
+
+		cmd, baseArgs := SkillInterpreterCommand(scriptDir, script)
+		out, err := exec.Command(cmd, append(append([]string{}, baseArgs...),
+			"--first", "value")...).CombinedOutput()
+		require.NoError(t, err, string(out))
+		require.Equal(t, "--first\nvalue\n", string(out))
 	})
 
 	t.Run("unknown extension falls back to sh", func(t *testing.T) {
@@ -205,4 +229,59 @@ print("\n".join(sys.argv[1:]))
 	output, err := exec.Command(cmd, args...).CombinedOutput()
 	require.NoError(t, err, string(output))
 	require.Equal(t, "--first\nvalue\n--third\n", string(output))
+}
+
+func TestSessionSkillPackageDir(t *testing.T) {
+	require.Equal(t, "/workspace/.skill-packages/律师助手", SessionSkillPackageDir("律师助手"))
+}
+
+func TestIsHostSkillTarget(t *testing.T) {
+	require.True(t, IsHostSkillTarget("host"))
+	require.True(t, IsHostSkillTarget(" host "))
+	require.False(t, IsHostSkillTarget(""))
+	require.False(t, IsHostSkillTarget("HOST"))
+	require.False(t, IsHostSkillTarget("0b2f0c56-7a52-4a26-9d61-3a8c3d5ce1f1"))
+}
+
+func TestSkillDirUnderJoinsOneSegment(t *testing.T) {
+	dir, err := SkillDirUnder("/Users/dev/.weknora/skills", "pdf")
+	require.NoError(t, err)
+	require.Equal(t, "/Users/dev/.weknora/skills/pdf", dir)
+
+	_, err = SkillDirUnder("/Users/dev/.weknora/skills", "../pdf")
+	require.ErrorIs(t, err, ErrInvalidSkillName)
+	_, err = SkillDirUnder("", "pdf")
+	require.Error(t, err)
+	_, err = SkillDirUnder("relative/root", "pdf")
+	require.Error(t, err)
+	_, err = SkillDirUnder("/", "pdf")
+	require.Error(t, err)
+}
+
+func TestValidatedSkillDirUnderRejectsOtherRoots(t *testing.T) {
+	root := "/Users/dev/.weknora/skills/.versions"
+	got, ok := ValidatedSkillDirUnder(root, root+"/pdf-3")
+	require.True(t, ok)
+	require.Equal(t, root+"/pdf-3", got)
+
+	_, ok = ValidatedSkillDirUnder(root, SkillsImageRoot+"/pdf")
+	require.False(t, ok)
+	_, ok = ValidatedSkillDirUnder(root, root)
+	require.False(t, ok)
+	_, ok = ValidatedSkillDirUnder(root, root+"/pdf-3/scripts")
+	require.False(t, ok)
+}
+
+func TestImageSkillHelpersKeepTheImageRoot(t *testing.T) {
+	dir, err := SkillDirFor("pdf")
+	require.NoError(t, err)
+	require.Equal(t, SkillsImageRoot+"/pdf", dir)
+
+	got, ok := ValidatedImageSkillDir(SkillsImageRoot + "/pdf")
+	require.True(t, ok)
+	require.Equal(t, SkillsImageRoot+"/pdf", got)
+
+	require.Equal(t, SkillsImageRoot+"/pdf/.weknora/requirements.json", SkillRequirementsPath("pdf"))
+	require.Equal(t, "/x/pdf-1/.weknora/requirements.json", SkillRequirementsPathIn("/x/pdf-1"))
+	require.Equal(t, "", SkillRequirementsPathIn(" "))
 }

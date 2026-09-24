@@ -77,7 +77,7 @@ func newKnowledgeRetryRouteEngine(t *testing.T, role types.TenantRole, userID st
 	kb := &types.KnowledgeBase{ID: "kb", TenantID: tenantID, CreatorID: creatorID}
 	kbSvc := &retryRouteKBService{kb: kb}
 	cfg := &config.Config{Tenant: &config.TenantConfig{EnableRBAC: &enabled}}
-	h := handler.NewKnowledgeHandler(cfg, kg, kbSvc, share, nil, nil, nil)
+	h := handler.NewKnowledgeHandler(cfg, kg, kbSvc, share, nil, nil, nil, nil)
 	guards := newRBACGuards(cfg, nil, nil, h, nil, nil, kbSvc, kg, nil, share, nil)
 	r := gin.New()
 	r.Use(middleware.ErrorHandler())

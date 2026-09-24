@@ -2,6 +2,7 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"log"
@@ -9,8 +10,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -743,10 +746,11 @@ func ValidateStdioConfig(command string, args []string, envVars map[string]strin
 
 // SSRFSafeHTTPClientConfig contains configuration for the SSRF-safe HTTP client
 type SSRFSafeHTTPClientConfig struct {
-	Timeout            time.Duration
-	MaxRedirects       int
-	DisableKeepAlives  bool
-	DisableCompression bool
+	SameOriginRedirectsOnly bool
+	Timeout                 time.Duration
+	MaxRedirects            int
+	DisableKeepAlives       bool
+	DisableCompression      bool
 }
 
 // DefaultSSRFSafeHTTPClientConfig returns the default configuration
@@ -860,10 +864,34 @@ func NewSSRFSafeHTTPClientWithTransport(
 		transport = NewSSRFSafeTransport(config)
 	}
 	return &http.Client{
-		Timeout:       config.Timeout,
-		Transport:     &SSRFValidatingRoundTripper{Base: transport},
-		CheckRedirect: newSSRFCheckRedirect(config.MaxRedirects),
+		Timeout:   config.Timeout,
+		Transport: &SSRFValidatingRoundTripper{Base: transport},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if config.SameOriginRedirectsOnly && len(via) > 0 && !sameHTTPOrigin(via[0].URL, req.URL) {
+				return fmt.Errorf("%w: cross-origin redirect is forbidden", ErrSSRFRedirectBlocked)
+			}
+			return newSSRFCheckRedirect(config.MaxRedirects)(req, via)
+		},
 	}
+}
+
+// SafeJoinUnderBase joins a caller-provided suffix to baseDir and proves the
+// result remains within that directory. Leading separators are stripped so an
+// absolute-looking suffix cannot replace the root.
+func SafeJoinUnderBase(baseDir, relPath string) (string, error) {
+	if strings.TrimSpace(baseDir) == "" {
+		return "", fmt.Errorf("baseDir cannot be empty")
+	}
+	rel := strings.Trim(strings.TrimSpace(relPath), `/\`)
+	if rel == "" {
+		return SafePathUnderBase(baseDir, baseDir)
+	}
+	slashRel := filepath.ToSlash(rel)
+	cleaned := path.Clean(slashRel)
+	if path.IsAbs(slashRel) || path.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", fmt.Errorf("path traversal denied: path is outside base directory")
+	}
+	return SafePathUnderBase(baseDir, filepath.Join(baseDir, filepath.FromSlash(cleaned)))
 }
 
 // NewSSRFSafeHTTPClient creates an HTTP client that validates redirect targets against SSRF protections.
@@ -900,6 +928,11 @@ func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 			KeepAlive: 30 * time.Second,
 		}
 		return dialer.DialContext(ctx, network, addr)
+	}
+	// In whitelist-only mode a non-whitelisted hostname must be refused before
+	// the resolver below. Address literals continue through the address checks.
+	if err := CheckDialWhitelistOnly(host); err != nil {
+		return nil, fmt.Errorf("connection blocked: %w", err)
 	}
 	if restrictedPorts[port] {
 		return nil, fmt.Errorf("connection blocked: port %s is restricted", port)
@@ -1161,24 +1194,46 @@ func mergeSSRFWhitelistRaws(primary, extra string) string {
 // covered by the SSRF_WHITELIST environment variable.
 func IsSSRFWhitelisted(hostname string) bool {
 	wl := loadSSRFWhitelist()
+	if whitelistedByName(wl, hostname) {
+		return true
+	}
+	// CIDR entries may match a hostname through DNS during ordinary operation.
+	// Whitelist-only mode must never make that lookup for a host whose name is
+	// not itself listed; that DNS request is exactly what the mode prevents.
+	if wl == nil || len(wl.cidrNets) == 0 || net.ParseIP(hostname) != nil || SSRFWhitelistOnlyEnabled() {
+		return false
+	}
+	if ips, err := net.LookupIP(hostname); err == nil {
+		for _, ip := range ips {
+			for _, cidr := range wl.cidrNets {
+				if cidr.Contains(ip) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// isSSRFWhitelistedByName matches an exact or wildcard name, or an IP literal
+// covered by a CIDR entry, without resolving a hostname.
+func isSSRFWhitelistedByName(hostname string) bool {
+	return whitelistedByName(loadSSRFWhitelist(), hostname)
+}
+
+func whitelistedByName(wl *ssrfWhitelistConfig, hostname string) bool {
 	if wl == nil {
 		return false
 	}
 	lower := strings.ToLower(hostname)
-
-	// Exact match
 	if wl.exactHosts[lower] {
 		return true
 	}
-
-	// Suffix / wildcard match
 	for _, suffix := range wl.suffixHosts {
 		if strings.HasSuffix(lower, suffix) || lower == suffix[1:] {
 			return true
 		}
 	}
-
-	// CIDR match (only when hostname looks like an IP)
 	if ip := net.ParseIP(hostname); ip != nil {
 		for _, cidr := range wl.cidrNets {
 			if cidr.Contains(ip) {
@@ -1186,21 +1241,43 @@ func IsSSRFWhitelisted(hostname string) bool {
 			}
 		}
 	}
-
-	// Also resolve and check resolved IPs against CIDR whitelist
-	if net.ParseIP(hostname) == nil && len(wl.cidrNets) > 0 {
-		if ips, err := net.LookupIP(hostname); err == nil {
-			for _, ip := range ips {
-				for _, cidr := range wl.cidrNets {
-					if cidr.Contains(ip) {
-						return true
-					}
-				}
-			}
-		}
-	}
-
 	return false
+}
+
+// SSRFWhitelistOnlyEnabled reports whether SSRF_DNS_WHITELIST_ONLY makes the
+// whitelist the complete egress policy. A non-empty value that cannot be
+// parsed as a boolean fails closed instead of silently disabling the control.
+func SSRFWhitelistOnlyEnabled() bool {
+	raw := strings.TrimSpace(os.Getenv("SSRF_DNS_WHITELIST_ONLY"))
+	if raw == "" {
+		return false
+	}
+	enabled, err := strconv.ParseBool(raw)
+	return err != nil || enabled
+}
+
+// ErrSSRFHostNotWhitelisted reports that whitelist-only mode rejected a host
+// before resolving its name.
+var ErrSSRFHostNotWhitelisted = errors.New("host is not in the SSRF whitelist")
+
+// CheckSSRFWhitelistOnly applies the hostname allowlist gate. It does not
+// resolve names; the caller can safely invoke it before DNS.
+func CheckSSRFWhitelistOnly(host string) error {
+	if !SSRFWhitelistOnlyEnabled() || isSSRFWhitelistedByName(host) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s (SSRF_DNS_WHITELIST_ONLY is on; add it to SSRF_WHITELIST to allow it)",
+		ErrSSRFHostNotWhitelisted, host)
+}
+
+// CheckDialWhitelistOnly handles a dialer's target. DNS may already have
+// converted a whitelisted name to an IP before some dialers call this hook, so
+// address literals continue through the normal restricted-IP validation.
+func CheckDialWhitelistOnly(host string) error {
+	if net.ParseIP(host) != nil {
+		return nil
+	}
+	return CheckSSRFWhitelistOnly(host)
 }
 
 // ResetSSRFWhitelistForTest resets the whitelist singleton so tests in any
@@ -1236,6 +1313,15 @@ func FormatSSRFError(label, rawURL string, err error) string {
 	host := rawURL
 	if parsed, perr := parseHostForHint(rawURL); perr == nil && parsed != "" {
 		host = parsed
+	}
+	if errors.Is(err, ErrSSRFHostNotWhitelisted) {
+		return fmt.Sprintf(
+			"%s 未通过安全校验：服务端开启了「仅允许白名单出站」（SSRF_DNS_WHITELIST_ONLY），"+
+				"%s 不在白名单内，因此在解析域名之前就被拒绝。如该地址确实可信，请联系运维把它加入 "+
+				"SSRF_WHITELIST_EXTRA（支持精确域名 / *.example.com 通配 / IP / CIDR），"+
+				"示例：SSRF_WHITELIST_EXTRA=%s,*.example.com,10.0.0.0/8",
+			label, host, host,
+		)
 	}
 	return fmt.Sprintf(
 		"%s 未通过安全校验：%v。如该地址确实可信，请联系运维在服务端环境变量 "+
@@ -1303,6 +1389,11 @@ func ValidateURLForSSRF(rawURL string) error {
 	// If the host is whitelisted, skip the heavy checks.
 	if IsSSRFWhitelisted(hostname) {
 		return nil
+	}
+	// Whitelist-only mode refuses a non-whitelisted hostname before the full
+	// SSRF check resolves it.
+	if err := CheckSSRFWhitelistOnly(hostname); err != nil {
+		return err
 	}
 
 	// Delegate to the full SSRF validation (uses the normalised URL).

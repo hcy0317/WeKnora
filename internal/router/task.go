@@ -371,7 +371,9 @@ var taskTypesAffectingKnowledgeStatus = map[string]struct{}{
 }
 
 type deadLetterKnowledgeListDeletePayload struct {
-	KnowledgeIDs []string `json:"knowledge_ids,omitempty"`
+	TenantID        uint64   `json:"tenant_id"`
+	KnowledgeBaseID string   `json:"knowledge_base_id,omitempty"`
+	KnowledgeIDs    []string `json:"knowledge_ids,omitempty"`
 }
 
 // newDeadLetterKnowledgeFailer returns the callback wired into the asynq
@@ -548,10 +550,11 @@ func markKnowledgeListDeleteFailed(
 		if knowledgeID == "" {
 			continue
 		}
-		updated, err := repo.UpdateActiveDeletingKnowledgeColumns(ctx, knowledgeID, map[string]interface{}{
-			"parse_status":  types.ParseStatusFailed,
-			"error_message": errMsg,
-		})
+		updated, err := repo.UpdateActiveDeletingKnowledgeColumns(
+			ctx, payload.TenantID, payload.KnowledgeBaseID, knowledgeID, map[string]interface{}{
+				"parse_status":  types.ParseStatusFailed,
+				"error_message": errMsg,
+			})
 		if err != nil {
 			logger.Warnf(ctx, "dead-letter callback: failed to mark delete failure for knowledge %s: %v", knowledgeID, err)
 			continue

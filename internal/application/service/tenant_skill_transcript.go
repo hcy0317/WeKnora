@@ -38,11 +38,14 @@ type installTranscript struct {
 	sessionID          string
 	assistantMessageID string
 
-	mu       sync.Mutex
-	message  *types.Message
-	answers  []*installAnswerSegment
-	starts   map[string]time.Time
-	finished bool
+	mu            sync.Mutex
+	message       *types.Message
+	answers       []*installAnswerSegment
+	starts        map[string]time.Time
+	onActivity    func(steps int, lastCmd string)
+	toolCalls     int
+	progressMuted bool
+	finished      bool
 }
 
 // installAnswerSegment accumulates the prose streamed under one final-answer
@@ -67,8 +70,9 @@ func newInstallTranscript(
 	streams interfaces.StreamManager,
 	messages interfaces.MessageRepository,
 	sessionID, assistantMessageID string,
+	onActivity ...func(steps int, lastCmd string),
 ) *installTranscript {
-	return &installTranscript{
+	transcript := &installTranscript{
 		ctx:                ctx,
 		bus:                bus,
 		streams:            streams,
@@ -77,6 +81,19 @@ func newInstallTranscript(
 		assistantMessageID: assistantMessageID,
 		starts:             map[string]time.Time{},
 	}
+	if len(onActivity) > 0 {
+		transcript.onActivity = onActivity[0]
+	}
+	return transcript
+}
+
+func (tr *installTranscript) muteActivityProgress() {
+	if tr == nil {
+		return
+	}
+	tr.mu.Lock()
+	tr.progressMuted = true
+	tr.mu.Unlock()
 }
 
 // Create writes the two rows the conversation needs before the engine starts.
@@ -127,6 +144,21 @@ func (tr *installTranscript) Create(ctx context.Context, prompt string) error {
 		Data:      map[string]interface{}{},
 	})
 	return nil
+}
+
+// RecordPrompt adds a repair/continuation instruction to the install timeline.
+func (tr *installTranscript) RecordPrompt(prompt string) {
+	if tr == nil {
+		return
+	}
+	tr.append(interfaces.StreamEvent{
+		ID:        uuid.NewString(),
+		Type:      types.ResponseTypeInstallPrompt,
+		Content:   prompt,
+		Done:      true,
+		Timestamp: time.Now(),
+		Data:      map[string]interface{}{},
+	})
 }
 
 // Subscribe wires the six events an install can produce.
@@ -247,6 +279,10 @@ func (tr *installTranscript) onToolResult(_ context.Context, evt event.Event) er
 		delete(tr.starts, data.ToolCallID)
 	}
 	tr.mu.Unlock()
+	tr.mu.Lock()
+	tr.toolCalls++
+	steps, activity, muted := tr.toolCalls, tr.onActivity, tr.progressMuted
+	tr.mu.Unlock()
 
 	// A failed command is surfaced as an error, matching the chat path, so the
 	// console highlights it instead of filing it as one more quiet step.
@@ -282,6 +318,9 @@ func (tr *installTranscript) onToolResult(_ context.Context, evt event.Event) er
 		Timestamp: time.Now(),
 		Data:      meta,
 	})
+	if activity != nil && !muted {
+		activity(steps, data.Output)
+	}
 	return nil
 }
 

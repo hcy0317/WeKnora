@@ -44,6 +44,12 @@ func (s *stubKBRepoForModelDelete) CountByVectorStoreID(context.Context, *gorm.D
 func (s *stubKBRepoForModelDelete) CountByModelID(context.Context, uint64, string) (int64, error) {
 	return s.count, nil
 }
+func (s *stubKBRepoForModelDelete) ListModelUsages(context.Context, uint64, string) ([]types.ModelUsageResource, error) {
+	return nil, nil
+}
+func (s *stubKBRepoForModelDelete) UpdateKnowledgeBaseGeneratedProfile(context.Context, string, *types.KnowledgeBaseProfile) error {
+	return nil
+}
 func (s *stubKBRepoForModelDelete) SetUserKBPin(context.Context, uint64, string, string, bool) (*time.Time, error) {
 	return nil, nil
 }
@@ -70,6 +76,9 @@ func (s *stubAgentRepoForModelDelete) UpdateAgent(context.Context, *types.Custom
 func (s *stubAgentRepoForModelDelete) DeleteAgent(context.Context, string, uint64) error { return nil }
 func (s *stubAgentRepoForModelDelete) CountByModelID(context.Context, uint64, string) (int64, error) {
 	return s.count, nil
+}
+func (s *stubAgentRepoForModelDelete) ListModelUsages(context.Context, uint64, string) ([]types.ModelUsageResource, error) {
+	return nil, nil
 }
 func (s *stubAgentRepoForModelDelete) CountBySandboxConfigID(context.Context, uint64, string) (int64, error) {
 	return 0, nil

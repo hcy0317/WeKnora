@@ -8,13 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -50,6 +50,11 @@ var (
 	// It is exported so HTTP handlers can translate the failure to a 400
 	// without exposing bcrypt or persistence errors.
 	ErrPasswordPolicy = errors.New("password must be 8-32 characters and contain at least one letter and one number")
+	// ErrComplexPasswordPolicy is returned when the runtime complex-password
+	// switch is on and the new password is missing a required character class.
+	ErrComplexPasswordPolicy = errors.New(
+		"password must be 8-32 characters and must contain uppercase and lowercase " +
+			"letters, numbers, and special characters")
 
 	// ErrInvalidOldPassword is returned by ChangePassword when the supplied
 	// current password does not match the stored hash. Handlers map this to
@@ -68,30 +73,6 @@ const (
 	DetailPasswordPolicy     = "password_policy"
 	DetailSamePassword       = "same_password"
 )
-
-// ValidatePasswordPolicy keeps administrative password resets aligned with
-// the registration form's documented policy. Password bytes are never logged
-// or included in the returned error.
-func ValidatePasswordPolicy(password string) error {
-	length := utf8.RuneCountInString(password)
-	if length < 8 || length > 32 {
-		return ErrPasswordPolicy
-	}
-	hasLetter := false
-	hasNumber := false
-	for _, r := range password {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
-			hasLetter = true
-		case r >= '0' && r <= '9':
-			hasNumber = true
-		}
-	}
-	if !hasLetter || !hasNumber {
-		return ErrPasswordPolicy
-	}
-	return nil
-}
 
 // getJwtSecret retrieves the JWT secret from the environment, falling back to a securely generated random secret.
 func getJwtSecret() string {
@@ -113,11 +94,12 @@ func getJwtSecret() string {
 
 // userService implements the UserService interface
 type userService struct {
-	userRepo      interfaces.UserRepository
-	tokenRepo     interfaces.AuthTokenRepository
-	tenantService interfaces.TenantService
-	memberService interfaces.TenantMemberService
-	config        *config.Config
+	userRepo         interfaces.UserRepository
+	tokenRepo        interfaces.AuthTokenRepository
+	tenantService    interfaces.TenantService
+	memberService    interfaces.TenantMemberService
+	config           *config.Config
+	systemSettingSvc interfaces.SystemSettingService
 }
 
 // NewUserService creates a new user service instance
@@ -127,14 +109,20 @@ func NewUserService(
 	tokenRepo interfaces.AuthTokenRepository,
 	tenantService interfaces.TenantService,
 	memberService interfaces.TenantMemberService,
+	systemSettingSvc interfaces.SystemSettingService,
 ) interfaces.UserService {
 	return &userService{
-		userRepo:      userRepo,
-		tokenRepo:     tokenRepo,
-		tenantService: tenantService,
-		memberService: memberService,
-		config:        configInfo,
+		userRepo:         userRepo,
+		tokenRepo:        tokenRepo,
+		tenantService:    tenantService,
+		memberService:    memberService,
+		config:           configInfo,
+		systemSettingSvc: systemSettingSvc,
 	}
+}
+
+func (s *userService) complexPasswordEnabled(ctx context.Context) bool {
+	return ResolveComplexPasswordEnabled(ctx, s.config, s.systemSettingSvc)
 }
 
 // Register creates a new user account
@@ -683,7 +671,7 @@ func (s *userService) ChangePassword(ctx context.Context, userID string, oldPass
 		return ErrSamePassword
 	}
 
-	if err := ValidatePasswordPolicy(newPassword); err != nil {
+	if err := ValidatePasswordPolicy(newPassword, s.complexPasswordEnabled(ctx)); err != nil {
 		return err
 	}
 
@@ -714,7 +702,7 @@ func (s *userService) ChangePassword(ctx context.Context, userID string, oldPass
 // admin HTTP boundary; this service owns the security-critical persistence and
 // session invalidation so no caller can accidentally update only one of them.
 func (s *userService) AdminResetPassword(ctx context.Context, userID string, newPassword string) error {
-	if err := ValidatePasswordPolicy(newPassword); err != nil {
+	if err := ValidatePasswordPolicy(newPassword, s.complexPasswordEnabled(ctx)); err != nil {
 		return err
 	}
 
@@ -754,8 +742,9 @@ func (s *userService) AdminCreateUser(
 
 	password := ""
 	generated := false
+	complexPasswordEnabled := s.complexPasswordEnabled(ctx)
 	if req.Password == nil {
-		randomPassword, err := generatePolicyCompliantPassword()
+		randomPassword, err := generatePolicyCompliantPassword(complexPasswordEnabled)
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to generate password: %w", err)
 		}
@@ -767,7 +756,7 @@ func (s *userService) AdminCreateUser(
 	// Generation triggers only on an absent password. Any provided
 	// value, empty or whitespace-only, is hashed byte-for-byte and must
 	// satisfy the password policy.
-	if err := ValidatePasswordPolicy(password); err != nil {
+	if err := ValidatePasswordPolicy(password, complexPasswordEnabled); err != nil {
 		return nil, "", err
 	}
 
@@ -1224,6 +1213,43 @@ func (s *userService) ValidateToken(ctx context.Context, tokenString string) (*t
 	return user, activeTenantID, nil
 }
 
+func redactAuthToken(token *types.AuthToken) *types.AuthToken {
+	if token == nil {
+		return nil
+	}
+	copy := *token
+	copy.Token = ""
+	return &copy
+}
+
+// GetAccessTokenByValue looks up the stored token row for a JWT string while
+// redacting the bearer value before returning it.
+func (s *userService) GetAccessTokenByValue(ctx context.Context, tokenString string) (*types.AuthToken, error) {
+	tokenString = strings.TrimSpace(tokenString)
+	if tokenString == "" {
+		return nil, apprepo.ErrTokenNotFound
+	}
+	token, err := s.tokenRepo.GetTokenByValue(ctx, tokenString)
+	if err != nil {
+		return nil, err
+	}
+	return redactAuthToken(token), nil
+}
+
+// GetAccessTokenByID looks up a stored token row by primary key while
+// redacting the bearer value before returning it.
+func (s *userService) GetAccessTokenByID(ctx context.Context, id string) (*types.AuthToken, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, apprepo.ErrTokenNotFound
+	}
+	token, err := s.tokenRepo.GetTokenByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return redactAuthToken(token), nil
+}
+
 func isRefreshTokenClaims(claims jwt.MapClaims) bool {
 	tokenType, ok := claims["type"].(string)
 	return ok && tokenType == "refresh"
@@ -1383,6 +1409,8 @@ type oidcDiscoveryDocument struct {
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
 	TokenEndpoint         string `json:"token_endpoint"`
 	UserInfoEndpoint      string `json:"userinfo_endpoint"`
+	JwksURI               string `json:"jwks_uri"`
+	Issuer                string `json:"issuer"`
 }
 
 type oidcTokenResponse struct {
@@ -1419,6 +1447,12 @@ func validateOIDCEndpoints(cfg *config.OIDCAuthConfig) error {
 		return err
 	}
 	if err := validateOIDCEndpoint("userinfo", cfg.UserInfoEndpoint, false); err != nil {
+		return err
+	}
+	if err := validateOIDCEndpoint("jwks", cfg.JwksURI, false); err != nil {
+		return err
+	}
+	if err := validateOIDCEndpoint("jwks", cfg.JwksURI, false); err != nil {
 		return err
 	}
 	return nil
@@ -1477,6 +1511,18 @@ func (s *userService) populateOIDCEndpoints(ctx context.Context, cfg *config.OID
 	if cfg.UserInfoEndpoint == "" {
 		cfg.UserInfoEndpoint = doc.UserInfoEndpoint
 	}
+	if cfg.JwksURI == "" {
+		cfg.JwksURI = doc.JwksURI
+	}
+	if cfg.IssuerURL == "" {
+		cfg.IssuerURL = doc.Issuer
+	}
+	if cfg.JwksURI == "" {
+		cfg.JwksURI = doc.JwksURI
+	}
+	if cfg.IssuerURL == "" {
+		cfg.IssuerURL = doc.Issuer
+	}
 	if cfg.AuthorizationEndpoint == "" || cfg.TokenEndpoint == "" {
 		return errors.New("OIDC discovery document missing required endpoints")
 	}
@@ -1524,12 +1570,20 @@ func (s *userService) exchangeOIDCCode(ctx context.Context, cfg *config.OIDCAuth
 
 func (s *userService) resolveOIDCUserInfo(ctx context.Context, cfg *config.OIDCAuthConfig, tokenResp *oidcTokenResponse) (*types.OIDCUserInfo, error) {
 	claims := map[string]interface{}{}
+	verifiedFromIDToken := false
 
-	if strings.TrimSpace(tokenResp.IDToken) != "" {
-		idTokenClaims, err := decodeJWTClaims(tokenResp.IDToken)
-		if err != nil {
-			logger.Warnf(ctx, "Failed to decode OIDC id_token claims: %v", err)
+	if idToken := strings.TrimSpace(tokenResp.IDToken); idToken != "" {
+		if strings.TrimSpace(cfg.JwksURI) == "" {
+			if strings.TrimSpace(cfg.UserInfoEndpoint) == "" || strings.TrimSpace(tokenResp.AccessToken) == "" {
+				return nil, errors.New("cannot verify OIDC id_token: no jwks_uri configured")
+			}
+			logger.Warnf(ctx, "OIDC id_token ignored: no jwks_uri configured; relying on userinfo endpoint")
 		} else {
+			idTokenClaims, err := s.verifyOIDCIDToken(ctx, cfg, idToken)
+			if err != nil {
+				return nil, fmt.Errorf("OIDC id_token verification failed: %w", err)
+			}
+			verifiedFromIDToken = true
 			for k, v := range idTokenClaims {
 				claims[k] = v
 			}
@@ -1539,7 +1593,10 @@ func (s *userService) resolveOIDCUserInfo(ctx context.Context, cfg *config.OIDCA
 	if strings.TrimSpace(cfg.UserInfoEndpoint) != "" && strings.TrimSpace(tokenResp.AccessToken) != "" {
 		userInfoClaims, err := s.fetchOIDCUserInfo(ctx, cfg.UserInfoEndpoint, tokenResp.AccessToken)
 		if err != nil {
-			logger.Warnf(ctx, "Failed to fetch OIDC userinfo, fallback to id_token claims: %v", err)
+			if !verifiedFromIDToken {
+				return nil, fmt.Errorf("failed to fetch OIDC userinfo: %w", err)
+			}
+			logger.Warnf(ctx, "Failed to fetch OIDC userinfo, using verified id_token claims: %v", err)
 		} else {
 			for k, v := range userInfoClaims {
 				claims[k] = v
@@ -1661,17 +1718,60 @@ func generateRandomString(length int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buffer), nil
 }
 
-// generatePolicyCompliantPassword returns a cryptographically random
-// password that satisfies ValidatePasswordPolicy, regenerating until
-// it does (a single 32-char base64url draw misses digits ~0.4% of the
-// time).
-func generatePolicyCompliantPassword() (string, error) {
-	for {
-		password, err := generateRandomString(24)
+func getRandomChar(charset string) (byte, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+	if err != nil {
+		return 0, err
+	}
+	return charset[n.Int64()], nil
+}
+
+func generateComplexPassword(length int) (string, error) {
+	if length < 4 {
+		return "", fmt.Errorf("password length must be at least 4")
+	}
+	password := make([]byte, 0, length)
+	for _, charset := range []string{upperChars, lowerChars, digitChars, passwordSpecialChars} {
+		char, err := getRandomChar(charset)
 		if err != nil {
 			return "", err
 		}
-		if ValidatePasswordPolicy(password) == nil {
+		password = append(password, char)
+	}
+	for len(password) < length {
+		char, err := getRandomChar(allChars)
+		if err != nil {
+			return "", err
+		}
+		password = append(password, char)
+	}
+	for i := len(password) - 1; i > 0; i-- {
+		randomIndex, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		if err != nil {
+			return "", err
+		}
+		j := int(randomIndex.Int64())
+		password[i], password[j] = password[j], password[i]
+	}
+	return string(password), nil
+}
+
+// generatePolicyCompliantPassword returns a cryptographically random password
+// that satisfies the active policy.
+func generatePolicyCompliantPassword(complexPasswordMode ...bool) (string, error) {
+	complexPasswordEnabled := len(complexPasswordMode) > 0 && complexPasswordMode[0]
+	for {
+		var password string
+		var err error
+		if complexPasswordEnabled {
+			password, err = generateComplexPassword(16)
+		} else {
+			password, err = generateRandomString(24)
+		}
+		if err != nil {
+			return "", err
+		}
+		if ValidatePasswordPolicy(password, complexPasswordEnabled) == nil {
 			return password, nil
 		}
 	}

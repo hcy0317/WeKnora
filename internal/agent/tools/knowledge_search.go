@@ -106,8 +106,8 @@ type KnowledgeSearchInput struct {
 	KnowledgeBaseIDs []string `json:"knowledge_base_ids,omitempty"`
 }
 
-// searchResultWithMeta wraps search result with metadata about which query matched it
-type searchResultWithMeta struct {
+// legacySearchResultWithMeta wraps search result with metadata about which query matched it
+type legacySearchResultWithMeta struct {
 	*types.SearchResult
 	SourceQuery       string
 	QueryType         string // "vector" or "keyword"
@@ -296,7 +296,7 @@ func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage)
 	}
 
 	// Variable to hold results through reranking and MMR stages
-	var filteredResults []*searchResultWithMeta
+	var filteredResults []*legacySearchResultWithMeta
 
 	if t.rerankModel != nil && len(deduplicatedBeforeRerank) > 0 && rerankQuery != "" {
 		logger.Infof(ctx, "[Tool][KnowledgeSearch] Applying rerank, input: %d results, threshold: %.2f, queries: %v",
@@ -431,7 +431,7 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 	topK int,
 	vectorThreshold, keywordThreshold float64,
 	kbTypeMap map[string]string,
-) []*searchResultWithMeta {
+) []*legacySearchResultWithMeta {
 	// Batch-fetch KB records for embedding model grouping
 	kbIDs := searchTargets.GetAllKnowledgeBaseIDs()
 	var kbList []*types.KnowledgeBase
@@ -494,7 +494,7 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	allResults := make([]*searchResultWithMeta, 0)
+	allResults := make([]*legacySearchResultWithMeta, 0)
 
 	for _, query := range queries {
 		q := query
@@ -547,7 +547,7 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 						}
 						mu.Lock()
 						for _, r := range kbResults {
-							allResults = append(allResults, &searchResultWithMeta{
+							allResults = append(allResults, &legacySearchResultWithMeta{
 								SearchResult:      r,
 								SourceQuery:       q,
 								QueryType:         "hybrid",
@@ -586,7 +586,7 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 						}
 						mu.Lock()
 						for _, r := range kbResults {
-							allResults = append(allResults, &searchResultWithMeta{
+							allResults = append(allResults, &legacySearchResultWithMeta{
 								SearchResult:      r,
 								SourceQuery:       q,
 								QueryType:         "hybrid",
@@ -612,16 +612,16 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 //
 // A failed rerank call degrades to the raw retrieval order, mirroring the chat
 // pipeline's api_error_fallback. An empty result after threshold filtering is
-// kept empty: filterRerankRankResults already preserves the top candidate down
-// to agentRerankFallbackMinScore, so reaching zero means even the best match is
+// kept empty: filterLegacyRerankRankResults already preserves the top candidate down
+// to legacyAgentRerankFallbackMinScore, so reaching zero means even the best match is
 // below that floor. There is deliberately no chat-model re-scoring path here —
 // it mixed the reranker's [0,1] scale with raw RRF scores and could resurrect
 // candidates the reranker had already rejected.
 func (t *KnowledgeSearchTool) rerankResults(
 	ctx context.Context,
 	query string,
-	results []*searchResultWithMeta,
-) ([]*searchResultWithMeta, error) {
+	results []*legacySearchResultWithMeta,
+) ([]*legacySearchResultWithMeta, error) {
 	if len(results) == 0 || t.rerankModel == nil {
 		return results, nil
 	}
@@ -683,7 +683,7 @@ func (t *KnowledgeSearchTool) getFAQMetadata(
 func (t *KnowledgeSearchTool) rerankScores(
 	ctx context.Context,
 	query string,
-	results []*searchResultWithMeta,
+	results []*legacySearchResultWithMeta,
 ) ([]rerank.RankResult, error) {
 	passages := make([]string, len(results))
 	for i, result := range results {
@@ -704,9 +704,9 @@ func (t *KnowledgeSearchTool) rerankThreshold() float64 {
 	return 0.3
 }
 
-const agentRerankFallbackMinScore = 0.15
+const legacyAgentRerankFallbackMinScore = 0.15
 
-func filterRerankRankResults(
+func filterLegacyRerankRankResults(
 	rankResults []rerank.RankResult,
 	threshold float64,
 	preserveTop bool,
@@ -727,7 +727,7 @@ func filterRerankRankResults(
 				top = r
 			}
 		}
-		if preserveTop || top.RelevanceScore >= agentRerankFallbackMinScore {
+		if preserveTop || top.RelevanceScore >= legacyAgentRerankFallbackMinScore {
 			return []rerank.RankResult{top}
 		}
 	}
@@ -735,13 +735,13 @@ func filterRerankRankResults(
 }
 
 func (t *KnowledgeSearchTool) applyModelRerankScores(
-	originals []*searchResultWithMeta,
+	originals []*legacySearchResultWithMeta,
 	rankResults []rerank.RankResult,
 	threshold float64,
 	preserveTop bool,
-) []*searchResultWithMeta {
-	filtered := filterRerankRankResults(rankResults, threshold, preserveTop)
-	out := make([]*searchResultWithMeta, 0, len(filtered))
+) []*legacySearchResultWithMeta {
+	filtered := filterLegacyRerankRankResults(rankResults, threshold, preserveTop)
+	out := make([]*legacySearchResultWithMeta, 0, len(filtered))
 	for _, rr := range filtered {
 		if rr.Index < 0 || rr.Index >= len(originals) {
 			continue
@@ -760,10 +760,10 @@ func (t *KnowledgeSearchTool) applyModelRerankScores(
 
 // deduplicateResults removes duplicate chunks, keeping the highest score
 // Uses multiple keys (ID, parent chunk ID, knowledge+index) and content signature for deduplication
-func (t *KnowledgeSearchTool) deduplicateResults(results []*searchResultWithMeta) []*searchResultWithMeta {
+func (t *KnowledgeSearchTool) deduplicateResults(results []*legacySearchResultWithMeta) []*legacySearchResultWithMeta {
 	seen := make(map[string]bool)
 	contentSig := make(map[string]bool)
-	uniqueResults := make([]*searchResultWithMeta, 0)
+	uniqueResults := make([]*legacySearchResultWithMeta, 0)
 
 	for _, r := range results {
 		// Build multiple keys for deduplication
@@ -806,7 +806,7 @@ func (t *KnowledgeSearchTool) deduplicateResults(results []*searchResultWithMeta
 
 	// If we have duplicates by ID but different scores, keep the highest score
 	// This handles cases where the same chunk appears multiple times with different scores
-	seenByID := make(map[string]*searchResultWithMeta)
+	seenByID := make(map[string]*legacySearchResultWithMeta)
 	for _, r := range uniqueResults {
 		if existing, ok := seenByID[r.ID]; ok {
 			// Keep the result with higher score
@@ -819,7 +819,7 @@ func (t *KnowledgeSearchTool) deduplicateResults(results []*searchResultWithMeta
 	}
 
 	// Convert back to slice
-	deduplicated := make([]*searchResultWithMeta, 0, len(seenByID))
+	deduplicated := make([]*legacySearchResultWithMeta, 0, len(seenByID))
 	for _, r := range seenByID {
 		deduplicated = append(deduplicated, r)
 	}
@@ -832,10 +832,10 @@ func (t *KnowledgeSearchTool) buildContentSignature(content string) string {
 	return searchutil.BuildContentSignature(content)
 }
 
-// writeKnowledgeMetadataHeader emits document-scoped metadata once per
+// writeLegacyKnowledgeMetadataHeader emits document-scoped metadata once per
 // knowledge item. Chunk entries keep only chunk-specific content so repeated
 // results from the same document do not waste model context.
-func writeKnowledgeMetadataHeader(ob *strings.Builder, results []*searchResultWithMeta) {
+func writeLegacyKnowledgeMetadataHeader(ob *strings.Builder, results []*legacySearchResultWithMeta) {
 	seen := make(map[string]struct{}, len(results))
 	hasMetadata := false
 	var documents strings.Builder
@@ -868,7 +868,7 @@ func writeKnowledgeMetadataHeader(ob *strings.Builder, results []*searchResultWi
 // formatOutput formats the search results for display
 func (t *KnowledgeSearchTool) formatOutput(
 	ctx context.Context,
-	results []*searchResultWithMeta,
+	results []*legacySearchResultWithMeta,
 	kbsToSearch []string,
 	queries []string,
 ) (*types.ToolResult, error) {
@@ -910,7 +910,7 @@ func (t *KnowledgeSearchTool) formatOutput(
 	for _, q := range queries {
 		ob.WriteString(fmt.Sprintf("<query>%s</query>\n", xmlEscape(q)))
 	}
-	writeKnowledgeMetadataHeader(&ob, results)
+	writeLegacyKnowledgeMetadataHeader(&ob, results)
 
 	formattedResults := make([]map[string]interface{}, 0, len(results))
 	enabled := true
@@ -1034,7 +1034,7 @@ func (t *KnowledgeSearchTool) formatOutput(
 				snippet = faqMatchSnippetFromQueries(faqMeta, queries)
 			}
 			if snippet == "" {
-				snippet = extractSnippetForQueries(result.Content, queries)
+				snippet = extractLegacySnippetForQueries(result.Content, queries)
 			}
 			if snippet != "" {
 				ob.WriteString(fmt.Sprintf("<match_snippet>%s</match_snippet>\n", xmlEscape(snippet)))
@@ -1208,7 +1208,7 @@ func (t *KnowledgeSearchTool) getEnrichedPassage(ctx context.Context, result *ty
 
 // compositeScore calculates a composite score considering multiple factors
 func (t *KnowledgeSearchTool) compositeScore(
-	result *searchResultWithMeta,
+	result *legacySearchResultWithMeta,
 	modelScore, baseScore float64,
 ) float64 {
 	// Source weight: web_search results get slightly lower weight
@@ -1248,10 +1248,10 @@ func (t *KnowledgeSearchTool) clampFloat(v, minV, maxV float64) float64 {
 // applyMMR applies Maximal Marginal Relevance algorithm to reduce redundancy
 func (t *KnowledgeSearchTool) applyMMR(
 	ctx context.Context,
-	results []*searchResultWithMeta,
+	results []*legacySearchResultWithMeta,
 	k int,
 	lambda float64,
-) []*searchResultWithMeta {
+) []*legacySearchResultWithMeta {
 	if k <= 0 || len(results) == 0 {
 		return nil
 	}
@@ -1259,8 +1259,8 @@ func (t *KnowledgeSearchTool) applyMMR(
 	logger.Infof(ctx, "[Tool][KnowledgeSearch] Applying MMR: lambda=%.2f, k=%d, candidates=%d",
 		lambda, k, len(results))
 
-	selected := make([]*searchResultWithMeta, 0, k)
-	candidates := make([]*searchResultWithMeta, len(results))
+	selected := make([]*legacySearchResultWithMeta, 0, k)
+	candidates := make([]*legacySearchResultWithMeta, len(results))
 	copy(candidates, results)
 
 	// Pre-compute token sets for all candidates
@@ -1331,13 +1331,13 @@ func (t *KnowledgeSearchTool) tokenizeSimple(text string) map[string]struct{} {
 	return searchutil.TokenizeSimple(text)
 }
 
-// extractSnippetForQueries tries to produce a short contextual snippet around
+// extractLegacySnippetForQueries tries to produce a short contextual snippet around
 // the first occurrence of any token extracted from the provided queries.
 // When no token matches (common for fully paraphrased semantic queries) it
 // falls back to the leading 160 runes of content so callers always get
 // something to scan. The snippet is single-lined and bounded in length to
 // keep the rendered XML compact.
-func extractSnippetForQueries(content string, queries []string) string {
+func extractLegacySnippetForQueries(content string, queries []string) string {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return ""

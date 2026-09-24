@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,8 @@ import (
 const (
 	redisLifecycleLockLease         = 60 * time.Second
 	redisLifecycleLockRenewInterval = 20 * time.Second
+	sessionRewindLockTTL            = 2 * time.Minute
+	sessionRewindLockRenewInterval  = 40 * time.Second
 )
 
 var deleteBindingIfMatchScript = redis.NewScript(`
@@ -43,19 +46,62 @@ redis.call('SET', KEYS[1], ARGV[3])
 return 1
 `)
 
+// Patches only traffic_access_token so a concurrent stale-mark cannot be
+// overwritten by a full-document replace. ARGV[3] is the new token.
+//
+// The field is rewritten in the stored JSON text rather than via
+// cjson.encode of the whole object: Redis's cjson turns integers into
+// x.0, and encoding/json then refuses those into uint64 (tenant_id).
+var replaceTrafficTokenIfMatchScript = redis.NewScript(`
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local value = cjson.decode(raw)
+if value['provider'] ~= ARGV[1] or value['sandbox_id'] ~= ARGV[2] then
+	return 0
+end
+if value['traffic_access_token'] == ARGV[3] then
+	return 0
+end
+local encoded = string.gsub(cjson.encode(ARGV[3]), '%%', '%%%%')
+local updated, n = string.gsub(raw, '"traffic_access_token"%s*:%s*".-"', '"traffic_access_token":'..encoded, 1)
+if n == 0 then
+	updated, n = string.gsub(raw, '}(%s*)$', ',"traffic_access_token":'..encoded..'}%1', 1)
+	if n == 0 then
+		return 0
+	end
+end
+redis.call('SET', KEYS[1], updated)
+return 1
+`)
+
 // sessionTurnLeaseTTL bounds a leaked turn if EndSessionTurn never runs
 // (process crash). After it expires the next resolve may rebuild a stale
 // image, which is what we want once no turn is actually using the sandbox.
 const sessionTurnLeaseTTL = 30 * time.Minute
-
 const sessionTurnLeaseRenewInterval = 10 * time.Minute
 
 var beginTurnScript = redis.NewScript(`
-if redis.call('EXISTS', KEYS[1]) == 0 then
+if redis.call('EXISTS', KEYS[2]) == 1 then
+	return redis.error_reply('ERR_SESSION_REWIND_LOCKED')
+end
+local refs = redis.call('HINCRBY', KEYS[1], 'refs', 1)
+if refs == 1 then
 	redis.call('HSET', KEYS[1], 'rebuild', '1')
 end
 redis.call('HSET', KEYS[1], 'token:' .. ARGV[2], '1')
 redis.call('PEXPIRE', KEYS[1], ARGV[1])
+return refs
+`)
+
+// KEYS[1] turn lease, KEYS[2] rewind lock. ARGV[1] owner token, ARGV[2] TTL ms.
+var tryLockRewindScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 1 then
+	return redis.error_reply('ERR_SESSION_TURN_ACTIVE')
+end
+if redis.call('EXISTS', KEYS[2]) == 1 then
+	return 0
+end
+redis.call('SET', KEYS[2], ARGV[1], 'PX', ARGV[2])
 return 1
 `)
 
@@ -63,11 +109,12 @@ var endTurnScript = redis.NewScript(`
 if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
 local removed = redis.call('HDEL', KEYS[1], 'token:' .. ARGV[1])
 if removed == 0 then return 0 end
-if redis.call('HLEN', KEYS[1]) <= 1 then
+local refs = redis.call('HINCRBY', KEYS[1], 'refs', -1)
+if refs <= 0 then
 	redis.call('DEL', KEYS[1])
 	return 0
 end
-return 1
+return refs
 `)
 
 var consumeTurnRebuildScript = redis.NewScript(`
@@ -88,6 +135,9 @@ type RedisSessionSandboxBindingStore struct {
 	namespace         string
 	lockLease         time.Duration
 	lockRenewInterval time.Duration
+	rewindLockTTL     time.Duration
+	rewindLockRenew   time.Duration
+	rewindRenewer     func(ctx context.Context, key, token string, lease time.Duration) (bool, error)
 	turnLeaseTTL      time.Duration
 	turnRenewInterval time.Duration
 	turnMu            sync.Mutex
@@ -111,6 +161,8 @@ func NewRedisSessionSandboxBindingStore(
 		namespace:         namespace,
 		lockLease:         redisLifecycleLockLease,
 		lockRenewInterval: redisLifecycleLockRenewInterval,
+		rewindLockTTL:     sessionRewindLockTTL,
+		rewindLockRenew:   sessionRewindLockRenewInterval,
 		turnLeaseTTL:      sessionTurnLeaseTTL,
 		turnRenewInterval: sessionTurnLeaseRenewInterval,
 		localTurns:        make(map[string]chan struct{}),
@@ -185,6 +237,34 @@ func (s *RedisSessionSandboxBindingStore) DeleteIfMatch(
 		return false, fmt.Errorf("delete sandbox binding: %w", err)
 	}
 	return deleted != 0, nil
+}
+
+// ReplaceTrafficTokenIfMatch patches the inbound credential only while the
+// stored binding still names expected's provider and sandbox.
+func (s *RedisSessionSandboxBindingStore) ReplaceTrafficTokenIfMatch(
+	ctx context.Context,
+	key SessionSandboxKey,
+	expected SessionSandboxBinding,
+	token string,
+) (bool, error) {
+	if err := validateBindingMatch(key, expected.Provider, expected.SandboxID); err != nil {
+		return false, err
+	}
+	if token == "" {
+		return false, nil
+	}
+	wrote, err := replaceTrafficTokenIfMatchScript.Run(
+		ctx,
+		s.client,
+		[]string{s.bindingKey(key)},
+		string(expected.Provider),
+		expected.SandboxID,
+		token,
+	).Int64()
+	if err != nil {
+		return false, fmt.Errorf("replace sandbox inbound token: %w", err)
+	}
+	return wrote != 0, nil
 }
 
 // WithLifecycleLock serializes create, recover, replace, and delete transitions
@@ -328,7 +408,10 @@ func (s *RedisSessionSandboxBindingStore) BeginTurn(
 	if ttlMS <= 0 {
 		ttlMS = (30 * time.Minute).Milliseconds()
 	}
-	if err := beginTurnScript.Run(ctx, s.client, []string{s.turnKey(key)}, ttlMS, token).Err(); err != nil {
+	if err := beginTurnScript.Run(ctx, s.client, []string{s.turnKey(key), s.rewindKey(key)}, ttlMS, token).Err(); err != nil {
+		if isRewindLockedRedisErr(err) {
+			return "", ErrSessionRewindLocked
+		}
 		return "", fmt.Errorf("begin sandbox turn lease: %w", err)
 	}
 	s.beginLocalTurnRenewal(key, token)
@@ -369,13 +452,8 @@ func (s *RedisSessionSandboxBindingStore) TurnState(
 		return false, false, nil
 	}
 	_ = s.client.PExpire(ctx, s.turnKey(key), s.effectiveTurnLeaseTTL()).Err()
-	tokens := 0
-	for field := range values {
-		if strings.HasPrefix(field, "token:") {
-			tokens++
-		}
-	}
-	if tokens == 0 {
+	refs, _ := strconv.Atoi(values["refs"])
+	if refs <= 0 {
 		return false, false, nil
 	}
 	return true, values["rebuild"] == "1", nil
@@ -398,14 +476,14 @@ func (s *RedisSessionSandboxBindingStore) ConsumeTurnRebuild(
 }
 
 func (s *RedisSessionSandboxBindingStore) effectiveTurnLeaseTTL() time.Duration {
-	if s.turnLeaseTTL > 0 {
+	if s != nil && s.turnLeaseTTL > 0 {
 		return s.turnLeaseTTL
 	}
 	return sessionTurnLeaseTTL
 }
 
 func (s *RedisSessionSandboxBindingStore) effectiveTurnRenewInterval() time.Duration {
-	if s.turnRenewInterval > 0 {
+	if s != nil && s.turnRenewInterval > 0 {
 		return s.turnRenewInterval
 	}
 	return sessionTurnLeaseRenewInterval
@@ -426,11 +504,9 @@ func (s *RedisSessionSandboxBindingStore) beginLocalTurnRenewal(key SessionSandb
 			case <-stop:
 				return
 			case <-ticker.C:
-				// Detached from the request: model/provider waits may outlive the
-				// HTTP context, while EndTurn remains the lifecycle authority.
-				_ = s.client.PExpire(
-					context.Background(), s.turnKey(key), s.effectiveTurnLeaseTTL(),
-				).Err()
+				// A provider/model call may outlive the HTTP request. Keep the
+				// lease alive until its exact token is released.
+				_ = s.client.PExpire(context.Background(), s.turnKey(key), s.effectiveTurnLeaseTTL()).Err()
 			}
 		}
 	}()
@@ -450,6 +526,139 @@ func (s *RedisSessionSandboxBindingStore) endLocalTurnRenewal(key SessionSandbox
 
 func (s *RedisSessionSandboxBindingStore) turnKey(key SessionSandboxKey) string {
 	return "weknora:sandbox:session:{" + s.hashTag(key) + "}:turn"
+}
+
+func (s *RedisSessionSandboxBindingStore) rewindKey(key SessionSandboxKey) string {
+	return "weknora:sandbox:session:{" + s.hashTag(key) + "}:rewind"
+}
+
+// TryLockRewind takes a distributed exclusive rewind lock for key.
+// The lock fails if a chat-turn lease already exists, and is renewed until
+// the returned unlock runs so a slow reset+cleanup cannot expire it.
+func (s *RedisSessionSandboxBindingStore) TryLockRewind(
+	ctx context.Context,
+	key SessionSandboxKey,
+) (func(), error) {
+	if err := key.Validate(); err != nil {
+		return nil, err
+	}
+	token, err := redislock.NewToken()
+	if err != nil {
+		return nil, err
+	}
+	lease := s.rewindLease()
+	ttlMS := lease.Milliseconds()
+	if ttlMS <= 0 {
+		ttlMS = sessionRewindLockTTL.Milliseconds()
+	}
+	acquired, err := tryLockRewindScript.Run(
+		ctx, s.client, []string{s.turnKey(key), s.rewindKey(key)}, token, ttlMS,
+	).Int64()
+	if err != nil {
+		if isTurnActiveRedisErr(err) {
+			return nil, ErrSessionTurnActive
+		}
+		return nil, fmt.Errorf("lock session rewind: %w", err)
+	}
+	if acquired == 0 {
+		return nil, ErrSessionRewindLocked
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go s.renewRewindLock(stop, done, s.rewindKey(key), token, lease)
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+			relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_, _ = redislock.Release(relCtx, s.client, s.rewindKey(key), token)
+		})
+	}, nil
+}
+
+// HasRewindLock reports whether rewind currently holds key.
+func (s *RedisSessionSandboxBindingStore) HasRewindLock(
+	ctx context.Context,
+	key SessionSandboxKey,
+) (bool, error) {
+	if err := key.Validate(); err != nil {
+		return false, err
+	}
+	n, err := s.client.Exists(ctx, s.rewindKey(key)).Result()
+	if err != nil {
+		return false, fmt.Errorf("read session rewind lock: %w", err)
+	}
+	return n > 0, nil
+}
+
+func isRewindLockedRedisErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "ERR_SESSION_REWIND_LOCKED")
+}
+
+func isTurnActiveRedisErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "ERR_SESSION_TURN_ACTIVE")
+}
+
+func (s *RedisSessionSandboxBindingStore) rewindLease() time.Duration {
+	if s != nil && s.rewindLockTTL > 0 {
+		return s.rewindLockTTL
+	}
+	return sessionRewindLockTTL
+}
+
+func (s *RedisSessionSandboxBindingStore) rewindRenewInterval() time.Duration {
+	if s != nil && s.rewindLockRenew > 0 {
+		return s.rewindLockRenew
+	}
+	return sessionRewindLockRenewInterval
+}
+
+func (s *RedisSessionSandboxBindingStore) renewRewind(
+	ctx context.Context, key, token string, lease time.Duration,
+) (bool, error) {
+	if s != nil && s.rewindRenewer != nil {
+		return s.rewindRenewer(ctx, key, token, lease)
+	}
+	return redislock.Renew(ctx, s.client, key, token, lease)
+}
+
+func (s *RedisSessionSandboxBindingStore) renewRewindLock(
+	stop <-chan struct{}, done chan<- struct{}, key, token string, lease time.Duration,
+) {
+	defer close(done)
+	interval := s.rewindRenewInterval()
+	if interval <= 0 || interval >= lease {
+		interval = lease / 3
+	}
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			renewed, err := s.renewRewind(context.Background(), key, token, lease)
+			if err == nil && renewed {
+				continue
+			}
+			// A blip talking to Redis, or a lost lease, must not kill the
+			// renew loop: git reset can still be running, and the 2m TTL
+			// would otherwise expire under it. Re-acquire on both, so the
+			// original unlock token still matches a key that vanished — an
+			// errored renew is exactly the case where the key may have
+			// expired underneath us, and sitting the tick out is what lets
+			// a short outage hand the session to a second rewind.
+			_, _ = redislock.TryAcquire(
+				context.Background(), s.client, key, token, lease,
+			)
+		}
+	}
 }
 
 func (s *RedisSessionSandboxBindingStore) bindingKey(key SessionSandboxKey) string {

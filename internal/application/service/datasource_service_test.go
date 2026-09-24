@@ -105,6 +105,13 @@ func (s *processSyncKBService) HybridSearch(context.Context, string, types.Searc
 	return nil, nil
 }
 
+func (s *processSyncKBService) HybridSearchWithRerank(
+	ctx context.Context, id string, params types.SearchParams,
+) (*types.RetrievalResult, error) {
+	results, err := s.HybridSearch(ctx, id, params)
+	return &types.RetrievalResult{Results: results}, err
+}
+
 func (s *processSyncKBService) GetQueryEmbedding(context.Context, string, string) ([]float32, error) {
 	return nil, nil
 }
@@ -254,9 +261,11 @@ func (r *processSyncTenantRepo) GetTenantByID(context.Context, uint64) (*types.T
 
 type processSyncTagService struct {
 	interfaces.KnowledgeTagService
+	ctx context.Context
 }
 
-func (*processSyncTagService) FindOrCreateTagByName(context.Context, string, string) (*types.KnowledgeTag, error) {
+func (s *processSyncTagService) FindOrCreateTagByName(ctx context.Context, _ string, _ string) (*types.KnowledgeTag, error) {
+	s.ctx = ctx
 	return nil, nil
 }
 

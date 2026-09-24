@@ -182,6 +182,25 @@ func (f fakeTaskInspector) HasQueuedTasksForKnowledge(
 	return f.queued[knowledgeID], nil
 }
 
+func (f fakeTaskInspector) HasQueuedDeleteTasksForKnowledge(
+	_ context.Context, knowledgeID string,
+) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.queued[knowledgeID], nil
+}
+
+func (f fakeTaskInspector) QueuedKnowledgeIDs(context.Context) (map[string]struct{}, error) {
+	queued := make(map[string]struct{}, len(f.queued))
+	for id, present := range f.queued {
+		if present {
+			queued[id] = struct{}{}
+		}
+	}
+	return queued, nil
+}
+
 func (f fakeTaskInspector) QueueStats(
 	_ context.Context,
 ) ([]types.QueueStat, bool, error) {
@@ -205,7 +224,7 @@ func newHousekeepingSvcWithInspector(db *gorm.DB, inspector interfaces.TaskInspe
 		// default of 2h+10min is just a constant scale factor.
 		DocumentProcessTimeout: 1 * time.Hour,
 	}}
-	return NewHousekeepingService(db, cfg, inspector)
+	return NewHousekeepingService(db, cfg, inspector, nil)
 }
 
 func insertCompletionOutbox(t *testing.T, db *gorm.DB, knowledgeID string, attempt int) {

@@ -49,7 +49,7 @@ func (s *TenantSkillService) RemoveSkill(
 	// that is the stuck-run reaper's job (Task 17).
 	go func() {
 		bgCtx := context.WithoutCancel(ctx)
-		if err := s.withConfigLock(bgCtx, tenantID, configID, func(lockCtx context.Context) error {
+		if err := s.withSkillRunLock(bgCtx, tenantID, configID, skillID, func(lockCtx context.Context) error {
 			return s.runRemove(lockCtx, tenantID, configID, skillID)
 		}); err != nil {
 			logger.Errorf(bgCtx, "[skill] remove %s failed: %v", skillID, err)
@@ -81,6 +81,7 @@ func (s *TenantSkillService) runRemove(
 ) (err error) {
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, tenantID)
 	ctx = types.WithSandboxTenantID(ctx, tenantID)
+	handle := s.lookupSkillRun(tenantID, configID, skillID)
 
 	// An empty id never names a row; refusing here keeps the later GetSkill
 	// from being the only thing standing between us and a no-op that looks
@@ -105,6 +106,10 @@ func (s *TenantSkillService) runRemove(
 	// it (or wiping its directory) would discard that install.
 	if existing.Status != types.SkillStatusRemoving {
 		return nil
+	}
+
+	if sandbox.IsHostSkillTarget(configID) {
+		return s.runHostRemove(ctx, tenantID, configID, skillID, existing)
 	}
 
 	// The image directory is the skill name, and SkillDirFor is what refuses a
@@ -136,6 +141,9 @@ func (s *TenantSkillService) runRemove(
 			logger.Errorf(cleanupBase,
 				"[skill] %s is gone from the image but its bookkeeping is incomplete: %v",
 				skillID, err)
+			return
+		}
+		if !s.skillRunStillBound(tenantID, configID, skillID, handle) {
 			return
 		}
 		// A half-removed skill is worse than a kept one: the image still has

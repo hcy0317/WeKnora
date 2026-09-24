@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
@@ -41,7 +42,34 @@ func (s *knowledgeBaseService) GetQueryEmbedding(ctx context.Context, kbID strin
 		return nil, err
 	}
 
-	return embeddingModel.Embed(ctx, queryText)
+	vector, err := embeddingModel.Embed(ctx, queryText)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateQueryEmbeddingDimension(embeddingModel, len(vector)); err != nil {
+		return nil, err
+	}
+	return vector, nil
+}
+
+// validateQueryEmbeddingDimension catches model/config drift before a
+// malformed query vector reaches a dimension-partitioned or bound vector store.
+func validateQueryEmbeddingDimension(model embedding.Embedder, actual int) error {
+	if model == nil || actual == 0 {
+		return nil
+	}
+	expected := model.GetDimensions()
+	if expected <= 0 || expected == actual {
+		return nil
+	}
+	return apperrors.NewVectorStoreUnavailableError(
+		"embedding vector dimension does not match the configured model",
+	).WithDetails(map[string]any{
+		"model":              model.GetModelName(),
+		"expected_dimension": expected,
+		"actual_dimension":   actual,
+		"hint":               fmt.Sprintf("check the embedding model configuration and rebuild the affected index (%d dimensions)", expected),
+	})
 }
 
 // ResolveEmbeddingModelKeys resolves embedding model IDs to their actual model
@@ -98,6 +126,28 @@ func (s *knowledgeBaseService) HybridSearch(ctx context.Context,
 	// copy, so this stays local to the call.
 	params.MatchCount = normalizedMatchCount(params.MatchCount)
 
+	chunks, err := s.hybridSearchCandidates(ctx, id, params)
+	if err != nil || len(chunks) == 0 {
+		return nil, err
+	}
+
+	// Truncate to the primary-match cap. MatchCount is guaranteed positive by
+	// the normalization at the top of this function; the slice bound below
+	// depends on that.
+	if len(chunks) > params.MatchCount {
+		chunks = chunks[:params.MatchCount]
+	}
+
+	return s.processSearchResults(ctx, chunks, params.SkipContextEnrichment)
+}
+
+// hybridSearchCandidates runs retrieval, fusion and FAQ post-processing for
+// HybridSearch and returns the fused chunks, best first, before the
+// MatchCount cut. params.MatchCount must already be normalized.
+func (s *knowledgeBaseService) hybridSearchCandidates(ctx context.Context,
+	id string,
+	params types.SearchParams,
+) ([]*types.IndexWithScore, error) {
 	// Determine the set of KB IDs to search.
 	searchKBIDs := params.KnowledgeBaseIDs
 	if len(searchKBIDs) == 0 {
@@ -253,20 +303,8 @@ func (s *knowledgeBaseService) HybridSearch(ctx context.Context,
 	// AppError from inside the iterative fan-out path (e.g. a per-group
 	// timeout surfaced as ErrVectorStoreUnavailable) must surface to the
 	// caller rather than be silently converted to a truncated chunk list.
-	deduplicatedChunks, err = s.applyFAQPostProcessing(
+	return s.applyFAQPostProcessing(
 		ctx, kb, deduplicatedChunks, vectorResults, groups, params, matchCount)
-	if err != nil {
-		return nil, err
-	}
-
-	// Truncate to the primary-match cap. MatchCount is guaranteed positive by
-	// the normalization at the top of this function; the slice bound below
-	// depends on that.
-	if len(deduplicatedChunks) > params.MatchCount {
-		deduplicatedChunks = deduplicatedChunks[:params.MatchCount]
-	}
-
-	return s.processSearchResults(ctx, deduplicatedChunks, params.SkipContextEnrichment)
 }
 
 // normalizedMatchCount resolves the effective primary-match cap for a search.
@@ -477,6 +515,10 @@ func (s *knowledgeBaseService) resolveQueryEmbedding(
 	queryEmbedding, err := embeddingModel.Embed(ctx, params.QueryText)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to embed query text, query text: %s, error: %v", params.QueryText, err)
+		return nil, err
+	}
+	if err := validateQueryEmbeddingDimension(embeddingModel, len(queryEmbedding)); err != nil {
+		logger.Errorf(ctx, "resolveQueryEmbedding: %v", err)
 		return nil, err
 	}
 	logger.Infof(ctx, "Query embedding generated successfully, embedding vector length: %d", len(queryEmbedding))

@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$WeKnoraPath = (Split-Path -Parent $PSScriptRoot)
+    [string]$WeKnoraPath = (Split-Path -Parent $PSScriptRoot),
+    [switch]$MigrationOnly,
+    [string]$TestFilter
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,27 +48,41 @@ try {
         throw 'ephemeral PostgreSQL did not become ready within 60 seconds'
     }
 
+    if ($MigrationOnly) {
+        $goTestArguments = @('-tags', 'sqlite_fts5', './internal/database', '-count=1')
+        if ($TestFilter) {
+            $goTestArguments = @('-tags', 'sqlite_fts5', './internal/database', '-run', $TestFilter, '-count=1')
+        }
+    }
+    else {
+        $goTestArguments = @(
+            './internal/application/repository', './internal/database',
+            '-run', 'Test(KnowledgeSpanRepo_Postgres|QuestionGenerationManifestRepository_Postgres|KnowledgeBaseDeletionRepository_Postgres|WikiCheckpointPostgres|PostgresMigration|PostgresFresh)',
+            '-count=1', '-v'
+        )
+    }
+
     docker run --rm --network $network `
         -e WEKNORA_TEST_POSTGRES_EPHEMERAL=1 `
         -e "WEKNORA_TEST_POSTGRES_DSN=postgres://g004:g004test@${postgresContainer}:5432/g004?sslmode=disable" `
         -v "${resolvedWeKnora}:/workspace" -v weknora-go-mod-cache:/go/pkg/mod `
         -v weknora-go-build-cache:/root/.cache/go-build -w /workspace `
-        golang:1.26-bookworm go test `
-        ./internal/application/repository ./internal/database `
-        -run 'Test(KnowledgeSpanRepo_Postgres|QuestionGenerationManifestRepository_Postgres|KnowledgeBaseDeletionRepository_Postgres|WikiCheckpointPostgres|PostgresMigration|PostgresFresh)' -count=1 -v
+        golang:1.26-bookworm go test @goTestArguments
     if ($LASTEXITCODE -ne 0) {
         throw "G004 PostgreSQL tests failed with exit code $LASTEXITCODE"
     }
 
-    docker run --rm --network $network `
-        -e WEKNORA_MIGRATE_ONLY=true -e AUTO_RECOVER_DIRTY=false `
-        -e DB_DRIVER=postgres -e DB_USER=g004 -e DB_PASSWORD=g004test -e DB_NAME=g004 `
-        -e DB_PORT=5432 -e "DB_HOST=$postgresContainer" -e RETRIEVE_DRIVER=postgres `
-        -v "${resolvedWeKnora}:/workspace" -v weknora-go-mod-cache:/go/pkg/mod `
-        -v weknora-go-build-cache:/root/.cache/go-build -w /workspace `
-        golang:1.26-bookworm go run ./cmd/server
-    if ($LASTEXITCODE -ne 0) {
-        throw "one-shot migrator failed with exit code $LASTEXITCODE"
+    if (-not $MigrationOnly) {
+        docker run --rm --network $network `
+            -e WEKNORA_MIGRATE_ONLY=true -e AUTO_RECOVER_DIRTY=false `
+            -e DB_DRIVER=postgres -e DB_USER=g004 -e DB_PASSWORD=g004test -e DB_NAME=g004 `
+            -e DB_PORT=5432 -e "DB_HOST=$postgresContainer" -e RETRIEVE_DRIVER=postgres `
+            -v "${resolvedWeKnora}:/workspace" -v weknora-go-mod-cache:/go/pkg/mod `
+            -v weknora-go-build-cache:/root/.cache/go-build -w /workspace `
+            golang:1.26-bookworm go run ./cmd/server
+        if ($LASTEXITCODE -ne 0) {
+            throw "one-shot migrator failed with exit code $LASTEXITCODE"
+        }
     }
 }
 finally {

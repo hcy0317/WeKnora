@@ -39,7 +39,14 @@ type KnowledgeHandler struct {
 	agentShareService interfaces.AgentShareService
 	asynqClient       interfaces.TaskEnqueuer
 	spanRepo          repository.KnowledgeSpanRepository
+	backlog           backlogProbe
 }
+
+type backlogProbe interface {
+	QueuedWork(ctx context.Context, ids []string) (map[string]bool, error)
+}
+
+const stallHintAfter = 20 * time.Minute
 
 // NewKnowledgeHandler creates a new knowledge handler instance
 func NewKnowledgeHandler(
@@ -50,7 +57,12 @@ func NewKnowledgeHandler(
 	agentShareService interfaces.AgentShareService,
 	asynqClient interfaces.TaskEnqueuer,
 	spanRepo repository.KnowledgeSpanRepository,
+	housekeeping *service.HousekeepingService,
 ) *KnowledgeHandler {
+	var backlog backlogProbe
+	if housekeeping != nil {
+		backlog = housekeeping
+	}
 	return &KnowledgeHandler{
 		cfg:               cfg,
 		kgService:         kgService,
@@ -59,7 +71,91 @@ func NewKnowledgeHandler(
 		agentShareService: agentShareService,
 		asynqClient:       asynqClient,
 		spanRepo:          spanRepo,
+		backlog:           backlog,
 	}
+}
+
+func (h *KnowledgeHandler) stallVerdicts(ctx context.Context, ids []string) map[string]string {
+	if h.backlog == nil || len(ids) == 0 {
+		return nil
+	}
+	queued, err := h.backlog.QueuedWork(ctx, ids)
+	if err != nil {
+		logger.Warnf(ctx, "backlog probe failed: %v", err)
+		return nil
+	}
+	out := make(map[string]string, len(ids))
+	for _, id := range ids {
+		out[id] = types.StallStateStalled
+		if queued[id] {
+			out[id] = types.StallStateQueued
+		}
+	}
+	return out
+}
+
+func (h *KnowledgeHandler) attachLastActivity(ctx context.Context, knowledges []*types.Knowledge) {
+	var ids []string
+	for _, knowledge := range knowledges {
+		if knowledge != nil && isParseInFlight(knowledge.ParseStatus) {
+			ids = append(ids, knowledge.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	var spanActivity map[string]time.Time
+	if h.spanRepo != nil {
+		var err error
+		spanActivity, err = h.spanRepo.LastActivity(ctx, ids)
+		if err != nil {
+			logger.Warnf(ctx, "span last activity lookup failed: %v", err)
+		}
+	}
+	var quiet []*types.Knowledge
+	var quietIDs []string
+	for _, knowledge := range knowledges {
+		if knowledge == nil || !isParseInFlight(knowledge.ParseStatus) {
+			continue
+		}
+		last := latestActivity(knowledge.UpdatedAt, spanActivity[knowledge.ID])
+		knowledge.LastActivityAt = &last
+		if time.Since(last) >= stallHintAfter {
+			quiet = append(quiet, knowledge)
+			quietIDs = append(quietIDs, knowledge.ID)
+		}
+	}
+	verdicts := h.stallVerdicts(ctx, quietIDs)
+	for _, knowledge := range quiet {
+		knowledge.StallState = verdicts[knowledge.ID]
+	}
+}
+
+func isParseInFlight(status string) bool {
+	switch status {
+	case types.ParseStatusPending, types.ParseStatusProcessing, types.ParseStatusFinalizing:
+		return true
+	default:
+		return false
+	}
+}
+
+func spansLastActivity(updatedAt time.Time, rows []types.KnowledgeProcessingSpan) time.Time {
+	last := updatedAt
+	for _, row := range rows {
+		last = latestActivity(last, row.UpdatedAt)
+	}
+	return last
+}
+
+func latestActivity(values ...time.Time) time.Time {
+	var latest time.Time
+	for _, value := range values {
+		if value.After(latest) {
+			latest = value
+		}
+	}
+	return latest
 }
 
 // requireKBOwnershipOrAdmin enforces the same "KB creator OR Admin+" matrix
@@ -634,6 +730,7 @@ func (h *KnowledgeHandler) GetKnowledge(c *gin.Context) {
 		c.Error(errors.NewNotFoundError("Knowledge not found"))
 		return
 	}
+	h.attachLastActivity(effCtx, []*types.Knowledge{knowledge})
 
 	logger.Infof(ctx, "Knowledge retrieved successfully, ID: %s, title: %s",
 		secutils.SanitizeForLog(knowledge.ID), secutils.SanitizeForLog(knowledge.Title))
@@ -1357,6 +1454,9 @@ func (h *KnowledgeHandler) ListKnowledge(c *gin.Context) {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(errors.NewInternalServerError(err.Error()))
 		return
+	}
+	if knowledgeRows, ok := result.Data.([]*types.Knowledge); ok {
+		h.attachLastActivity(ctx, knowledgeRows)
 	}
 
 	logger.Infof(

@@ -927,6 +927,12 @@ func (r *realKBRepo) CountByVectorStoreID(ctx context.Context, db *gorm.DB, tena
 func (r *realKBRepo) CountByModelID(_ context.Context, _ uint64, _ string) (int64, error) {
 	return 0, nil
 }
+func (r *realKBRepo) ListModelUsages(context.Context, uint64, string) ([]types.ModelUsageResource, error) {
+	return nil, nil
+}
+func (r *realKBRepo) UpdateKnowledgeBaseGeneratedProfile(context.Context, string, *types.KnowledgeBaseProfile) error {
+	return nil
+}
 
 // The remaining methods are not called by the tested code paths; declare them
 // so realKBRepo satisfies interfaces.KnowledgeBaseRepository.

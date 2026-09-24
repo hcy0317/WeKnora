@@ -22,6 +22,8 @@ type MCPServiceHandler struct {
 	mcpServiceService      interfaces.MCPServiceService
 	mcpToolApprovalService interfaces.MCPToolApprovalService
 	toolApprovalGate       *approval.Gate
+	modelService           interfaces.ModelService
+	agentShareService      interfaces.AgentShareService
 }
 
 // NewMCPServiceHandler creates a new MCP service handler
@@ -29,11 +31,15 @@ func NewMCPServiceHandler(
 	mcpServiceService interfaces.MCPServiceService,
 	mcpToolApprovalService interfaces.MCPToolApprovalService,
 	toolApprovalGate *approval.Gate,
+	modelService interfaces.ModelService,
+	agentShareService interfaces.AgentShareService,
 ) *MCPServiceHandler {
 	return &MCPServiceHandler{
 		mcpServiceService:      mcpServiceService,
 		mcpToolApprovalService: mcpToolApprovalService,
 		toolApprovalGate:       toolApprovalGate,
+		modelService:           modelService,
+		agentShareService:      agentShareService,
 	}
 }
 
