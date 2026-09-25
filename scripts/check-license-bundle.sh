@@ -20,6 +20,7 @@ while read -r module_name module_version checksum; do
     checksum="${checksum%$'\r'}"
     [[ "${checksum}" =~ ^[0-9a-f]{64}$ ]] || { echo "Invalid source checksum for ${module_name}" >&2; exit 1; }
     actual_version="$(awk -v name="${module_name}" '$1 == name { print $2 }' go.mod)"
+    actual_version="${actual_version%$'\r'}"
     if [ "${actual_version}" != "${module_version}" ]; then
         echo "Update the source manifest for ${module_name}: expected ${module_version}, got ${actual_version}" >&2
         exit 1
