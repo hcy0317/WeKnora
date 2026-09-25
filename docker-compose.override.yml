@@ -14,7 +14,7 @@ services:
   app:
     image: weknora-app:local-patched
     environment:
-      - SSRF_WHITELIST_EXTRA=sub2api.long-antares.ts.net,*.long-antares.ts.net,searxng,accelerator-router,engine-gateway,speaches,paddleocr-vl
+      - SSRF_WHITELIST_EXTRA=sub2api.long-antares.ts.net,*.long-antares.ts.net,searxng,accelerator-router,engine-gateway,speaches,paddleocr-vl,host.docker.internal
       - WEKNORA_ENGINE_GATEWAY_URL=${WEKNORA_ENGINE_GATEWAY_URL-http://engine-gateway:18084}
       - WEKNORA_ENGINE_CONTROLLER_URL=https://host.docker.internal:18443
       - WEKNORA_ENGINE_CONTROLLER_CA=/run/weknora-engine-controller/ca.crt
